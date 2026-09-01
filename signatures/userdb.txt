@@ -1,0 +1,20 @@
+; DebuggerJ++ - firmas de packers estilo PEiD (opcional).
+; Formato:
+;   [Nombre del packer]
+;   signature = 60 BE ?? ?? ?? ?? 8D BE
+;   ep_only = true
+;
+; Puedes pegar aqui una userdb.txt de PEiD completa; se carga al abrir un archivo.
+; El motor ya trae un set embebido; esto lo amplia.
+
+[UPX 3.x (userdb)]
+signature = 60 BE ?? ?? ?? ?? 8D BE ?? ?? ?? ?? 57 83 CD FF
+ep_only = true
+
+[ASPack 2.12 (userdb)]
+signature = 60 E8 03 00 00 00 E9 EB 04 5D 45 55 C3 E8 01 00 00 00
+ep_only = true
+
+[MPRESS 2.x (userdb)]
+signature = 60 E8 00 00 00 00 58 05 ?? ?? ?? ?? 8B 30
+ep_only = true
