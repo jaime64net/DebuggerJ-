@@ -98,7 +98,19 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;    // anclar ventanas dentro del main/contenedor
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;  // sacar ventanas a otros monitores
+    io.ConfigViewportsNoAutoMerge = false;
     ImGui::StyleColorsDark();
+    // Con viewports, las ventanas fuera del main son ventanas OS: quita el redondeo para
+    // que se vean como ventanas normales del sistema.
+    {
+        ImGuiStyle& style = ImGui::GetStyle();
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            style.WindowRounding = 0.0f;
+            style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+        }
+    }
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
@@ -157,6 +169,13 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRTV, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        // Multi-viewport: dibuja y presenta las ventanas que salieron a otros monitores.
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+        }
+
         g_pSwapChain->Present(1, 0);
     }
 

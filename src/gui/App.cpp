@@ -27,6 +27,7 @@ using njson = nlohmann::json;
 
 namespace dbg {
 
+static constexpr const char* kAppVersion = "1.0.0";
 static std::string favFilePath();   // definida mas abajo; usada en el menu Favourites
 static std::string hex64(uint64_t v)  { char b[24]; std::snprintf(b, sizeof(b), "%016llX", (unsigned long long)v); return b; }
 static std::string hex32(uint32_t v)  { char b[16]; std::snprintf(b, sizeof(b), "%08X", v); return b; }
@@ -905,6 +906,10 @@ void App::render() {
 
     drainMcpQueue();
 
+    // DockSpace del main: permite anclar (dock) las ventanas dentro de la ventana
+    // principal. PassthruCentralNode deja el centro transparente para el fondo.
+    ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+
     // Animate (step animado): mientras esté activo y pausado, da un paso cada ~15 frames.
     if (animateActive_) {
         if (dbgState_ == DbgState::Paused) {
@@ -941,6 +946,7 @@ void App::render() {
     if (visible("Notes"))                drawNotesPanel();
     if (visible("System"))               drawSystemPanel();
     if (visible("Entropy"))              drawEntropyPanel();
+    if (visible("Contenedor"))           drawContainerPanel();
     if (visible("Executable modules"))   drawExecModulesPanel();
     if (visible("Referencias"))          drawReferencesPanel();
     if (visible("Analysis"))             drawAnalysisPanel();
@@ -976,7 +982,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System", "Entropy"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System", "Entropy", "Contenedor"
     };
 }
 
@@ -1059,34 +1065,42 @@ void App::applyMagneticSnap() {
     if (np.x != p.x || np.y != p.y) mv->Pos = np;   // imanta esta ventana este frame
 }
 
+// Ruta del archivo .ini de un layout con nombre (sanitizado).
+static std::string layoutIniPath(const std::string& name) {
+    wchar_t exe[MAX_PATH] = {0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring w(exe); auto p = w.find_last_of(L"\\/");
+    std::wstring dir = (p == std::wstring::npos) ? L"." : w.substr(0, p);
+    std::string safe; for (char c : name) safe += (std::isalnum((unsigned char)c) ? c : '_');
+    std::wstring path = dir + L"\\layout_" + std::wstring(safe.begin(), safe.end()) + L".ini";
+    return std::string(path.begin(), path.end());
+}
+
+// Con docking, un layout completo = el estado .ini de ImGui, que incluye posiciones,
+// tamanos y el DOCKING de AMBOS dockspaces (el del main y el de la ventana Contenedor).
 void App::captureLayout(const std::string& name) {
+    size_t sz = 0;
+    const char* ini = ImGui::SaveIniSettingsToMemory(&sz);
+    std::ofstream f(layoutIniPath(name), std::ios::binary | std::ios::trunc);
+    if (f && ini) f.write(ini, sz);
+    for (auto& e : customLayouts_) if (e.name == name) { saveLayouts(); pushLog("Layout actualizado: " + name); return; }
     WinLayout L; L.name = name;
-    for (auto nm : managedWindows()) {
-        ImGuiWindow* w = ImGui::FindWindowByName(nm);
-        if (w) L.wins.push_back({nm, w->Pos.x, w->Pos.y, w->Size.x, w->Size.y});
-    }
-    for (auto& e : customLayouts_) if (e.name == name) { e = L; saveLayouts(); return; }
     customLayouts_.push_back(L);
     saveLayouts();
-    pushLog("Layout guardado: " + name);
+    pushLog("Layout guardado (incluye ambos contenedores): " + name);
 }
 
 void App::applyLayout(const WinLayout& L) {
-    for (auto& g : L.wins) {
-        ImGui::SetWindowCollapsed(g.name.c_str(), false);
-        ImGui::SetWindowPos(g.name.c_str(), ImVec2(g.x, g.y));
-        ImGui::SetWindowSize(g.name.c_str(), ImVec2(g.w, g.h));
-    }
+    std::ifstream f(layoutIniPath(L.name), std::ios::binary);
+    if (!f) { pushLog("Layout sin archivo .ini: " + L.name); return; }
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (!data.empty()) { ImGui::LoadIniSettingsFromMemory(data.data(), data.size()); pushLog("Layout aplicado: " + L.name); }
 }
 
+// La lista de layouts (solo nombres) se guarda en layouts.txt; cada uno tiene su .ini.
 void App::saveLayouts() {
     std::ofstream f(layoutsFilePath());
     if (!f) return;
-    for (auto& L : customLayouts_) {
-        f << "[" << L.name << "]\n";
-        for (auto& g : L.wins)
-            f << g.name << "|" << g.x << "|" << g.y << "|" << g.w << "|" << g.h << "\n";
-    }
+    for (auto& L : customLayouts_) f << L.name << "\n";
 }
 
 void App::loadLayouts() {
@@ -1094,28 +1108,12 @@ void App::loadLayouts() {
     std::ifstream f(layoutsFilePath());
     if (!f) return;
     std::string line;
-    WinLayout cur; bool have = false;
-    auto flush = [&]() { if (have && !cur.name.empty()) customLayouts_.push_back(cur); cur = WinLayout(); have = false; };
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        if (line.front() == '[') { flush(); cur.name = line.substr(1, line.find(']') - 1); have = true; }
-        else {
-            std::stringstream ss(line); std::string tok; WinGeom g; int idx = 0;
-            while (std::getline(ss, tok, '|')) {
-                switch (idx) {
-                    case 0: g.name = tok; break;
-                    case 1: g.x = (float)atof(tok.c_str()); break;
-                    case 2: g.y = (float)atof(tok.c_str()); break;
-                    case 3: g.w = (float)atof(tok.c_str()); break;
-                    case 4: g.h = (float)atof(tok.c_str()); break;
-                }
-                idx++;
-            }
-            if (idx >= 5) cur.wins.push_back(g);
-        }
+        // Compatibilidad: ignora las lineas del formato antiguo (con '|' o '[').
+        if (line.empty() || line[0] == '[' || line.find('|') != std::string::npos) continue;
+        WinLayout L; L.name = line; customLayouts_.push_back(L);
     }
-    flush();
 }
 
 bool App::visible(const char* name) {
@@ -1347,6 +1345,8 @@ void App::drawMenuBar() {
             if (ImGui::MenuItem("MCP")) { helpPage_ = 1; showHelp_ = true; }
             if (ImGui::MenuItem("Plugins")) { helpPage_ = 2; showHelp_ = true; }
             if (ImGui::MenuItem("Roadmap")) { helpPage_ = 3; showHelp_ = true; }
+            ImGui::Separator();
+            if (ImGui::MenuItem("About")) { helpPage_ = 4; showHelp_ = true; }
             ImGui::EndMenu();
         }
         drawWindowMenu();
@@ -1480,6 +1480,12 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Plugins -> Hot-reload (M11): recarga los plugins automaticamente al detectar cambios en la carpeta plugins/.");
             ImGui::BulletText("--headless (M10): oculta la ventana y deja el MCP corriendo para automatizacion/batch. --noauth arranca el MCP sin token.");
             ImGui::BulletText("Snap magnetico (Window -> Snap magnetico): al arrastrar una ventana cerca de otra o del borde de la pantalla, se pega por imantacion (umbral 14 px). Desactivable desde el menu.");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Ventanas: docking, X para cerrar y Contenedor");
+            ImGui::BulletText("Cada ventana tiene una X en su barra de titulo para cerrarla (se reactiva en Window -> Show).");
+            ImGui::BulletText("Docking: arrastra la barra de titulo de una ventana sobre otra o sobre los bordes para anclarla; las ventanas se agrupan en pestanas y paneles divididos dentro del main.");
+            ImGui::BulletText("Ventana Contenedor (Window -> Show -> Contenedor): un segundo espacio de anclaje. Arrastra su barra de titulo FUERA del main para convertirla en una ventana del sistema (con minimizar/maximizar/cerrar) y llevarla a OTRO MONITOR. Ancla dentro las ventanas que no caben en un solo monitor.");
+            ImGui::BulletText("Window -> Custom -> Add to custom: guarda el layout COMPLETO (posiciones, tamanos y el docking del main Y del Contenedor) en un .ini con nombre; elige el nombre para restaurarlo. Se guarda y carga para ambos contenedores.");
             ImGui::BulletText("CFG (Window -> CFG): grafo de las funciones analizadas (Analyze this) y sus xrefs; doble clic en un nodo navega a la funcion.");
             ImGui::BulletText("Compare (Window -> Compare): compara dos archivos/dumps byte a byte y lista los rangos que difieren. Tambien por MCP: diff_files.");
             ImGui::BulletText("Struct -> Inferir con IA: pide a la IA una struct probable a partir de los bytes en la direccion base. Tambien por MCP: infer_struct.");
@@ -1569,6 +1575,34 @@ void App::drawHelpWindow() {
             ImGui::BulletText("FUERA DE ALCANCE por ahora: decompilador nativo real (el panel Code da interpretacion por IA, no genera pseudo-C fiel). Es un proyecto en si mismo.");
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("About", nullptr, helpPage_ == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+            ImGui::PushFont(nullptr);
+            ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "DebuggerJ++");
+            ImGui::PopFont();
+            ImGui::Text("Version %s", kAppVersion);
+            ImGui::Separator();
+            ImGui::TextWrapped("Debugger y desensamblador para Windows (x86/x64) orientado al analisis "
+                "de malware con fines defensivos. Interfaz estilo OllyDbg/x64dbg con Dear ImGui, "
+                "desensamblado con Zydis, ensamblador Keystone y motor de depuracion sobre la Windows "
+                "Debug API. Integra un asistente de IA (multi-proveedor) y un servidor MCP para "
+                "automatizar el analisis. Incluye breakpoints (software/hardware/memoria/excepcion), "
+                "unpacking asistido, motor de expresiones, scripting, CFG, informes SARIF/JSON y mas.");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.7f,1,0.7f,1), "Autor");
+            ImGui::BulletText("Ing. Jaime Macias");
+            ImGui::TextColored(ImVec4(0.7f,1,0.7f,1), "Co-autor");
+            ImGui::BulletText("Claude (Anthropic) - asistente de IA");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1,0.9f,0.4f,1), "Licencia");
+            ImGui::TextWrapped("Publicado bajo la GNU General Public License v3.0 (GPLv3). "
+                "Puedes usar, estudiar, modificar y redistribuir el programa; las obras derivadas "
+                "deben distribuirse tambien bajo GPLv3 y con el codigo fuente disponible. El software "
+                "se ofrece SIN GARANTIA. Consulta el archivo LICENSE para el texto completo.");
+            ImGui::Separator();
+            ImGui::TextDisabled("Repositorio: github.com/jaime64net/DebuggerJ-");
+            ImGui::TextDisabled("Analiza muestras de malware solo en una VM aislada.");
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::End();
@@ -1600,7 +1634,8 @@ void App::drawCpuPanel() {
     std::string title = "CPU";
     if (dbgState_ == DbgState::Paused && !curModule_.empty()) title += " - " + curModule_;
     title += "###CPU"; // ID estable aunque cambie el titulo visible
-    ImGui::Begin(title.c_str());
+    { bool was = winVisible_["CPU"]; ImGui::Begin(title.c_str(), &winVisible_["CPU"]);
+      if (was && !winVisible_["CPU"]) saveVisibility(); }
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float topH = avail.y * 0.58f;
     float leftW = avail.x * 0.62f;
@@ -2116,7 +2151,7 @@ void App::drawRegistersContent() {
 }
 
 void App::drawBreakpointsPanel() {
-    ImGui::Begin("Breakpoints");
+    beginManaged("Breakpoints");
     static std::map<uint64_t, std::array<char, 160>> conditionEdits;
     auto bps = debugger_.breakpoints();
     ImGui::Text("%zu breakpoints", bps.size());
@@ -2242,7 +2277,7 @@ void App::drawBreakpointsPanel() {
 // Memoria (hex dump + mapa)
 // ---------------------------------------------------------------------------
 void App::drawMemoryPanel() {
-    ImGui::Begin("Memoria");
+    beginManaged("Memoria");
     ImGui::InputTextWithHint("##goto", "ir a VA hex", memGotoBuf_, sizeof(memGotoBuf_));
     ImGui::SameLine();
     if (ImGui::Button("Ver")) {
@@ -2399,7 +2434,7 @@ void App::drawStackContent() {
 // Strings / busqueda hex
 // ---------------------------------------------------------------------------
 void App::drawStringsPanel() {
-    ImGui::Begin("Strings & Busqueda");
+    beginManaged("Strings & Busqueda");
 
     if (ImGui::BeginTabBar("sb")) {
         if (ImGui::BeginTabItem("Strings (archivo)")) {
@@ -2520,7 +2555,7 @@ void App::drawStringsPanel() {
 // Modulos, imports/exports, secciones (simbolos)
 // ---------------------------------------------------------------------------
 void App::drawModulesPanel() {
-    ImGui::Begin("Modulos & Simbolos");
+    beginManaged("Modulos & Simbolos");
     if (ImGui::BeginTabBar("ms")) {
         if (ImGui::BeginTabItem("Secciones")) {
             if (ImGui::BeginTable("sec", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
@@ -2619,7 +2654,7 @@ void App::drawModulesPanel() {
 }
 
 void App::drawPackerPanel() {
-    ImGui::Begin("Packers / Proteccion");
+    beginManaged("Packers / Proteccion");
     if (!fileLoaded_) { ImGui::TextDisabled("Abre un archivo."); ImGui::End(); return; }
     ImGui::Text("Entropia global: %.3f / 8.0", pe_.overallEntropy());
     if (pe_.overallEntropy() > 7.0)
@@ -2649,7 +2684,7 @@ void App::drawPackerPanel() {
 }
 
 void App::drawExceptionsPanel() {
-    ImGui::Begin("Excepciones");
+    beginManaged("Excepciones");
     auto excs = debugger_.exceptionBreaks();
     ImGui::Text("%zu breakpoints de excepcion", excs.size());
     ImGui::TextDisabled("Doble clic en una fila para ir a su direccion.");
@@ -2725,7 +2760,7 @@ void App::drawExceptionsPanel() {
 }
 
 void App::drawPluginsPanel() {
-    ImGui::Begin("Plugins");
+    beginManaged("Plugins");
     bool active = (dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused);
     bool paused = (dbgState_ == DbgState::Paused);
 
@@ -3137,7 +3172,7 @@ void App::summarizeTraceWithAi() {
 }
 
 void App::drawTracePanel() {
-    ImGui::Begin("Run trace");
+    beginManaged("Run trace");
     bool paused = (dbgState_ == DbgState::Paused);
     ImGui::BeginDisabled(!paused);
     if (ImGui::Button("Start trace")) debugger_.runTrace();
@@ -3171,7 +3206,7 @@ void App::drawTracePanel() {
 }
 
 void App::drawReferencesPanel() {
-    ImGui::Begin("Referencias");
+    beginManaged("Referencias");
     if (refTarget_) ImGui::Text("Saltan/llaman a 0x%s  (%zu)", hex64(refTarget_).c_str(), refs_.size());
     else ImGui::TextDisabled("Selecciona un call/jmp en el CPU: aqui aparecen quienes saltan alli.");
     ImGui::TextDisabled("Doble clic o clic derecho -> Go to.");
@@ -3497,7 +3532,7 @@ void App::execCommandBar() {
 }
 
 void App::drawCommandBar() {
-    ImGui::Begin("Command");
+    beginManaged("Command");
     ImGui::TextDisabled("?expr  (evalua) | cmd {args} (tool dbg_*) | JSON crudo | o activa IA para lenguaje natural");
     ImGui::Checkbox("Usar IA (lenguaje natural -> controla el debugger)", &cmdBarUseAi_);
     ImGui::SetNextItemWidth(-1);
@@ -3613,7 +3648,7 @@ std::string App::runScript(const std::string& src, std::string& err) {
 }
 
 void App::drawScriptPanel() {
-    ImGui::Begin("Script");
+    beginManaged("Script");
     ImGui::TextDisabled("$v=expr | print expr | log txt | label: | goto label | if expr goto label | cmd key=val");
     ImGui::InputTextMultiline("##script", scriptBuf_, sizeof(scriptBuf_), ImVec2(-1, ImGui::GetContentRegionAvail().y - 130));
     if (ImGui::Button("Ejecutar")) { std::string err; scriptOutput_ = runScript(scriptBuf_, err); if (!err.empty()) scriptOutput_ += "\n[error] " + err; }
@@ -3642,7 +3677,7 @@ void App::refreshWatches() {
 }
 
 void App::drawWatchPanel() {
-    ImGui::Begin("Watch");
+    beginManaged("Watch");
     ImGui::SetNextItemWidth(-90);
     bool add = ImGui::InputTextWithHint("##watchin", "expr: dword(esp+4)  |  [eax]  |  rip - mod.base(rip)",
                    watchInput_, sizeof(watchInput_), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -3759,7 +3794,7 @@ std::vector<App::BasicBlock> App::computeBasicBlocks(uint64_t funcStart, uint64_
 // CFG interactivo: bloques básicos de una función, con pan (arrastrar) y zoom.
 // ---------------------------------------------------------------------------
 void App::drawCfgPanel() {
-    ImGui::Begin("CFG");
+    beginManaged("CFG");
     if (analyzedFunctions_.empty()) {
         ImGui::TextDisabled("No hay funciones analizadas. Clic derecho -> Analyze en el CPU.");
         ImGui::End(); return;
@@ -3838,7 +3873,7 @@ void App::drawCfgPanel() {
 // Comparación de dumps: diff byte a byte de dos archivos, lista rangos distintos
 // ---------------------------------------------------------------------------
 void App::drawComparePanel() {
-    ImGui::Begin("Compare");
+    beginManaged("Compare");
     ImGui::TextDisabled("Compara dos archivos (dumps) byte a byte y lista los rangos que difieren.");
     ImGui::InputTextWithHint("A", "ruta del archivo A", cmpPathA_, sizeof(cmpPathA_));
     ImGui::SameLine();
@@ -3914,7 +3949,7 @@ void App::inferStructWithAi() {
 // Struct viewer (M8): aplica una definicion de campos a una direccion base
 // ---------------------------------------------------------------------------
 void App::drawStructPanel() {
-    ImGui::Begin("Struct");
+    beginManaged("Struct");
     ImGui::TextDisabled("Aplica una struct a una direccion. La base admite expresiones (rax, 0x401000, dword(esp)).");
     ImGui::SetNextItemWidth(240);
     ImGui::InputTextWithHint("Base", "ej: rax  |  0x401000", structBase_, sizeof(structBase_));
@@ -3985,7 +4020,7 @@ void App::drawStructPanel() {
 }
 
 void App::drawAnalysisPanel() {
-    ImGui::Begin("Analysis");
+    beginManaged("Analysis");
     ImGui::TextDisabled("Resultados persistentes de Analyze this. Son analisis estaticos/lineales, no un decompilador completo.");
     ImGui::SameLine();
     if (ImGui::SmallButton("Analyze CPU")) {
@@ -4114,7 +4149,7 @@ void App::drawStatusBar() {
 // Executable modules (estilo Olly): Base | Tamano | Nombre | Ruta
 // ---------------------------------------------------------------------------
 void App::drawExecModulesPanel() {
-    ImGui::Begin("Executable modules");
+    beginManaged("Executable modules");
     auto mods = debugger_.modules();
     ImGui::Text("%zu modulos cargados (doble clic para abrir codigo)", mods.size());
     ImGui::Separator();
@@ -4166,7 +4201,7 @@ void App::drawExecModulesPanel() {
 // Call stack: camina la cadena de frames (RBP/EBP -> [RBP]=prev, [RBP+ptr]=ret)
 // ---------------------------------------------------------------------------
 void App::drawCallStackPanel() {
-    ImGui::Begin("Call stack");
+    beginManaged("Call stack");
     if (dbgState_ != DbgState::Paused) { ImGui::TextDisabled("(disponible al pausar)"); ImGui::End(); return; }
     const auto frames = debugger_.walkStack();
     ImGui::TextDisabled("StackWalk64 + DbgHelp; fuente solo aparece si hay PDB/simbolos disponibles.");
@@ -4264,7 +4299,7 @@ void App::saveNotesDebuggee() {
     if (f) f << notesDebuggee_;
 }
 void App::drawNotesPanel() {
-    ImGui::Begin("Notes");
+    beginManaged("Notes");
     std::string h = peContentHash();
     if (!h.empty() && h != notesDebuggeeHash_) { notesDebuggeeHash_ = h; std::snprintf(notesDebuggee_, sizeof(notesDebuggee_), "%s", readFileText(notesDebuggeePath(h)).c_str()); }
 
@@ -4336,8 +4371,30 @@ std::string App::systemInfoJson() {
     return j.dump();
 }
 
+// Begin de una ventana gestionada con boton X en el titulo. Devuelve lo que devuelve
+// Begin (false = colapsada). Al pulsar la X, winVisible_[name] pasa a false y la ventana
+// deja de dibujarse (render usa visible()). Guarda la visibilidad para que persista.
+bool App::beginManaged(const char* name) {
+    bool wasVisible = winVisible_[name];
+    bool ret = ImGui::Begin(name, &winVisible_[name]);
+    if (wasVisible && !winVisible_[name]) saveVisibility();   // se cerro con la X
+    return ret;
+}
+
+// Ventana Contenedor: un DockSpace secundario. Con multi-viewport, arrastra su barra de
+// titulo fuera del main y quedara como ventana del sistema (con minimizar/maximizar/cerrar)
+// en el monitor que quieras; ancla dentro las demas ventanas para organizarlas.
+void App::drawContainerPanel() {
+    ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Contenedor", &winVisible_["Contenedor"], ImGuiWindowFlags_NoScrollbar)) { ImGui::End(); return; }
+    ImGui::TextDisabled("Arrastra aqui las pestanas de otras ventanas para organizarlas. Puedes sacar esta ventana a otro monitor.");
+    ImGuiID dock = ImGui::GetID("ContenedorDockSpace");
+    ImGui::DockSpace(dock, ImVec2(0, 0), ImGuiDockNodeFlags_None);
+    ImGui::End();
+}
+
 void App::drawEntropyPanel() {
-    ImGui::Begin("Entropy");
+    beginManaged("Entropy");
     if (!fileLoaded_) { ImGui::TextDisabled("Abre un archivo."); ImGui::End(); return; }
     ImGui::Text("Entropia global: %.3f / 8.0", pe_.overallEntropy());
     ImGui::TextDisabled("0 = uniforme, 8 = maxima aleatoriedad. >7.2 suele indicar cifrado/empaquetado.");
@@ -4357,7 +4414,7 @@ void App::drawEntropyPanel() {
 }
 
 void App::drawSystemPanel() {
-    ImGui::Begin("System");
+    beginManaged("System");
     if (dbgState_ == DbgState::Idle || dbgState_ == DbgState::Exited || !debugger_.processHandle()) {
         ImGui::TextDisabled("(sin sesion de depuracion)"); ImGui::End(); return;
     }
@@ -4390,7 +4447,7 @@ void App::drawSystemPanel() {
 }
 
 void App::drawThreadsPanel() {
-    ImGui::Begin("Threads");
+    beginManaged("Threads");
     if (dbgState_ == DbgState::Idle || dbgState_ == DbgState::Exited) {
         ImGui::TextDisabled("(sin sesion de depuracion)"); ImGui::End(); return;
     }
@@ -5111,7 +5168,7 @@ std::string App::mcpLogJoined() {
 }
 
 void App::drawMcpLogPanel() {
-    ImGui::Begin("MCP Log");
+    beginManaged("MCP Log");
     if (mcp_.running())
         ImGui::TextColored(ImVec4(0.5f,1,0.5f,1), "MCP activo: puerto %d, %d cliente(s)", mcp_.port(), mcp_.clients());
     else
@@ -5147,7 +5204,7 @@ void App::drawMcpLogPanel() {
 }
 
 void App::drawLogPanel() {
-    ImGui::Begin("Log");
+    beginManaged("Log");
     std::lock_guard<std::mutex> lk(logMutex_);
     ImGui::BeginChild("logscroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
     for (auto& l : log_) ImGui::TextUnformatted(l.c_str());
@@ -5396,7 +5453,7 @@ void App::sendAiMessage() {
 }
 
 void App::drawAiPanel() {
-    ImGui::Begin("IA");
+    beginManaged("IA");
 
     // Seleccion del agente: solo se elige entre los ya configurados en Options.
     auto& agents = aiConfig_.agents();
@@ -5558,7 +5615,7 @@ void App::analyzeSelectionAsCpp() {
 }
 
 void App::drawCodePanel() {
-    ImGui::Begin("Code");
+    beginManaged("Code");
     ImGui::TextDisabled("Pseudocodigo C++ interpretado; no recupera el fuente original.");
     ImGui::SetNextItemWidth(190);
     ImGui::InputTextWithHint("Direccion", "RIP o VA hexadecimal", codeAddr_, sizeof(codeAddr_));

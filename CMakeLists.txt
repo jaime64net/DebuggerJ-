@@ -40,9 +40,11 @@ FetchContent_MakeAvailable(json)
 set(KEYSTONE_DIR ${CMAKE_SOURCE_DIR}/tools/keystone-win64/keystone-0.9.2-win64)
 
 # ---- Dear ImGui (GUI) + backends Win32/DX11 ----
+# Rama 'docking': habilita Docking (anclar ventanas) y Multi-Viewport (sacar ventanas
+# a otros monitores). Necesario para el DockSpace del main y la ventana Contenedor.
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        v1.90.9
+    GIT_TAG        docking
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(imgui)
 

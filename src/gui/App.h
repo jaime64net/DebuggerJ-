@@ -163,6 +163,8 @@ private:
     void drawNotesPanel();         // notas globales + por-binario (paridad x64dbg)
     void drawSystemPanel();        // privilegios, conexiones TCP y handles del proceso
     void drawEntropyPanel();       // entropía por sección con barras (diálogo de entropía)
+    void drawContainerPanel();     // Contenedor: DockSpace secundario (arrastrable a otro monitor)
+    bool          beginManaged(const char* name);  // Begin con X (cierra la ventana)
     std::string systemInfoJson();  // misma info para MCP
     void loadNotes();
     void saveNotesGlobal();
