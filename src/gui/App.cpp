@@ -1367,6 +1367,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Threads (Window -> Threads): lista los hilos del proceso (TID, hilo actual, prioridad, descripcion) y clic derecho para suspender/reanudar/terminar/prioridad. Por MCP: threads, thread_ctrl.");
             ImGui::BulletText("Notes (Window -> Notes): notas GLOBALES (siempre) y por BINARIO (guardadas por hash del contenido). Por MCP: notes_get, notes_set.");
             ImGui::BulletText("System (Window -> System): privilegios del token del proceso, conexiones TCP (IPv4) y conteo de handles. Por MCP: system_info.");
+            ImGui::BulletText("Operaciones de memoria (solo por MCP, requieren pausa): mem_alloc, mem_free, mem_fill, mem_copy, mem_save, page_protect.");
             ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
             ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin. Packers muestra firmas y heuristicas.");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
@@ -4297,7 +4298,8 @@ static std::string hexBytes(const uint8_t* p, size_t n) {
 static int mcpRequiredAccess(const std::string& cmd) {
     if (cmd == "save_session" || cmd == "load_session" || cmd == "export_report" || cmd == "write_mem" || cmd == "set_reg" || cmd == "assemble" || cmd == "patch" ||
         cmd == "nop" || cmd == "dump" || cmd == "fix_iat" || cmd == "antidebug" ||
-        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script" || cmd == "thread_ctrl" || cmd == "notes_set") return 2;
+        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script" || cmd == "thread_ctrl" || cmd == "notes_set" ||
+        cmd == "mem_alloc" || cmd == "mem_free" || cmd == "mem_fill" || cmd == "mem_copy" || cmd == "mem_save" || cmd == "page_protect") return 2;
     if (cmd == "attach" || cmd == "detach" || cmd == "launch" || cmd == "restart" || cmd == "go" || cmd == "pause" ||
         cmd == "step_into" || cmd == "step_over" || cmd == "step_to_ret" || cmd == "stop" ||
         cmd == "set_bp" || cmd == "del_bp" || cmd == "set_hwbp" || cmd == "del_hwbp" ||
@@ -4795,6 +4797,40 @@ std::string App::handleMcpCommand(const std::string& line) {
         if (!need_paused()) goto done;
         runToAddress(jU64(a["addr"]));
     }
+    else if (cmd == "mem_alloc") {
+        if (!need_paused()) goto done;
+        size_t size = (size_t)a.value("size", 4096);
+        uint32_t prot = (uint32_t)jU64(a.value("protect", njson(0x40)));  // def PAGE_EXECUTE_READWRITE
+        uint64_t va = debugger_.allocMemory(size, prot);
+        if (va) { res["addr"] = va; res["hex"] = "0x" + hex64(va); } else { res["ok"] = false; res["error"] = "VirtualAllocEx fallo"; }
+    }
+    else if (cmd == "mem_free") { if (!need_paused()) goto done; res["ok"] = debugger_.freeMemory(jU64(a["addr"])); }
+    else if (cmd == "mem_fill") {
+        if (!need_paused()) goto done;
+        res["ok"] = debugger_.fillMemory(jU64(a["addr"]), (uint8_t)jU64(a.value("value", njson(0))), (size_t)a.value("size", 1));
+    }
+    else if (cmd == "mem_copy") {
+        if (!need_paused()) goto done;
+        size_t n = (size_t)a.value("size", 0); if (n > 1048576) n = 1048576;
+        std::vector<uint8_t> buf(n);
+        size_t got = debugger_.readMemory(jU64(a["src"]), buf.data(), n);
+        size_t wr = 0; if (got) wr = debugger_.writeMemory(jU64(a["dst"]), buf.data(), got);
+        res["copied"] = wr; res["ok"] = (wr == got && got > 0);
+    }
+    else if (cmd == "mem_save") {
+        size_t n = (size_t)a.value("size", 0); if (n > 67108864) n = 67108864;
+        std::string path = a.value("path", "");
+        std::vector<uint8_t> buf(n);
+        size_t got = (dbgState_==DbgState::Paused) ? debugger_.readMemory(jU64(a["addr"]), buf.data(), n)
+                   : (fileLoaded_ ? pe_.readAtRva((uint32_t)(jU64(a["addr"])-pe_.imageBase()), buf.data(), n) : 0);
+        std::ofstream f(path, std::ios::binary); if (f) f.write((char*)buf.data(), got);
+        res["ok"] = (bool)f && got > 0; res["written"] = got;
+    }
+    else if (cmd == "page_protect") {
+        if (!need_paused()) goto done;
+        uint32_t oldp = 0; bool ok = debugger_.setPageProtect(jU64(a["addr"]), (uint32_t)jU64(a["protect"]), oldp);
+        res["ok"] = ok; res["old"] = oldp;
+    }
     else if (cmd == "thread_ctrl") {
         uint32_t tid = (uint32_t)a.value("tid", 0);
         std::string action = a.value("action", "");
@@ -5072,6 +5108,12 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("notes_set",   "Guarda notas. scope: 'global' o 'debuggee' (por binario).", obj({{"scope", STR}, {"text", STR}}, {"text"}));
     add("run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));
     add("thread_ctrl", "Controla un hilo. action: suspend|resume|kill|priority|name; value=prioridad/exitcode; name=nombre.", obj({{"tid", INT}, {"action", STR}, {"value", INT}, {"name", STR}}, {"tid","action"}));
+    add("mem_alloc",   "Reserva memoria en el proceso (VirtualAllocEx). size, protect (hex, def 0x40=RWX). Requiere pausado.", obj({{"size", INT}, {"protect", HEX}}, {}));
+    add("mem_free",    "Libera memoria reservada (VirtualFreeEx). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));
+    add("mem_fill",    "Rellena memoria con un byte. addr, value (0-255), size. Requiere pausado.", obj({{"addr", HEX}, {"value", INT}, {"size", INT}}, {"addr","size"}));
+    add("mem_copy",    "Copia 'size' bytes de src a dst dentro del proceso. Requiere pausado.", obj({{"src", HEX}, {"dst", HEX}, {"size", INT}}, {"src","dst","size"}));
+    add("mem_save",    "Guarda 'size' bytes desde addr a un archivo (memoria o PE estatico).", obj({{"addr", HEX}, {"size", INT}, {"path", STR}}, {"addr","size","path"}));
+    add("page_protect","Cambia la proteccion de una pagina (VirtualProtectEx). protect en hex. Requiere pausado.", obj({{"addr", HEX}, {"protect", HEX}}, {"addr","protect"}));
     add("list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", obj(EMPTY, {}));
     add("set_follow_children","Activa/desactiva seguir procesos hijos (fijar antes de lanzar).", obj({{"on", njson{{"type","boolean"}}}}, {}));
     add("switch_to_child","Conmuta el target: desadjunta el actual y adjunta el proceso hijo indicado.", obj({{"pid", INT}}, {"pid"}));

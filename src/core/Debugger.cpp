@@ -182,6 +182,28 @@ std::vector<uint32_t> Debugger::childPids() {
     return childPids_;
 }
 
+uint64_t Debugger::allocMemory(size_t size, uint32_t protect) {
+    if (!hProcess_ || !size) return 0;
+    void* p = VirtualAllocEx(hProcess_, nullptr, size, MEM_COMMIT | MEM_RESERVE, protect ? protect : PAGE_EXECUTE_READWRITE);
+    return (uint64_t)p;
+}
+bool Debugger::freeMemory(uint64_t va) {
+    if (!hProcess_ || !va) return false;
+    return VirtualFreeEx(hProcess_, (void*)va, 0, MEM_RELEASE) != 0;
+}
+bool Debugger::fillMemory(uint64_t va, uint8_t value, size_t size) {
+    if (!hProcess_ || !size) return false;
+    std::vector<uint8_t> buf(size, value);
+    SIZE_T written = 0;
+    return WriteProcessMemory(hProcess_, (void*)va, buf.data(), size, &written) && written == size;
+}
+bool Debugger::setPageProtect(uint64_t va, uint32_t protect, uint32_t& oldProtect) {
+    if (!hProcess_) return false;
+    DWORD old = 0;
+    bool ok = VirtualProtectEx(hProcess_, (void*)va, 0x1000, protect, &old) != 0;
+    oldProtect = old; return ok;
+}
+
 bool Debugger::suspendThread(uint32_t tid) {
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
     if (!h) return false;

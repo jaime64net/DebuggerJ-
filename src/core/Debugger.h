@@ -209,6 +209,12 @@ public:
     bool setThreadPriority(uint32_t tid, int priority);
     bool setThreadName(uint32_t tid, const std::string& name);
 
+    // Operaciones de memoria en el proceso (paridad x64dbg: alloc/free/memset).
+    uint64_t allocMemory(size_t size, uint32_t protect);  // VirtualAllocEx; 0 si falla
+    bool     freeMemory(uint64_t va);                      // VirtualFreeEx
+    bool     fillMemory(uint64_t va, uint8_t value, size_t size);
+    bool     setPageProtect(uint64_t va, uint32_t protect, uint32_t& oldProtect);
+
     // Symbol server (M5): path de busqueda de simbolos (formato DbgHelp/symsrv),
     // ej. "srv*C:\\sym*https://msdl.microsoft.com/download/symbols". Se aplica en el
     // proximo SymInitialize; si ya hay sesion, refresca de inmediato.
