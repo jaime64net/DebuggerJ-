@@ -3,6 +3,9 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <commdlg.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <algorithm>
 #include <array>
 #include <set>
@@ -873,6 +876,7 @@ void App::render() {
     if (visible("Call stack"))           drawCallStackPanel();
     if (visible("Threads"))              drawThreadsPanel();
     if (visible("Notes"))                drawNotesPanel();
+    if (visible("System"))               drawSystemPanel();
     if (visible("Executable modules"))   drawExecModulesPanel();
     if (visible("Referencias"))          drawReferencesPanel();
     if (visible("Analysis"))             drawAnalysisPanel();
@@ -908,7 +912,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System"
     };
 }
 
@@ -1058,7 +1062,7 @@ void App::ensureVisibilityKeys() {
     // Paneles auxiliares nuevos: ocultos por defecto para no saturar la pantalla al abrir
     // (se activan desde Window -> Show). El resto arranca visible.
     static const std::set<std::string> hiddenByDefault = {
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System"
     };
     for (auto nm : managedWindows())
         if (winVisible_.find(nm) == winVisible_.end())
@@ -1362,6 +1366,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Call stack usa StackWalk64/DbgHelp. Si Windows puede localizar un PDB, muestra simbolos y archivo:linea; de otro modo conserva las direcciones disponibles.");
             ImGui::BulletText("Threads (Window -> Threads): lista los hilos del proceso (TID, hilo actual, prioridad, descripcion) y clic derecho para suspender/reanudar/terminar/prioridad. Por MCP: threads, thread_ctrl.");
             ImGui::BulletText("Notes (Window -> Notes): notas GLOBALES (siempre) y por BINARIO (guardadas por hash del contenido). Por MCP: notes_get, notes_set.");
+            ImGui::BulletText("System (Window -> System): privilegios del token del proceso, conexiones TCP (IPv4) y conteo de handles. Por MCP: system_info.");
             ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
             ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin. Packers muestra firmas y heuristicas.");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
@@ -4133,6 +4138,94 @@ void App::drawNotesPanel() {
     ImGui::End();
 }
 
+// ---------------------------------------------------------------------------
+// System (paridad x64dbg): privilegios del token, conexiones TCP y handles.
+// ---------------------------------------------------------------------------
+std::string App::systemInfoJson() {
+    njson j;
+    if (dbgState_ == DbgState::Idle || dbgState_ == DbgState::Exited || !debugger_.processHandle()) {
+        j["active"] = false; return j.dump();
+    }
+    j["active"] = true;
+    uint32_t pid = debugger_.pid();
+    HANDLE hProc = (HANDLE)debugger_.processHandle();
+
+    // Privilegios del token del proceso
+    HANDLE token = nullptr;
+    if (OpenProcessToken(hProc, TOKEN_QUERY, &token)) {
+        DWORD len = 0; GetTokenInformation(token, TokenPrivileges, nullptr, 0, &len);
+        std::vector<uint8_t> buf(len);
+        if (len && GetTokenInformation(token, TokenPrivileges, buf.data(), len, &len)) {
+            auto* tp = (TOKEN_PRIVILEGES*)buf.data();
+            for (DWORD i = 0; i < tp->PrivilegeCount; ++i) {
+                char name[128] = {0}; DWORD nlen = sizeof(name);
+                LUID luid = tp->Privileges[i].Luid;
+                if (LookupPrivilegeNameA(nullptr, &luid, name, &nlen)) {
+                    bool enabled = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+                    j["privileges"].push_back({{"name", name}, {"enabled", enabled}});
+                }
+            }
+        }
+        CloseHandle(token);
+    }
+    // Handle count
+    DWORD hc = 0; if (GetProcessHandleCount(hProc, &hc)) j["handleCount"] = hc;
+    // Conexiones TCP del proceso (IPv4)
+    {
+        ULONG sz = 0;
+        GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        std::vector<uint8_t> tbuf(sz);
+        if (sz && GetExtendedTcpTable(tbuf.data(), &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+            auto* t = (MIB_TCPTABLE_OWNER_PID*)tbuf.data();
+            for (DWORD i = 0; i < t->dwNumEntries; ++i) {
+                if (t->table[i].dwOwningPid != pid) continue;
+                auto ipstr = [](DWORD ip){ char b[16]; unsigned char* p=(unsigned char*)&ip; std::snprintf(b,sizeof(b),"%u.%u.%u.%u",p[0],p[1],p[2],p[3]); return std::string(b); };
+                static const char* states[] = {"","CLOSED","LISTEN","SYN_SENT","SYN_RCVD","ESTABLISHED","FIN_WAIT1","FIN_WAIT2","CLOSE_WAIT","CLOSING","LAST_ACK","TIME_WAIT","DELETE_TCB"};
+                DWORD st = t->table[i].dwState;
+                j["tcp"].push_back({
+                    {"local", ipstr(t->table[i].dwLocalAddr) + ":" + std::to_string(ntohs((u_short)t->table[i].dwLocalPort))},
+                    {"remote", ipstr(t->table[i].dwRemoteAddr) + ":" + std::to_string(ntohs((u_short)t->table[i].dwRemotePort))},
+                    {"state", (st < 13) ? states[st] : "?"}
+                });
+            }
+        }
+    }
+    return j.dump();
+}
+
+void App::drawSystemPanel() {
+    ImGui::Begin("System");
+    if (dbgState_ == DbgState::Idle || dbgState_ == DbgState::Exited || !debugger_.processHandle()) {
+        ImGui::TextDisabled("(sin sesion de depuracion)"); ImGui::End(); return;
+    }
+    njson j; try { j = njson::parse(systemInfoJson()); } catch (...) {}
+    if (j.contains("handleCount")) ImGui::Text("Handles abiertos: %d", (int)j["handleCount"]);
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Privilegios del token", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (auto& p : j.value("privileges", njson::array())) {
+            bool en = p.value("enabled", false);
+            ImGui::TextColored(en ? ImVec4(0.6f,1,0.6f,1) : ImVec4(0.6f,0.6f,0.6f,1), "%s %s",
+                               en ? "[on] " : "[off]", p.value("name", "").c_str());
+        }
+    }
+    if (ImGui::CollapsingHeader("Conexiones TCP", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::BeginTable("tcp", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
+            ImGui::TableSetupColumn("Local"); ImGui::TableSetupColumn("Remoto"); ImGui::TableSetupColumn("Estado");
+            ImGui::TableHeadersRow();
+            for (auto& c : j.value("tcp", njson::array())) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(c.value("local","").c_str());
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(c.value("remote","").c_str());
+                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(c.value("state","").c_str());
+            }
+            ImGui::EndTable();
+        }
+        if (j.value("tcp", njson::array()).empty()) ImGui::TextDisabled("Sin conexiones TCP IPv4.");
+    }
+    ImGui::TextDisabled("Enumeracion detallada de handles individuales: pendiente (se muestra el conteo).");
+    ImGui::End();
+}
+
 void App::drawThreadsPanel() {
     ImGui::Begin("Threads");
     if (dbgState_ == DbgState::Idle || dbgState_ == DbgState::Exited) {
@@ -4681,6 +4774,9 @@ std::string App::handleMcpCommand(const std::string& line) {
         for (const auto& t : debugger_.threads())
             res["threads"].push_back({{"tid", t.id}, {"current", t.current}, {"priority", t.priority}, {"description", t.description}});
     }
+    else if (cmd == "system_info") {
+        try { res["system"] = njson::parse(systemInfoJson()); } catch (...) { res["ok"] = false; }
+    }
     else if (cmd == "notes_get") {
         std::string h = peContentHash();
         if (!h.empty() && h != notesDebuggeeHash_) loadNotes();
@@ -4971,6 +5067,7 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("poll_events", "Sondea el bus de eventos (streaming). Devuelve eventos con seq > 'since' y el ultimo seq.", obj({{"since", INT}}, {}));
     add("diff_files",  "Compara dos archivos byte a byte y devuelve los rangos que difieren.", obj({{"a", STR}, {"b", STR}}, {"a","b"}));
     add("threads",     "Lista los hilos del proceso depurado (TID, actual, prioridad, descripcion).", obj(EMPTY, {}));
+    add("system_info", "Info del sistema para el proceso: privilegios del token, conexiones TCP y conteo de handles.", obj(EMPTY, {}));
     add("notes_get",   "Devuelve las notas globales y las del binario actual.", obj(EMPTY, {}));
     add("notes_set",   "Guarda notas. scope: 'global' o 'debuggee' (por binario).", obj({{"scope", STR}, {"text", STR}}, {"text"}));
     add("run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));

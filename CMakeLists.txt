@@ -76,6 +76,7 @@ target_link_libraries(DebuggerJpp PRIVATE
     comdlg32    # dialogo abrir archivo
     psapi       # GetMappedFileName / modulos
     ws2_32      # servidor de control MCP
+    iphlpapi    # conexiones TCP del proceso (panel System)
     bcrypt      # token criptografico de sesion MCP
     ntdll)
 

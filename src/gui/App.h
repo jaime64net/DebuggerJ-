@@ -144,6 +144,8 @@ private:
     void drawCallStackPanel();     // Call stack (cadena de frames)
     void drawThreadsPanel();       // hilos del proceso depurado
     void drawNotesPanel();         // notas globales + por-binario (paridad x64dbg)
+    void drawSystemPanel();        // privilegios, conexiones TCP y handles del proceso
+    std::string systemInfoJson();  // misma info para MCP
     void loadNotes();
     void saveNotesGlobal();
     void saveNotesDebuggee();
