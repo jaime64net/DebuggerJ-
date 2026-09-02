@@ -1327,6 +1327,14 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Informes: Archivo -> Exportar SARIF genera SARIF 2.1.0 con las detecciones (packer, entropia, W+X, TLS, pocos imports). Por MCP: report format=sarif.");
             ImGui::BulletText("Unpacking: Plugins -> 'Validar dump' revisa un ejecutable volcado (entrypoint en seccion ejecutable, entropia de codigo, IAT reconstruida). Por MCP: validate_dump.");
             ImGui::BulletText("Seguir procesos hijos: hoy se detectan y listan (list_children). Para 'seguir' un hijo: Archivo -> Detach y luego Attach al PID del hijo (conmutacion manual). El seguimiento simultaneo de varios procesos aun no esta.");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Navegacion del CPU (estilo OllyDbg)");
+            ImGui::BulletText("Clic en una linea SELECCIONA (ya no pone breakpoint). El BP se pone/quita con F2 sobre la seleccion o desde el menu contextual -> Breakpoints.");
+            ImGui::BulletText("Flechas arriba/abajo y RePag/AvPag mueven la seleccion; Shift+flecha o Shift+clic selecciona varias lineas.");
+            ImGui::BulletText("Enter (o doble clic) sobre un call/jmp sigue el salto y te lleva al destino o al inicio del procedimiento.");
+            ImGui::BulletText("Al seleccionar un call/jmp, el panel Referencias muestra automaticamente todas las direcciones que saltan/llaman a ese destino; doble clic o clic derecho -> Go to.");
+            ImGui::BulletText("Menu contextual -> 'Goto RVA / VA...': pide una direccion (VA con 0x, o RVA sin prefijo) y navega alli.");
+            ImGui::BulletText("Menu contextual -> 'Analyze / AI as C++': manda las lineas seleccionadas a la IA y muestra el pseudocodigo C++ en la ventana Code.");
             ImGui::BulletText("Archivo -> Guardar/Cargar sesion conserva el objetivo, argumentos, anotaciones y breakpoints; las direcciones de la imagen principal se guardan como RVA. Los memory breakpoints no se guardan: dependen de paginas validas de la ejecucion actual.");
             ImGui::BulletText("Archivo -> Exportar informe Markdown genera un resumen reproducible de PE, secciones, detecciones, estado y breakpoints. Por MCP, report devuelve el texto y export_report lo guarda en una ruta indicada.");
             ImGui::TextDisabled("Las anotaciones se guardan en la cache de analisis. Consulta MCP y Plugins para automatizacion y extensiones.");
@@ -1502,19 +1510,40 @@ void App::drawCpuContent() {
                 bool isCur = (dbgState_ == DbgState::Paused && in.address == currentIp_);
                 if (isCur) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.35f,0.28f,0.05f,1)));
 
-                // Col BP: click para poner/quitar breakpoint
+                // Col BP: muestra el breakpoint. El click en la FILA solo selecciona;
+                // el doble-click sigue el salto/call (como OllyDbg). El BP se pone/quita
+                // con F2 sobre la seleccion o desde el menu contextual, NO al hacer click.
                 ImGui::TableSetColumnIndex(0);
                 bool bp = hasBp(in.address);
                 ImGui::PushID(i);
-                if (ImGui::Selectable(bp ? "*" : " ", selectedInsn_ == i, ImGuiSelectableFlags_SpanAllColumns)) {
-                    if (bp) debugger_.removeBreakpoint(in.address);
-                    else    debugger_.addBreakpoint(in.address);
-                    selectedInsn_ = i;
+                if (bp) ImGui::TextColored(ImVec4(1,0.35f,0.35f,1), "*"); else ImGui::TextUnformatted(" ");
+                // Resaltado de la seleccion (rango [anchor..sel] para seleccion multiple).
+                int selLo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
+                int selHi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
+                bool inSel = (i >= selLo && i <= selHi && selectedInsn_ >= 0);
+                // Selectable transparente que cubre toda la fila (seleccion + doble clic).
+                ImGui::SameLine(0,0);
+                if (ImGui::Selectable("##sel", inSel,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (ImGui::GetIO().KeyShift && selAnchor_ >= 0) selectedInsn_ = i;   // extiende rango
+                    else { selectedInsn_ = i; selAnchor_ = i; }                          // nueva seleccion
+                    if (ImGui::IsMouseDoubleClicked(0) && in.hasBranchTarget) gotoAddress(in.branchTarget);
                 }
                 // Menu contextual (clic derecho sobre el renglon)
                 if (ImGui::BeginPopupContextItem("cpuctx")) {
-                    selectedInsn_ = i;
-                    ImGui::TextDisabled("0x%s", vaStr(in.address, dbgState_==DbgState::Paused?debugger_.is64():pe_.is64Bit()).c_str());
+                    // Si el click derecho cae fuera de la seleccion multiple, resetea a esta fila;
+                    // si cae dentro del rango, conserva la seleccion (para "AI as C++").
+                    {
+                        int lo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
+                        int hi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
+                        if (!(i >= lo && i <= hi)) { selectedInsn_ = i; selAnchor_ = i; }
+                    }
+                    int selCount = (selAnchor_ >= 0 ? std::abs(selectedInsn_ - selAnchor_) + 1 : 1);
+                    if (selCount > 1) ImGui::TextDisabled("%d lineas seleccionadas", selCount);
+                    else ImGui::TextDisabled("0x%s", vaStr(in.address, dbgState_==DbgState::Paused?debugger_.is64():pe_.is64Bit()).c_str());
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Analyze / AI as C++")) analyzeSelectionAsCpp();
+                    if (ImGui::MenuItem("Goto RVA / VA...")) { gotoRvaBuf_[0] = '\0'; openGotoRva_ = true; }
                     ImGui::Separator();
                     if (ImGui::BeginMenu("Breakpoints")) {
                         if (ImGui::MenuItem(bp ? "Quitar breakpoint" : "Agregar breakpoint")) {
@@ -1653,8 +1682,61 @@ void App::drawCpuContent() {
         }
         ImGui::EndTable();
     }
+
+    // Navegacion con teclado (estilo OllyDbg) cuando el panel CPU tiene foco.
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !insns_.empty()) {
+        bool shift = ImGui::GetIO().KeyShift;
+        int prev = selectedInsn_;
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) selectedInsn_ = selectedInsn_ < 0 ? 0 : std::min((int)insns_.size()-1, selectedInsn_+1);
+        else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) selectedInsn_ = selectedInsn_ <= 0 ? 0 : selectedInsn_-1;
+        else if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) selectedInsn_ = selectedInsn_ < 0 ? 0 : std::min((int)insns_.size()-1, selectedInsn_+20);
+        else if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) selectedInsn_ = selectedInsn_ <= 0 ? 0 : std::max(0, selectedInsn_-20);
+        if (selectedInsn_ != prev) {
+            if (!shift) selAnchor_ = selectedInsn_;      // sin shift, mueve el ancla; con shift, extiende
+            pendingScroll_ = selectedInsn_;              // mantener la seleccion visible
+        }
+        // Enter: seguir el salto/call de la instruccion seleccionada (como OllyDbg).
+        if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() &&
+            (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
+            const auto& s = insns_[selectedInsn_];
+            if (s.hasBranchTarget) gotoAddress(s.branchTarget);
+        }
+        // F2: poner/quitar breakpoint en la linea seleccionada (el click NO lo hace).
+        if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
+            uint64_t a = insns_[selectedInsn_].address;
+            bool has = false; for (auto& b : debugger_.breakpoints()) if (b.address == a) has = true;
+            if (has) debugger_.removeBreakpoint(a); else debugger_.addBreakpoint(a, "cpu");
+        }
+    }
     if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A))
         analyzeCodeAt(insns_[selectedInsn_].address);
+
+    // Xrefs automaticos: al seleccionar un call/jmp, buscar quien salta/llama a su destino
+    // (solo al cambiar de seleccion, para no rescanear cada frame).
+    if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && selectedInsn_ != lastXrefSel_) {
+        lastXrefSel_ = selectedInsn_;
+        const auto& s = insns_[selectedInsn_];
+        if ((s.isCall || s.isJump) && s.hasBranchTarget) findReferences(s.branchTarget);
+    }
+
+    // Popup "Goto RVA / VA": navega a una direccion (RVA relativa a imageBase, o VA con 0x).
+    if (openGotoRva_) { ImGui::OpenPopup("gotorva"); openGotoRva_ = false; }
+    if (ImGui::BeginPopup("gotorva")) {
+        ImGui::TextUnformatted("Ir a direccion (VA con 0x, o RVA sin prefijo):");
+        ImGui::SetNextItemWidth(240);
+        bool ok = ImGui::InputTextWithHint("##grva", "ej: 0x401000  o  1000", gotoRvaBuf_, sizeof(gotoRvaBuf_),
+                     ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_AutoSelectAll);
+        if ((ImGui::Button("Ir") || ok) && gotoRvaBuf_[0]) {
+            std::string t = gotoRvaBuf_;
+            uint64_t v = strtoull(t.c_str(), nullptr, 16);
+            uint64_t va = (t.rfind("0x", 0) == 0 || v >= pe_.imageBase()) ? v : pe_.imageBase() + v;  // RVA -> VA
+            gotoAddress(va);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancelar##grva")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 
     // Popup de anotacion (comentario/etiqueta)
     if (openAnnot_) { ImGui::OpenPopup("annot"); openAnnot_ = false; }
@@ -2919,13 +3001,22 @@ void App::drawTracePanel() {
 
 void App::drawReferencesPanel() {
     ImGui::Begin("Referencias");
-    if (refTarget_) ImGui::Text("Referencias a 0x%s  (%zu)", hex64(refTarget_).c_str(), refs_.size());
-    else ImGui::TextDisabled("Clic derecho en el CPU -> Buscar referencias.");
+    if (refTarget_) ImGui::Text("Saltan/llaman a 0x%s  (%zu)", hex64(refTarget_).c_str(), refs_.size());
+    else ImGui::TextDisabled("Selecciona un call/jmp en el CPU: aqui aparecen quienes saltan alli.");
+    ImGui::TextDisabled("Doble clic o clic derecho -> Go to.");
     ImGui::Separator();
     ImGui::BeginChild("refslist", ImVec2(0, 0), false);
     for (auto a : refs_) {
         ImGui::PushID((int)(a ^ (a >> 32)));
-        if (ImGui::Selectable(("0x" + hex64(a)).c_str())) gotoAddress(a);
+        std::string sym = (dbgState_ == DbgState::Paused) ? debugger_.symbolAt(a) : "";
+        std::string label = "0x" + hex64(a) + (sym.empty() ? "" : ("  " + sym));
+        if (ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick) && ImGui::IsMouseDoubleClicked(0))
+            gotoAddress(a);
+        if (ImGui::BeginPopupContextItem("refctx")) {
+            if (ImGui::MenuItem("Go to")) gotoAddress(a);
+            if (ImGui::MenuItem("Copiar direccion")) ImGui::SetClipboardText(("0x" + hex64(a)).c_str());
+            ImGui::EndPopup();
+        }
         ImGui::PopID();
     }
     ImGui::EndChild();
@@ -4861,6 +4952,43 @@ void App::sendCodeRequest() {
         codeOutput_ = response.empty() ? "[error] " + err : response;
         aiBusy_ = false;
     });
+}
+
+// Manda las instrucciones seleccionadas en el CPU a la IA para interpretarlas como
+// C++, mostrando el resultado en la ventana Code (clic derecho -> Analyze / AI as C++).
+void App::analyzeSelectionAsCpp() {
+    if (aiBusy_) { pushLog("La IA esta ocupada."); return; }
+    const AiAgent* agent = aiConfig_.current();
+    if (!agent) { pushLog("No hay agente de IA configurado (Tools -> Options -> AI)."); return; }
+    if (selectedInsn_ < 0 || insns_.empty()) { pushLog("Selecciona una o varias lineas en el CPU."); return; }
+
+    int lo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
+    int hi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
+    lo = std::max(0, lo); hi = std::min((int)insns_.size()-1, hi);
+    bool is64 = (dbgState_ == DbgState::Paused) ? debugger_.is64() : pe_.is64Bit();
+    std::string asmText;
+    for (int i = lo; i <= hi && i - lo < 400; ++i)
+        asmText += vaStr(insns_[i].address, is64) + "  " + insns_[i].bytes + "\t" + insns_[i].text + "\n";
+
+    winVisible_["Code"] = true;
+    ai_.setAgent(*agent);
+    aiBusy_ = true; aiError_.clear();
+    { std::lock_guard<std::mutex> lk(aiMutex_); codeOutput_ = "Analizando " + std::to_string(hi-lo+1) + " instruccion(es) seleccionada(s)..."; }
+    if (aiThread_.joinable()) aiThread_.join();
+    aiThread_ = std::thread([this, asmText]() {
+        std::string sys =
+            "Eres un analista experto de ensamblador x86/x64 con fines defensivos. Te dan un "
+            "fragmento de codigo desensamblado. Conviertelo en PSEUDOCODIGO C++ legible, marcando "
+            "inferencias y nombres tentativos. Explica llamadas API, efectos y posibles intenciones "
+            "maliciosas. Responde en espanol: un bloque C++ y luego notas breves.";
+        std::vector<ChatMessage> h; h.push_back({"user", "Ensamblador seleccionado:\n" + asmText});
+        std::string err;
+        std::string resp = ai_.send(sys, h, 4096, err);
+        std::lock_guard<std::mutex> lk(aiMutex_);
+        codeOutput_ = resp.empty() ? ("[error] " + err) : resp;
+        aiBusy_ = false;
+    });
+    pushLog("Analisis 'AI as C++' del codigo seleccionado enviado (ver ventana Code).");
 }
 
 void App::drawCodePanel() {

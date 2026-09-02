@@ -204,7 +204,12 @@ private:
     bool          showAttach_ = false;
     char          attachPid_[16] = {0};
     int           selectedInsn_ = -1;
+    int           selAnchor_ = -1;     // ancla para seleccion multiple (rango [anchor..sel])
     int           pendingScroll_ = -1; // indice de instruccion al que hay que desplazar
+    int           lastXrefSel_ = -1;   // ultima seleccion para la que se calcularon xrefs
+    char          gotoRvaBuf_[36] = {0};
+    bool          openGotoRva_ = false;
+    void          analyzeSelectionAsCpp();   // manda las lineas seleccionadas a la ventana Code (IA)
     uint64_t      disBase_ = 0;      // VA base del listado actual
     bool          liveView_ = false; // true = desensamblando memoria viva
 
