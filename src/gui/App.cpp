@@ -683,6 +683,8 @@ void App::render() {
 
     drawAddCustomPopup();
     drawStatusBar();
+
+    applyMagneticSnap();   // imantacion de ventanas (al final, tras el update de movimiento)
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +731,52 @@ void App::arrangeWindows() {
         ImGui::SetWindowPos(names[i], ImVec2(left + c * cw, top + r * ch));
         ImGui::SetWindowSize(names[i], ImVec2(cw - 4, ch - 4));
     }
+}
+
+// Snapping magnetico: mientras se arrastra una ventana, si un borde queda a pocos
+// pixeles de otra ventana gestionada o del borde del area de trabajo, la "pega".
+// Se aplica al final del frame (tras el update de movimiento de ImGui), asi que la
+// ventana se ve imantada cada frame que el cursor este dentro del umbral.
+void App::applyMagneticSnap() {
+    if (!magneticSnap_) return;
+    ImGuiContext* g = ImGui::GetCurrentContext();
+    if (!g || !g->MovingWindow) return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;
+
+    ImGuiWindow* mv = g->MovingWindow->RootWindow ? g->MovingWindow->RootWindow : g->MovingWindow;
+    const float SNAP = 14.0f;   // umbral de imantacion en pixeles
+
+    ImVec2 p = mv->Pos, s = mv->Size;
+    float edgesX[2] = { p.x, p.x + s.x };   // izquierda, derecha
+    float edgesY[2] = { p.y, p.y + s.y };   // arriba, abajo
+    float bestDX = SNAP + 1.0f, bestDY = SNAP + 1.0f, offX = 0.0f, offY = 0.0f;
+
+    auto consider = [](float mvEdge, float otherEdge, float& bestD, float& off) {
+        float d = fabsf(mvEdge - otherEdge);
+        if (d < bestD) { bestD = d; off = otherEdge - mvEdge; }
+    };
+
+    // Bordes del area de trabajo (para pegar a los bordes de la pantalla).
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    float wsX[2] = { vp->WorkPos.x, vp->WorkPos.x + vp->WorkSize.x };
+    float wsY[2] = { vp->WorkPos.y, vp->WorkPos.y + vp->WorkSize.y };
+    for (float me : edgesX) for (float oe : wsX) consider(me, oe, bestDX, offX);
+    for (float me : edgesY) for (float oe : wsY) consider(me, oe, bestDY, offY);
+
+    // Bordes de las demas ventanas gestionadas visibles.
+    for (auto nm : managedWindows()) {
+        ImGuiWindow* w = ImGui::FindWindowByName(nm);
+        if (!w || w == mv || !w->WasActive || w->Collapsed) continue;
+        float wx[2] = { w->Pos.x, w->Pos.x + w->Size.x };
+        float wy[2] = { w->Pos.y, w->Pos.y + w->Size.y };
+        for (float me : edgesX) for (float oe : wx) consider(me, oe, bestDX, offX);
+        for (float me : edgesY) for (float oe : wy) consider(me, oe, bestDY, offY);
+    }
+
+    ImVec2 np = p;
+    if (bestDX <= SNAP) np.x = p.x + offX;
+    if (bestDY <= SNAP) np.y = p.y + offY;
+    if (np.x != p.x || np.y != p.y) mv->Pos = np;   // imanta esta ventana este frame
 }
 
 void App::captureLayout(const std::string& name) {
@@ -830,6 +878,7 @@ void App::drawWindowMenu() {
     if (!ImGui::BeginMenu("Window")) return;
 
     if (ImGui::MenuItem("Arrange Windows")) arrangeWindows();
+    ImGui::MenuItem("Snap magnetico", nullptr, &magneticSnap_);
 
     if (ImGui::BeginMenu("Show")) {
         ensureVisibilityKeys();
@@ -1088,6 +1137,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Depurar -> Seguir procesos hijos (M7): lanza con DEBUG_PROCESS; los procesos hijos se detectan y reportan (evento create_process_child) sin colgar la sesion. Util para malware que se relanza o inyecta. El following completo (cambiar de target) aun no esta.");
             ImGui::BulletText("Plugins -> Hot-reload (M11): recarga los plugins automaticamente al detectar cambios en la carpeta plugins/.");
             ImGui::BulletText("--headless (M10): oculta la ventana y deja el MCP corriendo para automatizacion/batch. --noauth arranca el MCP sin token.");
+            ImGui::BulletText("Snap magnetico (Window -> Snap magnetico): al arrastrar una ventana cerca de otra o del borde de la pantalla, se pega por imantacion (umbral 14 px). Desactivable desde el menu.");
             ImGui::BulletText("Archivo -> Guardar/Cargar sesion conserva el objetivo, argumentos, anotaciones y breakpoints; las direcciones de la imagen principal se guardan como RVA. Los memory breakpoints no se guardan: dependen de paginas validas de la ejecucion actual.");
             ImGui::BulletText("Archivo -> Exportar informe Markdown genera un resumen reproducible de PE, secciones, detecciones, estado y breakpoints. Por MCP, report devuelve el texto y export_report lo guarda en una ruta indicada.");
             ImGui::TextDisabled("Las anotaciones se guardan en la cache de analisis. Consulta MCP y Plugins para automatizacion y extensiones.");

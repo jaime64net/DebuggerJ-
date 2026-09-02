@@ -149,6 +149,7 @@ private:
     void drawWindowMenu();           // menu "Window"
     void drawAddCustomPopup();       // modal para nombrar un layout
     void arrangeWindows();           // mosaico sin solapamiento
+    void applyMagneticSnap();        // pega la ventana en arrastre a los bordes vecinos
     void captureLayout(const std::string& name);
     void applyLayout(const WinLayout& L);
     void loadLayouts();
@@ -355,6 +356,7 @@ private:
     bool          openAddCustom_ = false;
     char          newLayoutName_[64] = {0};
     float         toolbarHeight_ = 44.0f;
+    bool          magneticSnap_ = true;   // pegar ventanas por imantacion al arrastrar
 };
 
 } // namespace dbg
