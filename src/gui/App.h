@@ -200,6 +200,9 @@ private:
     void* contImGuiCtx_ = nullptr;   // contexto ImGui de la ventana Contenedor (para layouts)
     void* contHwnd_ = nullptr;       // HWND de la ventana Contenedor
     int   pendingContWinRect_[4] = {0,0,0,0}; bool pendingContWinMove_ = false;  // reposicionar la ventana OS del Contenedor
+    // Al cargar un layout, los .ini se aplican al INICIO del render de cada contexto (no
+    // mid-frame ni cruzando de contexto, que crasheaba).
+    std::string pendingMainIni_, pendingContIni_;
     bool          beginManaged(const char* name);  // Begin con X (cierra la ventana)
     std::string systemInfoJson();  // misma info para MCP
     void loadNotes();

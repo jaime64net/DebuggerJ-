@@ -911,6 +911,9 @@ void App::render() {
 
     drainMcpQueue();
 
+    // Aplicar el .ini del layout (main) al inicio del frame, antes de dibujar ventanas.
+    if (!pendingMainIni_.empty()) { ImGui::LoadIniSettingsFromMemory(pendingMainIni_.data(), pendingMainIni_.size()); pendingMainIni_.clear(); }
+
     // Animate (step animado): mientras esté activo y pausado, da un paso cada ~15 frames.
     if (animateActive_) {
         if (dbgState_ == DbgState::Paused) {
@@ -1137,14 +1140,10 @@ void App::applyLayout(const WinLayout& L) {
       }
     }
     saveContainerState();
-    // aplicar inis a cada contexto
-    if (!mainIni.empty()) ImGui::LoadIniSettingsFromMemory(mainIni.data(), mainIni.size());
-    if (!contIni.empty() && contImGuiCtx_) {
-        ImGuiContext* prev = ImGui::GetCurrentContext();
-        ImGui::SetCurrentContext((ImGuiContext*)contImGuiCtx_);
-        ImGui::LoadIniSettingsFromMemory(contIni.data(), contIni.size());
-        ImGui::SetCurrentContext(prev);
-    }
+    // Diferir la aplicacion de los .ini: cada contexto lo carga al inicio de SU render
+    // (aplicar aqui, mid-frame y cruzando de contexto, crasheaba).
+    pendingMainIni_ = mainIni;
+    pendingContIni_ = contIni;
     containerDockInit_ = false;   // usar el docking del layout, no reconstruir
     pushLog("Layout aplicado (main + Contenedor): " + L.name);
 }
@@ -4554,6 +4553,8 @@ void App::drawManagedPanel(const char* name) {
 // Se llama con el contexto ImGui de la ventana Contenedor activo (segunda ventana nativa).
 // Dibuja un DockSpace que llena la ventana y ancla ahi los paneles enviados al Contenedor.
 void App::renderContainer() {
+    // Aplicar el .ini del Contenedor (de un layout) al inicio, en su propio contexto.
+    if (!pendingContIni_.empty()) { ImGui::LoadIniSettingsFromMemory(pendingContIni_.data(), pendingContIni_.size()); pendingContIni_.clear(); }
     ImGuiID dock = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
     if (containerDockInit_) {
         containerDockInit_ = false;
