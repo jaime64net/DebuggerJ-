@@ -138,6 +138,8 @@ App::App() {
     loadLayouts();
     loadVisibility();
     ensureVisibilityKeys();
+    // Primer arranque (sin imgui.ini): construir un layout de docking ordenado.
+    { std::ifstream ini("imgui.ini"); if (!ini.good()) dockNeedsInit_ = true; }
 }
 
 App::~App() {
@@ -908,7 +910,8 @@ void App::render() {
 
     // DockSpace del main: permite anclar (dock) las ventanas dentro de la ventana
     // principal. PassthruCentralNode deja el centro transparente para el fondo.
-    ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGuiID mainDock = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+    if (dockNeedsInit_) { dockNeedsInit_ = false; buildDefaultDock(mainDock); }
 
     // Animate (step animado): mientras esté activo y pausado, da un paso cada ~15 frames.
     if (animateActive_) {
@@ -969,8 +972,8 @@ void App::render() {
 
     drawAddCustomPopup();
     drawStatusBar();
-
-    applyMagneticSnap();   // imantacion de ventanas (al final, tras el update de movimiento)
+    // Nota: el snap magnetico se reemplazo por el docking (anclar ventanas), que evita
+    // el solapamiento sin reposicionar cada frame.
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,8 +1164,7 @@ void App::loadVisibility() {
 void App::drawWindowMenu() {
     if (!ImGui::BeginMenu("Window")) return;
 
-    if (ImGui::MenuItem("Arrange Windows")) arrangeWindows();
-    ImGui::MenuItem("Snap magnetico", nullptr, &magneticSnap_);
+    if (ImGui::MenuItem("Arrange Windows (reorganizar)")) dockNeedsInit_ = true;   // reconstruye el layout de docking
 
     if (ImGui::BeginMenu("Show")) {
         ensureVisibilityKeys();
@@ -4381,13 +4383,61 @@ bool App::beginManaged(const char* name) {
     return ret;
 }
 
+// Layout de docking por defecto: CPU al centro, logs abajo, el resto en pestañas a la
+// derecha. Evita que las ventanas se solapen sueltas al abrir por primera vez.
+void App::buildDefaultDock(unsigned int dockspaceId) {
+    ImGui::DockBuilderRemoveNode(dockspaceId);
+    ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->WorkSize);
+
+    ImGuiID center = dockspaceId;
+    ImGuiID down  = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down,  0.26f, nullptr, &center);
+    ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.34f, nullptr, &center);
+
+    ImGui::DockBuilderDockWindow("CPU", center);
+    for (const char* w : { "Log", "MCP Log", "Run trace", "Analysis", "Referencias" })
+        ImGui::DockBuilderDockWindow(w, down);
+    for (const char* w : { "Breakpoints", "Memoria", "Modulos & Simbolos", "Strings & Busqueda",
+                           "Call stack", "Executable modules", "Packers / Proteccion", "Excepciones",
+                           "Plugins", "IA", "Code", "Command", "Watch", "Struct", "CFG", "Compare",
+                           "Script", "Threads", "Notes", "System", "Entropy" })
+        ImGui::DockBuilderDockWindow(w, right);
+    ImGui::DockBuilderFinish(dockspaceId);
+    pushLog("Layout de ventanas reorganizado.");
+}
+
 // Ventana Contenedor: un DockSpace secundario. Con multi-viewport, arrastra su barra de
 // titulo fuera del main y quedara como ventana del sistema (con minimizar/maximizar/cerrar)
 // en el monitor que quieras; ancla dentro las demas ventanas para organizarlas.
 void App::drawContainerPanel() {
     ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Contenedor", &winVisible_["Contenedor"], ImGuiWindowFlags_NoScrollbar)) { ImGui::End(); return; }
-    ImGui::TextDisabled("Arrastra aqui las pestanas de otras ventanas para organizarlas. Puedes sacar esta ventana a otro monitor.");
+
+    // Barra propia con minimizar / maximizar / cerrar.
+    ImGui::TextDisabled("Ancla aqui otras ventanas; puedes sacarla a otro monitor (--viewports).");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 92);
+    if (ImGui::SmallButton("_")) ImGui::SetWindowCollapsed(true);   // minimizar (colapsa)
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimizar (colapsar)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton(contMaximized_ ? "><" : "[]")) {
+        const ImGuiViewport* vp = ImGui::GetWindowViewport();
+        if (!contMaximized_) {
+            ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+            contPrevPosX_ = p.x; contPrevPosY_ = p.y; contPrevW_ = s.x; contPrevH_ = s.y;
+            ImGui::SetWindowPos(vp->WorkPos); ImGui::SetWindowSize(vp->WorkSize);
+            contMaximized_ = true;
+        } else {
+            ImGui::SetWindowPos(ImVec2(contPrevPosX_, contPrevPosY_));
+            ImGui::SetWindowSize(ImVec2(contPrevW_, contPrevH_));
+            contMaximized_ = false;
+        }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(contMaximized_ ? "Restaurar" : "Maximizar");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("X")) { winVisible_["Contenedor"] = false; saveVisibility(); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cerrar");
+    ImGui::Separator();
+
     ImGuiID dock = ImGui::GetID("ContenedorDockSpace");
     ImGui::DockSpace(dock, ImVec2(0, 0), ImGuiDockNodeFlags_None);
     ImGui::End();

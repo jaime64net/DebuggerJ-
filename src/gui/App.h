@@ -164,6 +164,10 @@ private:
     void drawSystemPanel();        // privilegios, conexiones TCP y handles del proceso
     void drawEntropyPanel();       // entropía por sección con barras (diálogo de entropía)
     void drawContainerPanel();     // Contenedor: DockSpace secundario (arrastrable a otro monitor)
+    bool  contMaximized_ = false;
+    float contPrevPosX_ = 0, contPrevPosY_ = 0, contPrevW_ = 0, contPrevH_ = 0;
+    void  buildDefaultDock(unsigned int dockspaceId);   // layout de docking inicial ordenado
+    bool  dockNeedsInit_ = false;  // construir el layout por defecto una vez
     bool          beginManaged(const char* name);  // Begin con X (cierra la ventana)
     std::string systemInfoJson();  // misma info para MCP
     void loadNotes();

@@ -99,17 +99,19 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;    // anclar ventanas dentro del main/contenedor
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;  // sacar ventanas a otros monitores
-    io.ConfigViewportsNoAutoMerge = false;
+    // Multi-viewport (sacar ventanas a otros monitores) SOLO con --viewports: en algunas
+    // GPU/drivers las ventanas de plataforma parpadean, asi que por defecto va desactivado
+    // y el docking (estable) organiza todo dentro del main.
+    bool enableViewports = std::wstring(GetCommandLineW()).find(L"--viewports") != std::wstring::npos;
+    if (enableViewports) {
+        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+        io.ConfigViewportsNoAutoMerge = false;
+    }
     ImGui::StyleColorsDark();
-    // Con viewports, las ventanas fuera del main son ventanas OS: quita el redondeo para
-    // que se vean como ventanas normales del sistema.
-    {
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         ImGuiStyle& style = ImGui::GetStyle();
-        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
-            style.WindowRounding = 0.0f;
-            style.Colors[ImGuiCol_WindowBg].w = 1.0f;
-        }
+        style.WindowRounding = 0.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
     }
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
