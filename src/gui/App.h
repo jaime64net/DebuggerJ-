@@ -41,6 +41,13 @@ public:
     void setContainerOpen(bool v) { containerOpen_ = v; saveContainerState(); }
     void setContainerScreenRect(int x, int y, int w, int h, bool valid);  // desde main.cpp
     void setMainScreenRect(int x, int y, int w, int h);                    // desde main.cpp
+    void setContainerHandles(void* imguiCtx, void* hwnd) { contImGuiCtx_ = imguiCtx; contHwnd_ = hwnd; }
+    // main.cpp consume esto para reposicionar la ventana OS del Contenedor tras aplicar un layout.
+    bool consumeContWinMove(int& x, int& y, int& w, int& h) {
+        if (!pendingContWinMove_) return false;
+        x = pendingContWinRect_[0]; y = pendingContWinRect_[1]; w = pendingContWinRect_[2]; h = pendingContWinRect_[3];
+        pendingContWinMove_ = false; return true;
+    }
     int  vsyncInterval() const { return vsyncOn_ ? 1 : 0; }  // sync interval para Present
     void cliStartMcp(int port, bool bindAll); // arranca el MCP desde linea de comandos
     void cliSetNoAuth(bool on);               // --noauth: bypass del token (antes de cliStartMcp)
@@ -186,6 +193,9 @@ private:
     int   contRectX_=0, contRectY_=0, contRectW_=0, contRectH_=0; bool contRectValid_=false;
     int   mainRectX_=0, mainRectY_=0, mainRectW_=0, mainRectH_=0;
     std::string draggingWin_;        // ventana que se esta moviendo (para el drop)
+    void* contImGuiCtx_ = nullptr;   // contexto ImGui de la ventana Contenedor (para layouts)
+    void* contHwnd_ = nullptr;       // HWND de la ventana Contenedor
+    int   pendingContWinRect_[4] = {0,0,0,0}; bool pendingContWinMove_ = false;  // reposicionar la ventana OS del Contenedor
     bool          beginManaged(const char* name);  // Begin con X (cierra la ventana)
     std::string systemInfoJson();  // misma info para MCP
     void loadNotes();

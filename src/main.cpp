@@ -181,6 +181,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
     if (!appPtr) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
     dbg::App& app = *appPtr; g_app = &app;
+    app.setContainerHandles(g_contCtx, g_contHwnd);   // para guardar/cargar layouts del Contenedor
 
     bool wantMcp = false; int mcpPort = 8377; bool mcpBindAll = false;
     {
@@ -227,6 +228,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRTV, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_pSwapChain->Present(app.vsyncInterval(), 0);
+
+        // Reposicionar la ventana del Contenedor si un layout aplicado lo pidio.
+        { int rx,ry,rw,rh; if (g_contHwnd && app.consumeContWinMove(rx,ry,rw,rh))
+            SetWindowPos(g_contHwnd, nullptr, rx, ry, rw, rh, SWP_NOZORDER | SWP_NOACTIVATE); }
 
         // --- Ventana Contenedor (segundo contexto) ---
         if (g_contCtx) {

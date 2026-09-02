@@ -1059,25 +1059,80 @@ static std::string layoutIniPath(const std::string& name) {
     return std::string(path.begin(), path.end());
 }
 
-// Con docking, un layout completo = el estado .ini de ImGui, que incluye posiciones,
-// tamanos y el DOCKING de AMBOS dockspaces (el del main y el de la ventana Contenedor).
+// Un layout completo guarda: el .ini del contexto principal (posiciones/tamanos/docking del
+// main), el .ini del contexto Contenedor, que paneles estan en el Contenedor, si estaba
+// abierto y la geometria de la ventana OS del Contenedor. Todo en un archivo con secciones.
 void App::captureLayout(const std::string& name) {
-    size_t sz = 0;
-    const char* ini = ImGui::SaveIniSettingsToMemory(&sz);
+    std::string mainIni;
+    { size_t sz = 0; const char* ini = ImGui::SaveIniSettingsToMemory(&sz); if (ini) mainIni.assign(ini, sz); }
+    std::string contIni;
+    if (contImGuiCtx_) {
+        ImGuiContext* prev = ImGui::GetCurrentContext();
+        ImGui::SetCurrentContext((ImGuiContext*)contImGuiCtx_);
+        size_t sz2 = 0; const char* ini2 = ImGui::SaveIniSettingsToMemory(&sz2); if (ini2) contIni.assign(ini2, sz2);
+        ImGui::SetCurrentContext(prev);
+    }
+    // geometria de la ventana OS del Contenedor
+    int cx=0,cy=0,cw=0,ch=0;
+    if (contHwnd_) { RECT rc; if (GetWindowRect((HWND)contHwnd_, &rc)) { cx=rc.left; cy=rc.top; cw=rc.right-rc.left; ch=rc.bottom-rc.top; } }
+
     std::ofstream f(layoutIniPath(name), std::ios::binary | std::ios::trunc);
-    if (f && ini) f.write(ini, sz);
+    if (f) {
+        f << "[meta]\n";
+        f << "open|" << (containerOpen_?1:0) << "\n";
+        f << "contwin|" << cx << "|" << cy << "|" << cw << "|" << ch << "\n";
+        for (auto& [k,v] : winContainer_) if (v) f << "panel|" << k << "\n";
+        f << "[main_ini]\n" << mainIni << "\n";
+        f << "[cont_ini]\n" << contIni << "\n";
+    }
     for (auto& e : customLayouts_) if (e.name == name) { saveLayouts(); pushLog("Layout actualizado: " + name); return; }
     WinLayout L; L.name = name;
     customLayouts_.push_back(L);
     saveLayouts();
-    pushLog("Layout guardado (incluye ambos contenedores): " + name);
+    pushLog("Layout guardado (main + Contenedor): " + name);
 }
 
 void App::applyLayout(const WinLayout& L) {
     std::ifstream f(layoutIniPath(L.name), std::ios::binary);
-    if (!f) { pushLog("Layout sin archivo .ini: " + L.name); return; }
-    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (!data.empty()) { ImGui::LoadIniSettingsFromMemory(data.data(), data.size()); pushLog("Layout aplicado: " + L.name); }
+    if (!f) { pushLog("Layout sin archivo: " + L.name); return; }
+    std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    // separar secciones
+    auto section = [&](const std::string& tag) -> std::string {
+        std::string open = "[" + tag + "]\n";
+        auto s = all.find(open); if (s == std::string::npos) return "";
+        s += open.size();
+        auto e = all.find("\n[", s);
+        return all.substr(s, e == std::string::npos ? std::string::npos : e - s);
+    };
+    std::string meta = section("meta"), mainIni = section("main_ini"), contIni = section("cont_ini");
+
+    // meta: paneles del contenedor, open, geometria
+    winContainer_.clear();
+    { std::stringstream ss(meta); std::string line;
+      while (std::getline(ss, line)) {
+          if (!line.empty() && line.back()=='\r') line.pop_back();
+          auto bar = line.find('|'); if (bar==std::string::npos) continue;
+          std::string k=line.substr(0,bar), rest=line.substr(bar+1);
+          if (k=="open") containerOpen_ = (rest=="1");
+          else if (k=="panel") winContainer_[rest] = true;
+          else if (k=="contwin") {
+              int v[4]={0,0,0,0}; std::stringstream rs(rest); std::string t; int i=0;
+              while (std::getline(rs,t,'|') && i<4) v[i++]=atoi(t.c_str());
+              if (v[2]>0 && v[3]>0) { for(int j=0;j<4;j++) pendingContWinRect_[j]=v[j]; pendingContWinMove_ = true; }
+          }
+      }
+    }
+    saveContainerState();
+    // aplicar inis a cada contexto
+    if (!mainIni.empty()) ImGui::LoadIniSettingsFromMemory(mainIni.data(), mainIni.size());
+    if (!contIni.empty() && contImGuiCtx_) {
+        ImGuiContext* prev = ImGui::GetCurrentContext();
+        ImGui::SetCurrentContext((ImGuiContext*)contImGuiCtx_);
+        ImGui::LoadIniSettingsFromMemory(contIni.data(), contIni.size());
+        ImGui::SetCurrentContext(prev);
+    }
+    containerDockInit_ = false;   // usar el docking del layout, no reconstruir
+    pushLog("Layout aplicado (main + Contenedor): " + L.name);
 }
 
 // La lista de layouts (solo nombres) se guarda en layouts.txt; cada uno tiene su .ini.
@@ -1489,7 +1544,7 @@ void App::drawHelpWindow() {
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Skills de IA (panel IA -> menu Skills)");
             ImGui::BulletText("Skill browser: marca skills (recetas de texto) para aplicarlos al agente de IA actual; sus instrucciones se anaden al prompt del sistema.");
             ImGui::BulletText("Manage Skills: crea (genera una plantilla .md), edita o elimina skills. Se guardan en la carpeta 'skills'. Fase 1 local; el repositorio de comunidad llegara despues.");
-            ImGui::BulletText("Window -> Custom -> Add to custom: guarda el layout COMPLETO (posiciones, tamanos y el docking del main Y del Contenedor) en un .ini con nombre; elige el nombre para restaurarlo. Se guarda y carga para ambos contenedores.");
+            ImGui::BulletText("Window -> Custom -> Add to custom: guarda el layout COMPLETO con nombre: posiciones/tamanos/docking del main Y del Contenedor, que paneles estan en cada uno, si el Contenedor estaba abierto y la posicion/tamano de su ventana. Elige el nombre en Custom para restaurarlo todo (main + Contenedor).");
             ImGui::BulletText("CFG (Window -> CFG): grafo de las funciones analizadas (Analyze this) y sus xrefs; doble clic en un nodo navega a la funcion.");
             ImGui::BulletText("Compare (Window -> Compare): compara dos archivos/dumps byte a byte y lista los rangos que difieren. Tambien por MCP: diff_files.");
             ImGui::BulletText("Struct -> Inferir con IA: pide a la IA una struct probable a partir de los bytes en la direccion base. Tambien por MCP: infer_struct.");
