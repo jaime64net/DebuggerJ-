@@ -135,6 +135,7 @@ App::App() {
     loadSymPath();
     loadNotes();
     loadFavourites();
+    loadSkills();
     loadLayouts();
     loadVisibility();
     ensureVisibilityKeys();
@@ -967,6 +968,8 @@ void App::render() {
     if (visible("Script"))               drawScriptPanel();
     if (showSearchResults_)              drawSearchResultsPanel();
     if (showOptions_)                    drawOptionsWindow();
+    if (showSkillBrowser_)               drawSkillBrowser();
+    if (showSkillManage_)                drawSkillManage();
     if (showHelp_)                       drawHelpWindow();
     if (showAttach_)                     drawAttachWindow();
 
@@ -1504,7 +1507,11 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Cada ventana tiene una X en su barra de titulo para cerrarla (se reactiva en Window -> Show).");
             ImGui::BulletText("Docking: arrastra la barra de titulo de una ventana sobre otra o sobre los bordes para anclarla; las ventanas se agrupan en pestanas y paneles divididos dentro del main.");
             ImGui::BulletText("Ventana Contenedor (Window -> Show -> Contenedor): un segundo espacio de anclaje con botones minimizar/maximizar/cerrar. Ancla dentro las ventanas que no caben en un solo monitor.");
-            ImGui::BulletText("Sacar el Contenedor a OTRO MONITOR: activa Window -> 'Multi-monitor (sacar ventanas fuera del main)' y arrastra la barra de titulo del Contenedor fuera de la ventana principal; se vuelve una ventana del sistema. Si la interfaz parpadea en tu GPU/driver, desactiva esa opcion (o usa el docking dentro del main).");
+            ImGui::BulletText("Sacar el Contenedor a OTRO MONITOR: el multi-monitor viene activado; arrastra la barra de titulo del Contenedor FUERA de la ventana principal y se vuelve una ventana del sistema que puedes llevar a otro monitor. Si la interfaz parpadea en tu GPU/driver, desactivalo en Window -> Multi-monitor (o arranca con --no-viewports).");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Skills de IA (panel IA -> menu Skills)");
+            ImGui::BulletText("Skill browser: marca skills (recetas de texto) para aplicarlos al agente de IA actual; sus instrucciones se anaden al prompt del sistema.");
+            ImGui::BulletText("Manage Skills: crea (genera una plantilla .md), edita o elimina skills. Se guardan en la carpeta 'skills'. Fase 1 local; el repositorio de comunidad llegara despues.");
             ImGui::BulletText("Window -> Custom -> Add to custom: guarda el layout COMPLETO (posiciones, tamanos y el docking del main Y del Contenedor) en un .ini con nombre; elige el nombre para restaurarlo. Se guarda y carga para ambos contenedores.");
             ImGui::BulletText("CFG (Window -> CFG): grafo de las funciones analizadas (Analyze this) y sus xrefs; doble clic en un nodo navega a la funcion.");
             ImGui::BulletText("Compare (Window -> Compare): compara dos archivos/dumps byte a byte y lista los rangos que difieren. Tambien por MCP: diff_files.");
@@ -5470,7 +5477,8 @@ void App::sendAiMessage() {
 
     if (aiThread_.joinable()) aiThread_.join();
 
-    aiThread_ = std::thread([this, hist, userMsg, agentMode]() {
+    std::string skillsPrompt = activeSkillsPrompt();   // skills activos (hilo UI)
+    aiThread_ = std::thread([this, hist, userMsg, agentMode, skillsPrompt]() {
         std::string err, resp;
         if (agentMode) {
             std::string sys =
@@ -5482,7 +5490,7 @@ void App::sendAiMessage() {
                 "debe estar lanzado y PAUSADO (usa dbg_launch y consulta dbg_status). Tras un go/step, "
                 "vuelve a consultar dbg_status/dbg_get_regs para ver el nuevo estado. Encadena varias "
                 "tools si hace falta y, al terminar, resume en texto lo que hiciste. Se conciso y "
-                "tecnico. Responde en espanol.";
+                "tecnico. Responde en espanol." + skillsPrompt;
 
             AiCallbacks cb;
             cb.execTool = [this](const std::string& name, const std::string& argsJson) -> std::string {
@@ -5508,7 +5516,7 @@ void App::sendAiMessage() {
                 "Eres un asistente experto en ingenieria inversa y analisis de malware. "
                 "Ayudas a interpretar ensamblador x86/x64, volcados de memoria, y a identificar "
                 "comportamiento malicioso con fines defensivos (crear antivirus/limpiar equipos). "
-                "Se conciso y tecnico. Responde en espanol.";
+                "Se conciso y tecnico. Responde en espanol." + skillsPrompt;
             std::vector<ChatMessage> h = hist;
             h.push_back({"user", userMsg});
             resp = ai_.send(sys, h, 4096, err);
@@ -5520,8 +5528,181 @@ void App::sendAiMessage() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Skills de IA (Fase 1, locales): recetas en skills/*.md que se inyectan en el system
+// prompt del agente cuando estan marcadas. Un skill es texto (procedimiento), no codigo.
+// ---------------------------------------------------------------------------
+static std::string skillsDir() { return exeSiblingDir() + "\\skills"; }
+static std::string skillsActivePath() { return exeSiblingDir() + "\\skills_active.txt"; }
+
+void App::loadSkills() {
+    skills_.clear();
+    // set de skills activos guardados
+    std::set<std::string> active;
+    { std::ifstream f(skillsActivePath()); std::string l; while (std::getline(f, l)) { if (!l.empty() && l.back()=='\r') l.pop_back(); if(!l.empty()) active.insert(l); } }
+
+    CreateDirectoryA(skillsDir().c_str(), nullptr);
+    std::string pattern = skillsDir() + "\\*.md";
+    std::wstring wpat(pattern.begin(), pattern.end());
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(wpat.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring wname(fd.cFileName);
+        std::string fname(wname.begin(), wname.end());
+        std::ifstream f(skillsDir() + "\\" + fname, std::ios::binary);
+        if (!f) continue;
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        Skill s; s.file = fname; s.name = fname.substr(0, fname.size()-3);
+        // frontmatter --- ... ---
+        std::string body = content;
+        if (content.rfind("---", 0) == 0) {
+            size_t end = content.find("\n---", 3);
+            if (end != std::string::npos) {
+                std::string fm = content.substr(3, end-3);
+                body = content.substr(end + 4);
+                std::stringstream ss(fm); std::string line;
+                while (std::getline(ss, line)) {
+                    if (!line.empty() && line.back()=='\r') line.pop_back();
+                    auto colon = line.find(':'); if (colon == std::string::npos) continue;
+                    std::string k = line.substr(0, colon), v = line.substr(colon+1);
+                    auto trim=[&](std::string&x){ while(!x.empty()&&isspace((unsigned char)x.front()))x.erase(x.begin()); while(!x.empty()&&isspace((unsigned char)x.back()))x.pop_back(); };
+                    trim(k); trim(v);
+                    if (k=="name") s.name=v; else if (k=="description") s.description=v;
+                    else if (k=="author") s.author=v; else if (k=="version") s.version=v;
+                }
+            }
+        }
+        s.body = body;
+        s.active = active.count(s.name) > 0;
+        skills_.push_back(std::move(s));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+void App::saveActiveSkills() {
+    std::ofstream f(skillsActivePath(), std::ios::trunc);
+    if (!f) return;
+    for (auto& s : skills_) if (s.active) f << s.name << "\n";
+}
+
+std::string App::activeSkillsPrompt() {
+    std::string out;
+    for (auto& s : skills_) if (s.active && !s.body.empty()) {
+        out += "\n\n### Skill activo: " + s.name + "\n" + s.body;
+    }
+    if (!out.empty())
+        out = "\n\nEl usuario ha activado los siguientes SKILLS (procedimientos que debes seguir "
+              "cuando apliquen a la tarea):" + out;
+    return out;
+}
+
+void App::createSkillTemplate(const std::string& name, const std::string& desc) {
+    if (name.empty()) return;
+    std::string safe; for (char c : name) safe += (isalnum((unsigned char)c) ? c : '-');
+    CreateDirectoryA(skillsDir().c_str(), nullptr);
+    std::string path = skillsDir() + "\\" + safe + ".md";
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { pushLog("No se pudo crear el skill."); return; }
+    f << "---\n"
+      << "name: " << name << "\n"
+      << "description: " << (desc.empty() ? "Describe que hace este skill" : desc) << "\n"
+      << "author: " << "tu-usuario" << "\n"
+      << "version: 1.0\n"
+      << "tools: [dbg_status, dbg_disasm, dbg_read_mem]\n"
+      << "---\n\n"
+      << "# Objetivo\n"
+      << "Explica en una linea la tarea que resuelve este skill.\n\n"
+      << "# Procedimiento\n"
+      << "1. Primer paso (usa las tools dbg_* que necesites).\n"
+      << "2. Segundo paso...\n"
+      << "3. Al terminar, resume el resultado.\n\n"
+      << "# Notas\n"
+      << "- Direcciones en hex. El proceso debe estar pausado para leer registros/memoria.\n"
+      << "- Sé conciso y técnico.\n";
+    f.close();
+    pushLog("Skill creado: " + path);
+    loadSkills();
+}
+
+void App::drawSkillBrowser() {
+    ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Skill browser", &showSkillBrowser_)) { ImGui::End(); return; }
+    ImGui::TextWrapped("Marca los skills que quieres aplicar al agente de IA actual. Sus instrucciones "
+                       "se anaden al prompt del sistema. Son recetas de texto, no ejecutan codigo.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Recargar")) loadSkills();
+    ImGui::Separator();
+    if (skills_.empty()) ImGui::TextDisabled("No hay skills en la carpeta 'skills'. Crea uno en Manage Skills.");
+    int activeCount = 0;
+    for (int i = 0; i < (int)skills_.size(); ++i) {
+        auto& s = skills_[i];
+        ImGui::PushID(i);
+        if (ImGui::Checkbox("##act", &s.active)) saveActiveSkills();
+        ImGui::SameLine();
+        if (ImGui::TreeNode(s.name.c_str())) {
+            if (!s.description.empty()) ImGui::TextWrapped("%s", s.description.c_str());
+            ImGui::TextDisabled("autor: %s   version: %s", s.author.empty()?"-":s.author.c_str(), s.version.empty()?"-":s.version.c_str());
+            ImGui::Separator();
+            ImGui::TextUnformatted(s.body.substr(0, 1500).c_str());
+            ImGui::TreePop();
+        } else if (!s.description.empty()) { ImGui::SameLine(); ImGui::TextDisabled("- %s", s.description.c_str()); }
+        if (s.active) activeCount++;
+        ImGui::PopID();
+    }
+    ImGui::Separator();
+    ImGui::Text("%d skill(s) activo(s) para el agente actual.", activeCount);
+    ImGui::End();
+}
+
+void App::drawSkillManage() {
+    ImGui::SetNextWindowSize(ImVec2(520, 380), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Manage Skills", &showSkillManage_)) { ImGui::End(); return; }
+    ImGui::TextUnformatted("Crear un skill nuevo (se genera una plantilla .md editable):");
+    ImGui::SetNextItemWidth(180); ImGui::InputTextWithHint("##sn", "nombre", skillNewName_, sizeof(skillNewName_));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(220); ImGui::InputTextWithHint("##sd", "descripcion", skillNewDesc_, sizeof(skillNewDesc_));
+    ImGui::SameLine();
+    if (ImGui::Button("Crear") && skillNewName_[0]) { createSkillTemplate(skillNewName_, skillNewDesc_); skillNewName_[0]=0; skillNewDesc_[0]=0; }
+    ImGui::Separator();
+    ImGui::TextDisabled("Carpeta: %s", skillsDir().c_str());
+    if (skills_.empty()) ImGui::TextDisabled("(sin skills)");
+    for (int i = 0; i < (int)skills_.size(); ++i) {
+        auto& s = skills_[i];
+        ImGui::PushID(i);
+        ImGui::TextUnformatted(s.name.c_str());
+        ImGui::SameLine(260);
+        if (ImGui::SmallButton("Editar")) {
+            std::string p = skillsDir() + "\\" + s.file;
+            ShellExecuteA(nullptr, "open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Eliminar")) {
+            std::string p = skillsDir() + "\\" + s.file;
+            DeleteFileA(p.c_str()); loadSkills(); ImGui::PopID(); break;
+        }
+        ImGui::PopID();
+    }
+    ImGui::End();
+}
+
 void App::drawAiPanel() {
-    beginManaged("IA");
+    { bool was = winVisible_["IA"]; ImGui::Begin("IA", &winVisible_["IA"], ImGuiWindowFlags_MenuBar);
+      if (was && !winVisible_["IA"]) saveVisibility(); }
+
+    // Menu Skills (Fase 1): browser y gestion de skills que se aplican al agente.
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("Skills")) {
+            if (ImGui::MenuItem("Skill browser")) { loadSkills(); showSkillBrowser_ = true; }
+            if (ImGui::MenuItem("Manage Skills")) { loadSkills(); showSkillManage_ = true; }
+            int act = 0; for (auto& s : skills_) if (s.active) act++;
+            ImGui::Separator();
+            ImGui::TextDisabled("%d skill(s) activo(s)", act);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
+    }
 
     // Seleccion del agente: solo se elige entre los ya configurados en Options.
     auto& agents = aiConfig_.agents();

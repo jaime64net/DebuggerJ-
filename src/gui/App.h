@@ -176,6 +176,19 @@ private:
     void drawPluginsPanel();
     void drawLogPanel();
     void drawAiPanel();
+    // --- Skills de IA (Fase 1: locales) ---
+    struct Skill { std::string name, description, author, version, body, file; bool active = false; };
+    std::vector<Skill> skills_;
+    bool  showSkillBrowser_ = false;
+    bool  showSkillManage_  = false;
+    char  skillNewName_[64] = {0};
+    char  skillNewDesc_[192] = {0};
+    void  loadSkills();
+    void  saveActiveSkills();
+    std::string activeSkillsPrompt();   // instrucciones de los skills marcados (para el system prompt)
+    void  createSkillTemplate(const std::string& name, const std::string& desc);
+    void  drawSkillBrowser();
+    void  drawSkillManage();
     void drawCodePanel();
     void drawOptionsWindow();      // Tools -> Options (configuracion de agentes de IA)
     void drawHelpWindow();

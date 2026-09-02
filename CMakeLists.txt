@@ -101,6 +101,12 @@ add_custom_command(TARGET DebuggerJpp POST_BUILD
         ${CMAKE_SOURCE_DIR}/sdk
         $<TARGET_FILE_DIR:DebuggerJpp>/sdk)
 
+# Skills de IA (seed) junto al binario
+add_custom_command(TARGET DebuggerJpp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/skills
+        $<TARGET_FILE_DIR:DebuggerJpp>/skills)
+
 # keystone.dll junto al binario
 add_custom_command(TARGET DebuggerJpp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

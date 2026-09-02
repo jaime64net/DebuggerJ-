@@ -99,11 +99,11 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;    // anclar ventanas dentro del main/contenedor
-    // Multi-viewport (sacar ventanas a otros monitores) SOLO con --viewports: en algunas
-    // GPU/drivers las ventanas de plataforma parpadean, asi que por defecto va desactivado
-    // y el docking (estable) organiza todo dentro del main.
-    bool enableViewports = std::wstring(GetCommandLineW()).find(L"--viewports") != std::wstring::npos;
-    if (enableViewports) {
+    // Multi-viewport ON por defecto: necesario para que el platform interface se inicialice
+    // y las ventanas (p.ej. el Contenedor) puedan SALIR del main a otros monitores. Si en
+    // alguna GPU/driver la interfaz parpadea, se apaga en caliente (Window -> Multi-monitor)
+    // o se arranca con --no-viewports.
+    if (std::wstring(GetCommandLineW()).find(L"--no-viewports") == std::wstring::npos) {
         io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
         io.ConfigViewportsNoAutoMerge = false;
     }
