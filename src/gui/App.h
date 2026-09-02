@@ -35,7 +35,10 @@ public:
     App();
     ~App();
 
-    void render();   // se llama cada frame
+    void render();          // dibuja la ventana principal (contexto main)
+    void renderContainer(); // dibuja la ventana Contenedor nativa (segundo contexto/monitor)
+    bool containerOpen() const { return containerOpen_; }
+    void setContainerOpen(bool v) { containerOpen_ = v; saveContainerState(); }
     int  vsyncInterval() const { return vsyncOn_ ? 1 : 0; }  // sync interval para Present
     void cliStartMcp(int port, bool bindAll); // arranca el MCP desde linea de comandos
     void cliSetNoAuth(bool on);               // --noauth: bypass del token (antes de cliStartMcp)
@@ -164,11 +167,17 @@ private:
     void drawNotesPanel();         // notas globales + por-binario (paridad x64dbg)
     void drawSystemPanel();        // privilegios, conexiones TCP y handles del proceso
     void drawEntropyPanel();       // entropía por sección con barras (diálogo de entropía)
-    void drawContainerPanel();     // Contenedor: DockSpace secundario (arrastrable a otro monitor)
-    bool  contMaximized_ = false;
-    float contPrevPosX_ = 0, contPrevPosY_ = 0, contPrevW_ = 0, contPrevH_ = 0;
     void  buildDefaultDock(unsigned int dockspaceId);   // layout de docking inicial ordenado
     bool  dockNeedsInit_ = false;  // construir el layout por defecto una vez
+    // Ventana Contenedor nativa (segunda ventana OS, sin multi-viewport de ImGui):
+    bool  containerOpen_ = false;                       // ventana Contenedor visible
+    std::map<std::string, bool> winContainer_;          // panel -> se dibuja en el Contenedor
+    bool  containerDockInit_ = false;
+    bool  showInMain(const char* name);                 // visible y NO asignado al Contenedor
+    bool  showInContainer(const char* name);            // visible y asignado al Contenedor
+    void  drawManagedPanel(const char* name);           // despacha a drawXPanel por nombre
+    void  loadContainerState();
+    void  saveContainerState();
     bool          beginManaged(const char* name);  // Begin con X (cierra la ventana)
     std::string systemInfoJson();  // misma info para MCP
     void loadNotes();

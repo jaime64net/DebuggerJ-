@@ -136,6 +136,8 @@ App::App() {
     loadNotes();
     loadFavourites();
     loadSkills();
+    loadContainerState();
+    containerDockInit_ = true;   // construir el layout del Contenedor la primera vez que se dibuje
     loadLayouts();
     loadVisibility();
     ensureVisibilityKeys();
@@ -940,34 +942,9 @@ void App::render() {
 
     drawMenuBar();
     drawToolbar();
-    if (visible("CPU"))                  drawCpuPanel();
-    if (visible("Breakpoints"))          drawBreakpointsPanel();
-    if (visible("Memoria"))              drawMemoryPanel();
-    if (visible("Strings & Busqueda"))   drawStringsPanel();
-    if (visible("Modulos & Simbolos"))   drawModulesPanel();
-    if (visible("Packers / Proteccion")) drawPackerPanel();
-    if (visible("Excepciones"))          drawExceptionsPanel();
-    if (visible("Call stack"))           drawCallStackPanel();
-    if (visible("Threads"))              drawThreadsPanel();
-    if (visible("Notes"))                drawNotesPanel();
-    if (visible("System"))               drawSystemPanel();
-    if (visible("Entropy"))              drawEntropyPanel();
-    if (visible("Contenedor"))           drawContainerPanel();
-    if (visible("Executable modules"))   drawExecModulesPanel();
-    if (visible("Referencias"))          drawReferencesPanel();
-    if (visible("Analysis"))             drawAnalysisPanel();
-    if (visible("Run trace"))            drawTracePanel();
-    if (visible("Plugins"))              drawPluginsPanel();
-    if (visible("MCP Log"))              drawMcpLogPanel();
-    if (visible("Log"))                  drawLogPanel();
-    if (visible("IA"))                   drawAiPanel();
-    if (visible("Code"))                 drawCodePanel();
-    if (visible("Command"))              drawCommandBar();
-    if (visible("Watch"))                drawWatchPanel();
-    if (visible("Struct"))               drawStructPanel();
-    if (visible("CFG"))                  drawCfgPanel();
-    if (visible("Compare"))              drawComparePanel();
-    if (visible("Script"))               drawScriptPanel();
+    // Paneles gestionados: se dibujan en el main salvo los que el usuario envió al Contenedor.
+    for (auto nm : managedWindows())
+        if (showInMain(nm)) drawManagedPanel(nm);
     if (showSearchResults_)              drawSearchResultsPanel();
     if (showOptions_)                    drawOptionsWindow();
     if (showSkillBrowser_)               drawSkillBrowser();
@@ -990,7 +967,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System", "Entropy", "Contenedor"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System", "Entropy"
     };
 }
 
@@ -1171,27 +1148,19 @@ void App::drawWindowMenu() {
 
     if (ImGui::MenuItem("Arrange Windows (reorganizar)")) dockNeedsInit_ = true;   // reconstruye el layout de docking
 
-    // Multi-monitor: permite sacar ventanas (p.ej. el Contenedor) fuera del main a otros
-    // monitores. Se puede apagar en caliente si en tu GPU/driver la interfaz parpadea.
-    {
-        ImGuiIO& io = ImGui::GetIO();
-        bool vp = (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
-        if (ImGui::MenuItem("Multi-monitor (sacar ventanas fuera del main)", nullptr, vp)) {
-            if (vp) io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
-            else {
-                io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
-                io.ConfigViewportsNoAutoMerge = false;
-                ImGuiStyle& st = ImGui::GetStyle();
-                st.WindowRounding = 0.0f; st.Colors[ImGuiCol_WindowBg].w = 1.0f;
-            }
+    // Ventana Contenedor NATIVA (segunda ventana del sistema, se puede llevar a otro monitor
+    // sin parpadeo porque no usa el multi-viewport de ImGui).
+    if (ImGui::MenuItem("Contenedor (ventana aparte para 2do monitor)", nullptr, containerOpen_))
+        setContainerOpen(!containerOpen_);
+    if (containerOpen_ && ImGui::BeginMenu("Enviar al Contenedor")) {
+        ImGui::TextDisabled("Marca los paneles que quieres en la ventana Contenedor:");
+        for (auto nm : managedWindows()) {
+            bool inC = winContainer_[nm];
+            if (ImGui::MenuItem(nm, nullptr, inC)) { winContainer_[nm] = !inC; containerDockInit_ = true; saveContainerState(); }
         }
-        if (vp) ImGui::TextDisabled("  Arrastra la barra del Contenedor fuera del main.");
+        ImGui::EndMenu();
     }
-    // VSync: apagarlo suele quitar el parpadeo cuando una ventana esta en un monitor con
-    // distinta frecuencia de refresco (a costa de posible tearing y mas uso de GPU).
     if (ImGui::MenuItem("VSync", nullptr, &vsyncOn_)) {}
-    ImGui::TextDisabled("  Si el Contenedor parpadea en otro monitor: apaga VSync o iguala");
-    ImGui::TextDisabled("  la frecuencia de refresco de ambos monitores (p.ej. ambos a 60 Hz).");
 
     if (ImGui::BeginMenu("Show")) {
         ensureVisibilityKeys();
@@ -1513,8 +1482,9 @@ void App::drawHelpWindow() {
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Ventanas: docking, X para cerrar y Contenedor");
             ImGui::BulletText("Cada ventana tiene una X en su barra de titulo para cerrarla (se reactiva en Window -> Show).");
             ImGui::BulletText("Docking: arrastra la barra de titulo de una ventana sobre otra o sobre los bordes para anclarla; las ventanas se agrupan en pestanas y paneles divididos dentro del main.");
-            ImGui::BulletText("Ventana Contenedor (Window -> Show -> Contenedor): un segundo espacio de anclaje con botones minimizar/maximizar/cerrar. Ancla dentro las ventanas que no caben en un solo monitor.");
-            ImGui::BulletText("Sacar el Contenedor a OTRO MONITOR: el multi-monitor viene activado; arrastra la barra de titulo del Contenedor FUERA de la ventana principal y se vuelve una ventana del sistema que puedes llevar a otro monitor. Si la interfaz parpadea en tu GPU/driver, desactivalo en Window -> Multi-monitor (o arranca con --no-viewports).");
+            ImGui::BulletText("Ventana Contenedor (Window -> Contenedor): es una VENTANA DEL SISTEMA aparte (con minimizar/maximizar/cerrar propios) que puedes mover a OTRO MONITOR sin parpadeo (no usa el multi-viewport de ImGui, tiene su propio render).");
+            ImGui::BulletText("Enviar paneles al Contenedor: con el Contenedor abierto, Window -> 'Enviar al Contenedor' y marca los paneles que quieres alli; dentro del Contenedor se anclan/organizan con docking igual que en el main. Se recuerda entre sesiones.");
+            ImGui::BulletText("VSync (Window -> VSync): normalmente dejalo activado; solo afecta al suavizado del refresco.");
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Skills de IA (panel IA -> menu Skills)");
             ImGui::BulletText("Skill browser: marca skills (recetas de texto) para aplicarlos al agente de IA actual; sus instrucciones se anaden al prompt del sistema.");
@@ -4441,38 +4411,83 @@ void App::buildDefaultDock(unsigned int dockspaceId) {
 // Ventana Contenedor: un DockSpace secundario. Con multi-viewport, arrastra su barra de
 // titulo fuera del main y quedara como ventana del sistema (con minimizar/maximizar/cerrar)
 // en el monitor que quieras; ancla dentro las demas ventanas para organizarlas.
-void App::drawContainerPanel() {
-    ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Contenedor", &winVisible_["Contenedor"], ImGuiWindowFlags_NoScrollbar)) { ImGui::End(); return; }
+// showInMain/showInContainer: reparto de paneles entre la ventana principal y la ventana
+// Contenedor nativa (segundo monitor). Un panel visible se dibuja en una o en la otra.
+bool App::showInMain(const char* name) { return visible(name) && !winContainer_[name]; }
+bool App::showInContainer(const char* name) { return visible(name) && winContainer_[name]; }
 
-    // Barra propia con minimizar / maximizar / cerrar.
-    ImGui::TextDisabled("Ancla aqui otras ventanas; puedes sacarla a otro monitor (--viewports).");
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 92);
-    if (ImGui::SmallButton("_")) ImGui::SetWindowCollapsed(true);   // minimizar (colapsa)
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimizar (colapsar)");
-    ImGui::SameLine();
-    if (ImGui::SmallButton(contMaximized_ ? "><" : "[]")) {
-        const ImGuiViewport* vp = ImGui::GetWindowViewport();
-        if (!contMaximized_) {
-            ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
-            contPrevPosX_ = p.x; contPrevPosY_ = p.y; contPrevW_ = s.x; contPrevH_ = s.y;
-            ImGui::SetWindowPos(vp->WorkPos); ImGui::SetWindowSize(vp->WorkSize);
-            contMaximized_ = true;
-        } else {
-            ImGui::SetWindowPos(ImVec2(contPrevPosX_, contPrevPosY_));
-            ImGui::SetWindowSize(ImVec2(contPrevW_, contPrevH_));
-            contMaximized_ = false;
-        }
+// Despacha el dibujo de un panel gestionado por su nombre (usado por render y renderContainer).
+void App::drawManagedPanel(const char* name) {
+    std::string n = name;
+    if (n=="CPU") drawCpuPanel();
+    else if (n=="Breakpoints") drawBreakpointsPanel();
+    else if (n=="Memoria") drawMemoryPanel();
+    else if (n=="Strings & Busqueda") drawStringsPanel();
+    else if (n=="Modulos & Simbolos") drawModulesPanel();
+    else if (n=="Packers / Proteccion") drawPackerPanel();
+    else if (n=="Excepciones") drawExceptionsPanel();
+    else if (n=="Call stack") drawCallStackPanel();
+    else if (n=="Threads") drawThreadsPanel();
+    else if (n=="Notes") drawNotesPanel();
+    else if (n=="System") drawSystemPanel();
+    else if (n=="Entropy") drawEntropyPanel();
+    else if (n=="Executable modules") drawExecModulesPanel();
+    else if (n=="Referencias") drawReferencesPanel();
+    else if (n=="Analysis") drawAnalysisPanel();
+    else if (n=="Run trace") drawTracePanel();
+    else if (n=="Plugins") drawPluginsPanel();
+    else if (n=="MCP Log") drawMcpLogPanel();
+    else if (n=="Log") drawLogPanel();
+    else if (n=="IA") drawAiPanel();
+    else if (n=="Code") drawCodePanel();
+    else if (n=="Command") drawCommandBar();
+    else if (n=="Watch") drawWatchPanel();
+    else if (n=="Struct") drawStructPanel();
+    else if (n=="CFG") drawCfgPanel();
+    else if (n=="Compare") drawComparePanel();
+    else if (n=="Script") drawScriptPanel();
+}
+
+// Se llama con el contexto ImGui de la ventana Contenedor activo (segunda ventana nativa).
+// Dibuja un DockSpace que llena la ventana y ancla ahi los paneles enviados al Contenedor.
+void App::renderContainer() {
+    ImGuiID dock = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+    if (containerDockInit_) {
+        containerDockInit_ = false;
+        ImGui::DockBuilderRemoveNode(dock);
+        ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
+        ImGui::DockBuilderSetNodeSize(dock, ImGui::GetMainViewport()->WorkSize);
+        for (auto nm : managedWindows()) if (winContainer_[nm]) ImGui::DockBuilderDockWindow(nm, dock);
+        ImGui::DockBuilderFinish(dock);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(contMaximized_ ? "Restaurar" : "Maximizar");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("X")) { winVisible_["Contenedor"] = false; saveVisibility(); }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cerrar");
-    ImGui::Separator();
+    for (auto nm : managedWindows())
+        if (showInContainer(nm)) drawManagedPanel(nm);
+}
 
-    ImGuiID dock = ImGui::GetID("ContenedorDockSpace");
-    ImGui::DockSpace(dock, ImVec2(0, 0), ImGuiDockNodeFlags_None);
-    ImGui::End();
+static std::string containerStatePath() {
+    wchar_t exe[MAX_PATH]={0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring w(exe); auto p=w.find_last_of(L"\\/");
+    std::wstring dir=(p==std::wstring::npos)?L".":w.substr(0,p);
+    std::wstring path=dir+L"\\container_state.txt";
+    return std::string(path.begin(), path.end());
+}
+void App::saveContainerState() {
+    std::ofstream f(containerStatePath(), std::ios::trunc);
+    if (!f) return;
+    f << "open|" << (containerOpen_?1:0) << "\n";
+    for (auto& [k,v] : winContainer_) if (v) f << "panel|" << k << "\n";
+}
+void App::loadContainerState() {
+    std::ifstream f(containerStatePath());
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back()=='\r') line.pop_back();
+        auto bar=line.find('|'); if (bar==std::string::npos) continue;
+        std::string k=line.substr(0,bar), v=line.substr(bar+1);
+        if (k=="open") containerOpen_ = (v=="1");
+        else if (k=="panel") winContainer_[v] = true;
+    }
 }
 
 void App::drawEntropyPanel() {
