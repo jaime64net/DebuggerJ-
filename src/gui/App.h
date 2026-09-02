@@ -309,13 +309,22 @@ private:
     bool          searchBinHex_ = true;    // true = patron hex, false = texto
     bool          searchBinUtf16_ = false;
 
+    // --- Variables globales (paridad x64dbg $vars) ---
+    std::map<std::string, uint64_t> globalVars_;
+
+    // --- Favourites (herramientas externas, paridad x64dbg) ---
+    struct FavTool { std::string name; std::string command; };
+    std::vector<FavTool> favourites_;
+    void loadFavourites();
+    void runFavourite(const FavTool& f);
+
     // --- Command bar (M1) ---
     char          cmdBar_[512] = {0};
     bool          cmdBarUseAi_ = false;
     std::string   cmdBarResult_;
 
     // --- Watch (M2) ---
-    struct WatchItem { std::string expr; std::string value; bool ok = true; };
+    struct WatchItem { std::string expr; std::string value; bool ok = true; bool watchdog = false; uint64_t last = 0; bool haveLast = false; };
     std::vector<WatchItem> watches_;
     char          watchInput_[128] = {0};
 

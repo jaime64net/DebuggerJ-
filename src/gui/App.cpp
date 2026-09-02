@@ -6,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <array>
 #include <set>
@@ -26,6 +27,7 @@ using njson = nlohmann::json;
 
 namespace dbg {
 
+static std::string favFilePath();   // definida mas abajo; usada en el menu Favourites
 static std::string hex64(uint64_t v)  { char b[24]; std::snprintf(b, sizeof(b), "%016llX", (unsigned long long)v); return b; }
 static std::string hex32(uint32_t v)  { char b[16]; std::snprintf(b, sizeof(b), "%08X", v); return b; }
 static std::string vaStr(uint64_t v, bool is64) { char b[24]; std::snprintf(b, sizeof(b), is64 ? "%016llX" : "%08llX", (unsigned long long)v); return b; }
@@ -131,6 +133,7 @@ App::App() {
     loadRecent();
     loadSymPath();
     loadNotes();
+    loadFavourites();
     loadLayouts();
     loadVisibility();
     ensureVisibilityKeys();
@@ -1316,6 +1319,26 @@ void App::drawMenuBar() {
                 showOptions_ = true;
                 optLoadDraft(aiConfig_.selected());
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reiniciar como administrador")) {
+                wchar_t exe[MAX_PATH] = {0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+                SHELLEXECUTEINFOW sei{}; sei.cbSize = sizeof(sei); sei.lpVerb = L"runas";
+                sei.lpFile = exe; sei.nShow = SW_SHOWNORMAL;
+                if (ShellExecuteExW(&sei)) PostQuitMessage(0);
+                else pushLog("No se pudo reiniciar como admin (cancelado?).");
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Favourites")) {
+            if (favourites_.empty()) ImGui::TextDisabled("(edita favourites.txt: nombre|comando)");
+            for (const auto& f : favourites_) if (ImGui::MenuItem(f.name.c_str())) runFavourite(f);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Recargar favourites")) loadFavourites();
+            if (ImGui::MenuItem("Editar favourites.txt")) {
+                std::string p = favFilePath();
+                if (!std::ifstream(p).good()) { std::ofstream(p) << "# nombre|comando  (usa %DEBUGGEE% y %PID%)\n# Ejemplo: PEview|C:\\tools\\peview.exe %DEBUGGEE%\n"; }
+                ShellExecuteA(nullptr, "open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
@@ -1442,7 +1465,9 @@ void App::drawHelpWindow() {
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Novedades (inspiradas en x64dbg)");
             ImGui::BulletText("Command (Window -> Command): barra de comandos hibrida. '?expr' evalua una expresion; 'cmd {args}' ejecuta una tool dbg_*; JSON crudo se envia tal cual. Marca 'Usar IA' para escribir en lenguaje natural y que el agente controle el debugger.");
-            ImGui::BulletText("Watch (Window -> Watch): evalua expresiones en cada pausa. Ej: dword(esp+4), [eax], rip - mod.base(rip). Usa el motor de expresiones (hex por defecto; byte/word/dword/qword/ptr(a), registros, mod.base/size/fromname, dis.len, [mem], + - * / %% & | ^ ~ << >>).");
+            ImGui::BulletText("Watch (Window -> Watch): evalua expresiones en cada pausa. Ej: dword(esp+4), [eax], rip - mod.base(rip). Usa el motor de expresiones (hex por defecto; byte/word/dword/qword/ptr(a), registros, mod.base/size/fromname, dis.len, [mem], + - * / %% & | ^ ~ << >>). Marca 'Watchdog' para que avise en el Log cuando el valor cambie.");
+            ImGui::BulletText("Variables globales (paridad x64dbg $vars): por MCP var_set/var_get/var_list. Usables en cualquier expresion (Watch, condiciones, eval).");
+            ImGui::BulletText("Favourites (menu Favourites): herramientas externas configurables en favourites.txt (nombre|comando, con %%DEBUGGEE%% y %%PID%%). Tools -> Reiniciar como administrador relanza elevado.");
             ImGui::BulletText("Struct (Window -> Struct): aplica una definicion de campos (byte/word/dword/qword/ptr/string) a una direccion base (que admite expresiones) y muestra los valores leidos de memoria, con offsets automaticos.");
             ImGui::BulletText("CPU -> clic derecho -> Search for: 'All commands' busca una subcadena en todas las instrucciones; 'All intermodular calls' lista las llamadas a APIs de otros modulos (via IAT y thunks); 'Binary string' busca hex o texto. Resultados en la ventana Search results (doble clic para navegar, 'Copiar todo').");
             ImGui::BulletText("Archivo -> Attach a proceso / Detach: adjuntar por PID o desadjuntar dejando el proceso vivo (tambien en el menu Depurar y por MCP attach/detach).");
@@ -3310,6 +3335,8 @@ void App::drawSearchResultsPanel() {
 EvalContext App::makeEvalContext() {
     EvalContext ec;
     ec.readReg = [this](const std::string& n, uint64_t& out) -> bool {
+        // Variable global del usuario (funciona con o sin sesion).
+        { auto gv = globalVars_.find(n); if (gv != globalVars_.end()) { out = gv->second; return true; } }
         if (dbgState_ != DbgState::Paused) return false;
         Registers r = debugger_.registers();
         static const std::map<std::string, uint64_t Registers::*> m64 = {
@@ -3603,6 +3630,12 @@ void App::refreshWatches() {
         uint64_t v = 0; std::string err;
         w.ok = evalExpr(w.expr, v, err);
         w.value = w.ok ? ("0x" + hex64(v)) : ("err: " + err);
+        // Watchdog: alerta cuando el valor cambia respecto al anterior.
+        if (w.ok && w.watchdog) {
+            if (w.haveLast && v != w.last)
+                pushLog("[watchdog] '" + w.expr + "' cambio: 0x" + hex64(w.last) + " -> 0x" + hex64(v));
+            w.last = v; w.haveLast = true;
+        }
     }
 }
 
@@ -3620,9 +3653,10 @@ void App::drawWatchPanel() {
     ImGui::SameLine();
     if (ImGui::Button("Refrescar")) refreshWatches();
     ImGui::Separator();
-    if (ImGui::BeginTable("watches", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+    if (ImGui::BeginTable("watches", 4, ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("Expresion");
         ImGui::TableSetupColumn("Valor", ImGuiTableColumnFlags_WidthFixed, 170);
+        ImGui::TableSetupColumn("Watchdog", ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 30);
         ImGui::TableHeadersRow();
         int del = -1;
@@ -3633,6 +3667,8 @@ void App::drawWatchPanel() {
             ImGui::TextColored(watches_[i].ok ? ImVec4(0.7f,1,0.7f,1) : ImVec4(1,0.6f,0.6f,1), "%s", watches_[i].value.c_str());
             ImGui::TableSetColumnIndex(2);
             ImGui::PushID(i);
+            ImGui::Checkbox("##wd", &watches_[i].watchdog);
+            ImGui::TableSetColumnIndex(3);
             if (ImGui::SmallButton("x")) del = i;
             ImGui::PopID();
         }
@@ -4178,6 +4214,42 @@ static std::string readFileText(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : std::string();
 }
+// Favourites: herramientas externas configurables en favourites.txt (nombre|comando).
+// El comando admite %DEBUGGEE% (ruta del binario) y %PID%.
+static std::string favFilePath() {
+    wchar_t exe[MAX_PATH] = {0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring w(exe); auto p = w.find_last_of(L"\\/");
+    std::wstring dir = (p == std::wstring::npos) ? L"." : w.substr(0, p);
+    std::wstring path = dir + L"\\favourites.txt";
+    return std::string(path.begin(), path.end());
+}
+void App::loadFavourites() {
+    favourites_.clear();
+    std::ifstream f(favFilePath(), std::ios::binary);
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        auto bar = line.find('|');
+        if (bar == std::string::npos || line.empty() || line[0] == '#') continue;
+        favourites_.push_back({ line.substr(0, bar), line.substr(bar + 1) });
+    }
+}
+void App::runFavourite(const FavTool& f) {
+    std::string cmd = f.command;
+    std::string debuggee(loadedPath_.begin(), loadedPath_.end());
+    std::string pid = (dbgState_ != DbgState::Idle) ? std::to_string(debugger_.pid()) : "0";
+    auto rep = [&](const std::string& k, const std::string& v){ size_t p; while ((p = cmd.find(k)) != std::string::npos) cmd.replace(p, k.size(), v); };
+    rep("%DEBUGGEE%", debuggee); rep("%PID%", pid);
+    std::wstring wcmd(cmd.begin(), cmd.end());
+    STARTUPINFOW si{}; si.cb = sizeof(si); PROCESS_INFORMATION pi{};
+    std::wstring mut = wcmd;
+    if (CreateProcessW(nullptr, mut.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        pushLog("Favourite ejecutado: " + f.name);
+    } else pushLog("Favourite fallo: " + f.name);
+}
+
 void App::loadNotes() {
     std::snprintf(notesGlobal_, sizeof(notesGlobal_), "%s", readFileText(notesGlobalPath()).c_str());
     std::string h = peContentHash();
@@ -4945,6 +5017,23 @@ std::string App::handleMcpCommand(const std::string& line) {
         for (auto& e : events_) if (e.seq > since)
             res["events"].push_back({{"seq", e.seq}, {"type", e.type}, {"arg", e.arg}});
     }
+    else if (cmd == "var_set") {
+        std::string name = a.value("name", "");
+        std::string valexpr = a.value("value", "0");
+        uint64_t v = 0; std::string e;
+        if (name.empty()) { res["ok"] = false; res["error"] = "name requerido"; }
+        else if (!evalExpr(valexpr, v, e)) { res["ok"] = false; res["error"] = e; }
+        else { std::string ln = name; for (char& c : ln) c = (char)std::tolower((unsigned char)c); globalVars_[ln] = v; res["value"] = v; }
+    }
+    else if (cmd == "var_get") {
+        std::string ln = a.value("name", ""); for (char& c : ln) c = (char)std::tolower((unsigned char)c);
+        auto it = globalVars_.find(ln);
+        if (it == globalVars_.end()) { res["ok"] = false; res["error"] = "no existe"; }
+        else { res["value"] = it->second; res["hex"] = "0x" + hex64(it->second); }
+    }
+    else if (cmd == "var_list") {
+        for (auto& [k, v] : globalVars_) res["vars"].push_back({{"name", k}, {"value", v}});
+    }
     else if (cmd == "symsrv") {
         std::string path = a.value("path", "");
         debugger_.setSymbolSearchPath(path);
@@ -5181,7 +5270,10 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("find_refs",   "Busca referencias (code+data) a una direccion.", obj({{"addr", HEX}}, {"addr"}));
     add("run_trace",   "Inicia run-trace (registra cada instruccion). Requiere pausado.", obj(EMPTY, {}));
     add("get_trace",   "Devuelve el log del run-trace.", obj(EMPTY, {}));
-    add("eval",        "Evalua una expresion (hex por defecto; byte/dword/ptr(a), reg, mod.base/fromname, dis.len, [mem]).", obj({{"expr", STR}}, {"expr"}));
+    add("eval",        "Evalua una expresion (hex por defecto; byte/dword/ptr(a), reg, mod.base/fromname, dis.len, [mem], variables globales).", obj({{"expr", STR}}, {"expr"}));
+    add("var_set",     "Define una variable global (usable en expresiones). value es una expresion.", obj({{"name", STR}, {"value", STR}}, {"name","value"}));
+    add("var_get",     "Lee una variable global.", obj({{"name", STR}}, {"name"}));
+    add("var_list",    "Lista las variables globales definidas.", obj(EMPTY, {}));
     add("symsrv",      "Configura la ruta de simbolos (symsrv), ej 'srv*C:\\\\symbols*https://msdl.microsoft.com/download/symbols'.", obj({{"path", STR}}, {"path"}));
     add("poll_events", "Sondea el bus de eventos (streaming). Devuelve eventos con seq > 'since' y el ultimo seq.", obj({{"since", INT}}, {}));
     add("diff_files",  "Compara dos archivos byte a byte y devuelve los rangos que difieren.", obj({{"a", STR}, {"b", STR}}, {"a","b"}));
