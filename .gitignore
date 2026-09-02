@@ -129,3 +129,6 @@ ai_config.json
 
 # Dependencias locales reconstruibles o demasiado grandes para el repositorio
 /tools/python-embed/
+
+# Cache local de analisis (generada junto al ejecutable)
+/cache/

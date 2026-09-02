@@ -60,11 +60,40 @@ desensamblado y el volcado hex muestren los bytes reales.
 - **Heurística**: entropía global/por sección > 7.2, pocos imports, secciones con
   nombres conocidos (`UPX0`, `.aspack`, `.vmp`...), y sección de código escribible.
 
-## Ideas para crecer
+## Capacidades implementadas y límites
 
-- Hardware breakpoints (registros de depuración DR0-DR7) y memory breakpoints (guard pages).
-- Símbolos con DbgHelp + PDB, y resolución de nombres de API en el desensamblado.
-- Call stack (walk de la pila) y "trace" de ejecución.
-- Unpacking asistido: dump del proceso en el OEP + reconstrucción de la IAT.
-- Persistencia de sesión (breakpoints, comentarios, etiquetas).
-```
+- Los breakpoints de software admiten contador de impactos, condición y acción de
+  solo-log. La condición es un evaluador seguro y pequeño: registros, `hit`/`hits`,
+  números decimales o `0xHEX`, `&`, `|` y `== != >= <= > <`. No ejecuta código del
+  objetivo ni permite dereferencias, llamadas, paréntesis o scripts.
+- Además de DR0–DR3 y excepciones, hay breakpoints de memoria `PAGE_GUARD` y de
+  eventos de sistema. Los de memoria se rearman mediante Trap Flag, trabajan por
+  páginas completas y no pueden colocarse en la página de pila actual o sobre un
+  `PAGE_GUARD` ajeno.
+- `StackWalk64` sustituye al recorrido ingenuo de `RBP/EBP`. DbgHelp resuelve símbolos
+  y `archivo:línea` cuando un PDB local está disponible. No se configura todavía un
+  symbol server, por lo que optimizaciones, stack pivoting o símbolos ausentes pueden
+  dejar la pila incompleta.
+- El proceso adjuntado puede desadjuntarse mediante `DebugActiveProcessStop` sin
+  terminarlo. Las sesiones lanzadas por DebuggerJ++ sí se detienen con Stop. Aún no se
+  siguen árboles de procesos hijos.
+- MCP usa TCP local autenticado por token y tres niveles de permiso. Al pedir
+  `tools/list`, `mcp/server.mjs` consulta los plugins y expone las acciones JSON/DLL
+  como tools `dbg_plugin_<plugin>_<accion>`.
+- Las sesiones guardan objetivo, argumentos, anotaciones, breakpoints de software
+  (incluidas condiciones/acciones), hardware, excepción y la máscara de eventos. Los
+  breakpoints de memoria no se persisten porque las páginas pertenecen a una ejecución
+  concreta.
+- `buildAnalysisReport()` centraliza el informe Markdown que muestra MCP mediante
+  `dbg_report` o escribe `dbg_export_report`/Archivo → Exportar informe. Incluye solo
+  datos ya analizados (no ejecuta el objetivo ni vuelve a escanearlo).
+- La columna **Flow** de CPU preindexa las VAs de la vista actual y dibuja guías para
+  saltos con destino conocido dentro de ella. `Jump To` recarga una ventana estática o
+  viva desde ese destino si no estaba ya visible; no es todavía un grafo CFG completo.
+- `Analyze this` conserva una función candidata (recorrido lineal hasta `ret`), xrefs
+  de llamadas/saltos y loops por saltos hacia atrás. Esos artefactos, junto con los
+  bookmarks, se guardan en la misma caché validada que comentarios y etiquetas; la
+  ventana Analysis y las tools MCP `list_functions/xrefs/loops` los exponen.
+
+Consulta Help → Roadmap dentro de la aplicación para la lista mantenida de trabajo
+pendiente y sus prioridades.

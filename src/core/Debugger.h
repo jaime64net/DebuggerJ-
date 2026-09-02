@@ -16,6 +16,15 @@ namespace dbg {
 
 enum class DbgState { Idle, Launching, Running, Paused, Exited };
 
+// Eventos de la Windows Debug API que pueden comportarse como breakpoints de
+// sistema. Se combinan como mascara mediante setEventBreakMask().
+enum DebugEventBreak : uint32_t {
+    BreakOnThreadCreate = 1u << 0,
+    BreakOnThreadExit   = 1u << 1,
+    BreakOnDllLoad      = 1u << 2,
+    BreakOnDllUnload    = 1u << 3,
+};
+
 struct Registers {
     bool     is64 = true;
     uint64_t rax=0, rbx=0, rcx=0, rdx=0, rsi=0, rdi=0, rbp=0, rsp=0, rip=0;
@@ -42,12 +51,26 @@ struct LoadedModule {
     std::string path;
 };
 
+struct DebugThread {
+    uint32_t id = 0;
+    bool current = false;
+    uint32_t exitCode = 0;
+    int priority = 0;
+    std::string description;
+};
+
 struct Breakpoint {
     uint64_t address = 0;
     uint8_t  original = 0;    // byte original reemplazado por 0xCC
     bool     enabled = true;
     bool     oneShot = false; // temporal (step-over), se borra al golpear
     bool     installed = false;
+    uint64_t hits = 0;        // impactos totales durante la sesion
+    uint64_t breakOnHit = 0;  // 0=siempre; N=ignorar hasta el impacto N
+    // Expresion booleana simple evaluada en el contexto del hilo que golpea el BP.
+    // Vacia = verdadera. Ej.: "rax == 0", "ecx & 1 != 0", "hit >= 5".
+    std::string condition;
+    bool     logOnly = false; // registra el impacto que cumple, pero no pausa
     std::string label;
 };
 
@@ -59,6 +82,18 @@ struct HwBreakpoint {
     int         len = 1;      // 1/2/4/8
     bool        enabled = true;
     uint32_t    hits = 0;
+    std::string label;
+};
+
+// Breakpoint de memoria basado en PAGE_GUARD. Windows protege paginas completas,
+// por lo que el rango solicitado se redondea y puede recibir accesos vecinos.
+struct MemoryBreakpoint {
+    uint32_t id = 0;
+    uint64_t address = 0;
+    uint64_t size = 0;
+    int type = 0;             // 0=access, 1=write, 8=execute (ExceptionInformation[0])
+    bool enabled = true;
+    uint64_t hits = 0;
     std::string label;
 };
 
@@ -79,6 +114,9 @@ struct DbgCallbacks {
     std::function<void(const std::string&)> onLog;        // mensajes al log
     std::function<void(uint64_t)>            onBreak;      // se detuvo en esta VA
     std::function<void(const LoadedModule&)> onModule;     // DLL cargada
+    // Bus de eventos estilo x64dbg CB_* (Fase 3). type: "create_process","exit_process",
+    // "load_dll","unload_dll","create_thread","exit_thread","exception". arg = VA/base/codigo.
+    std::function<void(const std::string& type, uint64_t arg)> onEvent;
 };
 
 class Debugger {
@@ -90,6 +128,11 @@ public:
     bool launch(const std::wstring& exePath, const std::wstring& args, std::string& err);
     // Se engancha a un proceso ya en ejecucion.
     bool attach(uint32_t pid, std::string& err);
+    // El front-end informa la imagen estatica para relocalizar breakpoints que
+    // se colocaron antes del CREATE_PROCESS_DEBUG_EVENT cuando ASLR cambia base.
+    void setTargetImageLayout(uint64_t preferredBase, uint32_t imageSize);
+    // Libera un attach sin terminar el proceso. Solo aplica a DebugActiveProcess.
+    bool detach(std::string& err);
     void detachAndStop();
 
     void setCallbacks(DbgCallbacks cb) { cb_ = std::move(cb); }
@@ -107,6 +150,10 @@ public:
 
     DbgState state() const { return state_.load(); }
     bool     is64()  const { return is64_; }
+    // M7: seguir procesos hijos. Si esta activo, launch usa DEBUG_PROCESS y el loop
+    // detecta/continua los hijos (sin adoptarlos como target). Fijar antes de launch.
+    void     setFollowChildren(bool on) { followChildren_ = on; }
+    bool     followChildren() const { return followChildren_; }
     uint64_t imageBase() const { return imageBase_; }
     void*    processHandle() const { return hProcess_; }   // HANDLE del proceso
     uint32_t pid() const { return pid_; }
@@ -115,11 +162,16 @@ public:
     // salga del rango del stub [stubLo,stubHi) pero siga dentro de la imagen.
     void     findOEP(uint64_t stubLo, uint64_t stubHi, uint64_t imgLo, uint64_t imgHi);
     uint64_t foundOEP() const { return foundOEP_; }
+    void setEventBreakMask(uint32_t mask) { eventBreakMask_.store(mask); }
+    uint32_t eventBreakMask() const { return eventBreakMask_.load(); }
 
     // --- Breakpoints ---
     bool addBreakpoint(uint64_t va, const std::string& label = "");
     bool removeBreakpoint(uint64_t va);
     void toggleBreakpoint(uint64_t va, bool enabled);
+    bool setBreakpointHitTarget(uint64_t va, uint64_t hit);
+    bool setBreakpointCondition(uint64_t va, const std::string& condition);
+    bool setBreakpointLogOnly(uint64_t va, bool logOnly);
     std::vector<Breakpoint> breakpoints();
 
     // --- Breakpoints de excepcion ---
@@ -134,6 +186,12 @@ public:
     bool removeHwBreakpoint(uint64_t address);
     std::vector<HwBreakpoint> hwBreakpoints();
 
+    // --- Breakpoints de memoria (PAGE_GUARD, requiere proceso pausado) ---
+    bool addMemoryBreakpoint(uint64_t address, uint64_t size, int type,
+                             const std::string& label, std::string& error);
+    bool removeMemoryBreakpoint(uint32_t id);
+    std::vector<MemoryBreakpoint> memoryBreakpoints();
+
     // --- Memoria / registros (validos cuando esta Paused) ---
     size_t readMemory(uint64_t va, void* out, size_t len);
     size_t writeMemory(uint64_t va, const void* in, size_t len);
@@ -141,9 +199,25 @@ public:
     bool setRegister(const std::string& name, uint64_t value);
     std::vector<MemRegion> memoryMap();
     std::vector<LoadedModule> modules();
+    std::vector<DebugThread> threads();
+
+    // Symbol server (M5): path de busqueda de simbolos (formato DbgHelp/symsrv),
+    // ej. "srv*C:\\sym*https://msdl.microsoft.com/download/symbols". Se aplica en el
+    // proximo SymInitialize; si ya hay sesion, refresca de inmediato.
+    void setSymbolSearchPath(const std::string& path);
+    const std::string& symbolSearchPath() const { return symSearchPath_; }
 
     // Simbolos (DbgHelp) y cadena SEH.
     std::string symbolAt(uint64_t va);                    // "modulo!nombre+off" o ""
+    std::string sourceAt(uint64_t va);                    // archivo(linea) PDB, o ""
+    struct StackFrame {
+        uint64_t instruction = 0;
+        uint64_t frame = 0;
+        uint64_t stack = 0;
+        std::string symbol;
+        std::string source;
+    };
+    std::vector<StackFrame> walkStack(size_t maxFrames = 64);
     std::vector<std::pair<uint64_t, uint64_t>> sehChain(); // x86: (record, handler)
 
 private:
@@ -154,6 +228,10 @@ private:
     bool runToRetStep(void* hThread, uint64_t rip, void* disassembler); // avanza el modo step-to-ret
     void reinstallAfterStep();
     void refreshModulesString(MemRegion& r);
+    void relocateTargetImageArtifacts();
+    bool breakpointConditionMatches(const std::string& expression, uint64_t hits, std::string& error);
+    void rearmMemoryPage(uint64_t page);
+    void clearMemoryBreakpoints();
     void setState(DbgState s);
     void log(const std::string& m);
 
@@ -167,12 +245,16 @@ private:
     bool  is64_ = true;
     uint64_t imageBase_ = 0;
     uint64_t entryPoint_ = 0;
+    uint64_t targetPreferredBase_ = 0;
+    uint32_t targetImageSize_ = 0;
+    std::atomic<uint32_t> eventBreakMask_{0};
 
     std::thread worker_;
     std::atomic<DbgState> state_{DbgState::Idle};
     std::atomic<Cmd>      pending_{Cmd::None};
     std::atomic<bool>     resumeSignaled_{false};
     std::atomic<bool>     quit_{false};
+    std::atomic<bool>     detachRequested_{false};
 
     std::mutex bpMutex_;
     std::map<uint64_t, Breakpoint> bps_;
@@ -187,6 +269,16 @@ private:
     void applyHwToThread(void* hThread);
     uint64_t lastHwHit_ = 0;
     bool     hwJustHit_ = false;    // para poner Resume Flag al continuar
+
+    struct MemoryBreakpointEntry {
+        MemoryBreakpoint info;
+        struct Page { uint64_t base = 0; uint32_t originalProtect = 0; };
+        std::vector<Page> pages;
+    };
+    std::mutex memBpMutex_;
+    std::vector<MemoryBreakpointEntry> memBps_;
+    std::vector<uint64_t> pendingGuardRearmPages_;
+    uint32_t nextMemBpId_ = 1;
 
     // step-over interno
     uint64_t stepOverReturn_ = 0;
@@ -213,6 +305,8 @@ private:
 
     std::vector<uint64_t> history_; // VAs de breakpoints golpeados (para rewind logico)
     bool symReady_ = false;         // DbgHelp inicializado
+    std::string symSearchPath_;     // path de simbolos (symsrv); vacio = por defecto
+    bool followChildren_ = false;   // M7: seguir/detectar procesos hijos
 
     DbgCallbacks cb_;
     bool attached_ = false;

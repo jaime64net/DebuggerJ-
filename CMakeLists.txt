@@ -76,6 +76,7 @@ target_link_libraries(DebuggerJpp PRIVATE
     comdlg32    # dialogo abrir archivo
     psapi       # GetMappedFileName / modulos
     ws2_32      # servidor de control MCP
+    bcrypt      # token criptografico de sesion MCP
     ntdll)
 
 set_target_properties(DebuggerJpp PROPERTIES OUTPUT_NAME "DebuggerJ++")
@@ -85,6 +86,17 @@ add_custom_command(TARGET DebuggerJpp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/signatures
         $<TARGET_FILE_DIR:DebuggerJpp>/signatures)
+
+# Manifiestos de plugins declarativos disponibles junto al ejecutable.
+add_custom_command(TARGET DebuggerJpp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/plugins
+        $<TARGET_FILE_DIR:DebuggerJpp>/plugins)
+
+add_custom_command(TARGET DebuggerJpp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/sdk
+        $<TARGET_FILE_DIR:DebuggerJpp>/sdk)
 
 # keystone.dll junto al binario
 add_custom_command(TARGET DebuggerJpp POST_BUILD

@@ -16,8 +16,12 @@ public:
     using Dispatch = std::function<std::string(const std::string&)>;
     ~ControlServer();
 
-    bool start(int port, bool bindAll, Dispatch d, std::string& err);
+    // token es obligatorio: incluso un listener localhost no acepta comandos sin
+    // credencial de sesion. accessLevel: 0=lectura, 1=control, 2=modificacion.
+    bool start(int port, bool bindAll, const std::string& token, int accessLevel,
+               Dispatch d, std::string& err, bool noAuth = false);
     void stop();
+    void setAccessLevel(int level) { accessLevel_.store(level < 0 ? 0 : (level > 2 ? 2 : level)); }
 
     bool running() const { return running_.load(); }
     int  port()    const { return port_; }
@@ -34,6 +38,9 @@ private:
     uintptr_t         listenSock_ = (uintptr_t)~0ull;
     int               port_ = 0;
     bool              wsaUp_ = false;
+    std::string       token_;
+    std::atomic<int>  accessLevel_{0};
+    bool              noAuth_ = false;   // Bypass: acepta comandos sin token (solo uso local)
 };
 
 } // namespace dbg

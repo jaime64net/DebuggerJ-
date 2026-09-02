@@ -5,6 +5,9 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <dbghelp.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 
 namespace dbg {
 
@@ -35,11 +38,53 @@ const char* memTypeToStr(uint32_t t) {
 Debugger::Debugger() {}
 Debugger::~Debugger() { detachAndStop(); }
 
+void Debugger::setTargetImageLayout(uint64_t preferredBase, uint32_t imageSize) {
+    targetPreferredBase_ = preferredBase;
+    targetImageSize_ = imageSize;
+}
+
 void Debugger::setState(DbgState s) {
     state_.store(s);
     if (cb_.onState) cb_.onState(s);
 }
 void Debugger::log(const std::string& m) { if (cb_.onLog) cb_.onLog(m); }
+
+void Debugger::relocateTargetImageArtifacts() {
+    if (!targetPreferredBase_ || !targetImageSize_ || imageBase_ == targetPreferredBase_) return;
+    const uint64_t oldBase = targetPreferredBase_;
+    const uint64_t oldEnd = oldBase + targetImageSize_;
+    auto relocate = [&](uint64_t address) -> uint64_t {
+        return address >= oldBase && address < oldEnd ? imageBase_ + (address - oldBase) : address;
+    };
+
+    size_t moved = 0;
+    {
+        std::lock_guard<std::mutex> lock(bpMutex_);
+        std::map<uint64_t, Breakpoint> relocated;
+        for (auto& [address, bp] : bps_) {
+            const uint64_t newAddress = relocate(address);
+            if (newAddress != address) { bp.address = newAddress; ++moved; }
+            relocated.emplace(newAddress, std::move(bp));
+        }
+        bps_.swap(relocated);
+    }
+    {
+        std::lock_guard<std::mutex> lock(hwMutex_);
+        for (auto& bp : hwBps_) if (bp.address) bp.address = relocate(bp.address);
+    }
+    {
+        std::lock_guard<std::mutex> lock(excMutex_);
+        for (auto& bp : excBreaks_) if (bp.address) bp.address = relocate(bp.address);
+    }
+    if (moved) {
+        char text[128];
+        sprintf_s(text, "ASLR: %zu breakpoint(s) relocalizado(s) de 0x%llX a 0x%llX",
+                  moved, static_cast<unsigned long long>(oldBase), static_cast<unsigned long long>(imageBase_));
+        log(text);
+    }
+    // Evita relocalizar de nuevo si se reutiliza el motor para otra sesion.
+    targetPreferredBase_ = imageBase_;
+}
 
 // ---------------------------------------------------------------------------
 // Lanzamiento / attach. El hilo worker es el DUENO del debuggee: crea el
@@ -47,7 +92,11 @@ void Debugger::log(const std::string& m) { if (cb_.onLog) cb_.onLog(m); }
 // ---------------------------------------------------------------------------
 bool Debugger::launch(const std::wstring& exePath, const std::wstring& args, std::string& err) {
     if (state_.load() != DbgState::Idle) { err = "Ya hay una sesion activa."; return false; }
+    // Un detach limpio termina el worker pero deja el std::thread joinable. Hay
+    // que recogerlo antes de iniciar una nueva sesion para no provocar terminate.
+    if (worker_.joinable()) worker_.join();
     quit_.store(false);
+    detachRequested_.store(false);
     attached_ = false;
     std::wstring cmd = L"\"" + exePath + L"\"";
     if (!args.empty()) cmd += L" " + args;
@@ -57,8 +106,9 @@ bool Debugger::launch(const std::wstring& exePath, const std::wstring& args, std
         STARTUPINFOW si{}; si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
         std::wstring cmdMut = cmd;
+        DWORD dbgFlags = (followChildren_ ? DEBUG_PROCESS : DEBUG_ONLY_THIS_PROCESS) | CREATE_NEW_CONSOLE;
         BOOL ok = CreateProcessW(exePath.c_str(), cmdMut.data(), nullptr, nullptr, FALSE,
-                                 DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+                                 dbgFlags,
                                  nullptr, nullptr, &si, &pi);
         if (!ok) {
             log("CreateProcess fallo, error " + std::to_string(GetLastError()));
@@ -76,7 +126,9 @@ bool Debugger::launch(const std::wstring& exePath, const std::wstring& args, std
 
 bool Debugger::attach(uint32_t pid, std::string& err) {
     if (state_.load() != DbgState::Idle) { err = "Ya hay una sesion activa."; return false; }
+    if (worker_.joinable()) worker_.join();
     quit_.store(false);
+    detachRequested_.store(false);
     attached_ = true;
     pid_ = pid;
     setState(DbgState::Launching);
@@ -87,9 +139,28 @@ bool Debugger::attach(uint32_t pid, std::string& err) {
             return;
         }
         hProcess_ = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+        if (!hProcess_) {
+            log("OpenProcess fallo tras DebugActiveProcess, error " + std::to_string(GetLastError()));
+            DebugActiveProcessStop(pid);
+            setState(DbgState::Exited);
+            return;
+        }
         log("Enganchado al PID " + std::to_string(pid));
         debugLoop();
     });
+    return true;
+}
+
+bool Debugger::detach(std::string& err) {
+    err.clear();
+    if (!attached_) { err = "la sesion no fue iniciada mediante Attach"; return false; }
+    const DbgState current = state_.load();
+    if (current == DbgState::Idle || current == DbgState::Exited) { err = "no hay un proceso adjuntado activo"; return false; }
+    detachRequested_.store(true);
+    // Si ya esta pausado, desbloquea la espera. Si corre, genera un evento para
+    // llegar al punto seguro donde el hilo de depuracion llama DebugActiveProcessStop.
+    resumeSignaled_.store(true);
+    if (hProcess_ && current == DbgState::Running) DebugBreakProcess(hProcess_);
     return true;
 }
 
@@ -98,9 +169,21 @@ void Debugger::detachAndStop() {
     pending_.store(Cmd::Stop);
     resumeSignaled_.store(true);
     if (worker_.joinable()) worker_.join();
+    clearMemoryBreakpoints();
     if (symReady_ && hProcess_) { SymCleanup(hProcess_); symReady_ = false; }
     if (hProcess_) { CloseHandle(hProcess_); hProcess_ = nullptr; }
+    attached_ = false;
+    detachRequested_.store(false);
     state_.store(DbgState::Idle);
+}
+
+void Debugger::setSymbolSearchPath(const std::string& path) {
+    symSearchPath_ = path;
+    // Si ya hay una sesion con DbgHelp activo, aplica el nuevo path y recarga modulos.
+    if (symReady_ && hProcess_) {
+        SymSetSearchPath(hProcess_, path.empty() ? nullptr : path.c_str());
+        SymRefreshModuleList(hProcess_);
+    }
 }
 
 std::string Debugger::symbolAt(uint64_t va) {
@@ -117,6 +200,74 @@ std::string Debugger::symbolAt(uint64_t va) {
     s += si->Name;
     if (disp) { char d[32]; sprintf_s(d, "+0x%llX", (unsigned long long)disp); s += d; }
     return s;
+}
+
+std::string Debugger::sourceAt(uint64_t va) {
+    if (!symReady_ || !hProcess_ || !va) return "";
+    IMAGEHLP_LINE64 line{};
+    line.SizeOfStruct = sizeof(line);
+    DWORD displacement = 0;
+    if (!SymGetLineFromAddr64(hProcess_, va, &displacement, &line) || !line.FileName) return "";
+    std::string out = line.FileName;
+    out += ":" + std::to_string(line.LineNumber);
+    if (displacement) out += "+" + std::to_string(displacement);
+    return out;
+}
+
+static BOOL CALLBACK debuggerReadMemory64(HANDLE process, DWORD64 address, PVOID buffer,
+                                          DWORD size, LPDWORD bytesRead) {
+    SIZE_T read = 0;
+    const BOOL ok = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), buffer, size, &read);
+    if (bytesRead) *bytesRead = static_cast<DWORD>(read);
+    return ok;
+}
+
+std::vector<Debugger::StackFrame> Debugger::walkStack(size_t maxFrames) {
+    std::vector<StackFrame> out;
+    if (state_.load() != DbgState::Paused || !hProcess_ || !hThread_ || !maxFrames) return out;
+
+    STACKFRAME64 frame{};
+    DWORD machine = 0;
+    CONTEXT c64{};
+    WOW64_CONTEXT c32{};
+    void* context = nullptr;
+    if (is64_) {
+        c64.ContextFlags = CONTEXT_ALL;
+        if (!GetThreadContext((HANDLE)hThread_, &c64)) return out;
+        machine = IMAGE_FILE_MACHINE_AMD64;
+        frame.AddrPC.Offset = c64.Rip; frame.AddrFrame.Offset = c64.Rbp; frame.AddrStack.Offset = c64.Rsp;
+        context = &c64;
+    } else {
+        c32.ContextFlags = WOW64_CONTEXT_ALL;
+        if (!Wow64GetThreadContext((HANDLE)hThread_, &c32)) return out;
+        machine = IMAGE_FILE_MACHINE_I386;
+        frame.AddrPC.Offset = c32.Eip; frame.AddrFrame.Offset = c32.Ebp; frame.AddrStack.Offset = c32.Esp;
+        context = &c32;
+    }
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Mode = AddrModeFlat;
+
+    auto append = [&](const STACKFRAME64& f) {
+        if (!f.AddrPC.Offset) return;
+        StackFrame item;
+        item.instruction = f.AddrPC.Offset;
+        item.frame = f.AddrFrame.Offset;
+        item.stack = f.AddrStack.Offset;
+        item.symbol = symbolAt(item.instruction);
+        item.source = sourceAt(item.instruction);
+        out.push_back(std::move(item));
+    };
+    append(frame);
+    for (size_t i = 1; i < maxFrames; ++i) {
+        const DWORD64 previous = frame.AddrPC.Offset;
+        if (!StackWalk64(machine, hProcess_, (HANDLE)hThread_, &frame, context, debuggerReadMemory64,
+                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr) ||
+            !frame.AddrPC.Offset || frame.AddrPC.Offset == previous)
+            break;
+        append(frame);
+    }
+    return out;
 }
 
 std::vector<std::pair<uint64_t, uint64_t>> Debugger::sehChain() {
@@ -203,6 +354,27 @@ void Debugger::toggleBreakpoint(uint64_t va, bool enabled) {
     it->second.enabled = enabled;
     if (enabled) installBreakpoint(it->second);
     else uninstallBreakpoint(it->second);
+}
+bool Debugger::setBreakpointHitTarget(uint64_t va, uint64_t hit) {
+    std::lock_guard<std::mutex> lk(bpMutex_);
+    auto it = bps_.find(va);
+    if (it == bps_.end() || it->second.oneShot) return false;
+    it->second.breakOnHit = hit;
+    return true;
+}
+bool Debugger::setBreakpointCondition(uint64_t va, const std::string& condition) {
+    std::lock_guard<std::mutex> lk(bpMutex_);
+    auto it = bps_.find(va);
+    if (it == bps_.end() || it->second.oneShot) return false;
+    it->second.condition = condition;
+    return true;
+}
+bool Debugger::setBreakpointLogOnly(uint64_t va, bool logOnly) {
+    std::lock_guard<std::mutex> lk(bpMutex_);
+    auto it = bps_.find(va);
+    if (it == bps_.end() || it->second.oneShot) return false;
+    it->second.logOnly = logOnly;
+    return true;
 }
 std::vector<Breakpoint> Debugger::breakpoints() {
     std::lock_guard<std::mutex> lk(bpMutex_);
@@ -318,6 +490,101 @@ std::vector<HwBreakpoint> Debugger::hwBreakpoints() {
     return v;
 }
 
+// --------- Memory breakpoints (PAGE_GUARD) ---------
+bool Debugger::addMemoryBreakpoint(uint64_t address, uint64_t size, int type,
+                                   const std::string& label, std::string& error) {
+    error.clear();
+    if (state_.load() != DbgState::Paused || !hProcess_) { error = "el proceso debe estar pausado"; return false; }
+    if (!address || !size || (type != 0 && type != 1 && type != 8) || address + size < address) {
+        error = "direccion, tamano o tipo invalido"; return false;
+    }
+    SYSTEM_INFO si{}; GetSystemInfo(&si);
+    const uint64_t pageSize = si.dwPageSize ? si.dwPageSize : 4096;
+    const uint64_t firstPage = address & ~(pageSize - 1);
+    const uint64_t lastPage = (address + size - 1) & ~(pageSize - 1);
+    const uint64_t pageCount = ((lastPage - firstPage) / pageSize) + 1;
+    if (pageCount > 16384) { error = "rango demasiado grande (maximo 16384 paginas)"; return false; }
+
+    // Un guard en la pagina de la pila del hilo detenido se dispara continuamente
+    // por el propio flujo de llamadas. OllyDbg tambien recomienda no usar ese
+    // destino; rechazarlo aqui evita una sesion muy lenta o dificil de reanudar.
+    const Registers regs = registers();
+    if (regs.rsp >= firstPage && regs.rsp <= lastPage) {
+        error = "no se permite un memory breakpoint sobre la pagina de pila actual";
+        return false;
+    }
+
+    MemoryBreakpointEntry entry;
+    std::lock_guard<std::mutex> lock(memBpMutex_);
+    entry.info.id = nextMemBpId_++;
+    entry.info.address = address; entry.info.size = size; entry.info.type = type; entry.info.label = label;
+    for (const auto& existing : memBps_)
+        for (const auto& page : existing.pages)
+            if (page.base >= firstPage && page.base <= lastPage) { error = "el rango se superpone a otro memory breakpoint"; return false; }
+
+    for (uint64_t page = firstPage; page <= lastPage; page += pageSize) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(hProcess_, reinterpret_cast<LPCVOID>(page), &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || (mbi.Protect & 0xFF) == PAGE_NOACCESS || (mbi.Protect & PAGE_GUARD)) {
+            error = "pagina no protegible, inaccesible o ya guardada";
+            for (const auto& set : entry.pages) { DWORD old = 0; VirtualProtectEx(hProcess_, reinterpret_cast<LPVOID>(set.base), pageSize, set.originalProtect, &old); }
+            return false;
+        }
+        DWORD oldProtect = 0;
+        if (!VirtualProtectEx(hProcess_, reinterpret_cast<LPVOID>(page), pageSize, mbi.Protect | PAGE_GUARD, &oldProtect)) {
+            error = "VirtualProtectEx fallo " + std::to_string(GetLastError());
+            for (const auto& set : entry.pages) { DWORD old = 0; VirtualProtectEx(hProcess_, reinterpret_cast<LPVOID>(set.base), pageSize, set.originalProtect, &old); }
+            return false;
+        }
+        entry.pages.push_back({page, mbi.Protect});
+        if (page == lastPage) break; // evita overflow al sumar en el limite de VA
+    }
+    memBps_.push_back(std::move(entry));
+    log("Memory breakpoint agregado en 0x" + [&]{ char text[32]; sprintf_s(text, "%llX", static_cast<unsigned long long>(address)); return std::string(text); }());
+    return true;
+}
+
+bool Debugger::removeMemoryBreakpoint(uint32_t id) {
+    std::lock_guard<std::mutex> lock(memBpMutex_);
+    for (auto it = memBps_.begin(); it != memBps_.end(); ++it) {
+        if (it->info.id != id) continue;
+        SYSTEM_INFO si{}; GetSystemInfo(&si); const SIZE_T pageSize = si.dwPageSize ? si.dwPageSize : 4096;
+        for (const auto& page : it->pages) { DWORD old = 0; VirtualProtectEx(hProcess_, reinterpret_cast<LPVOID>(page.base), pageSize, page.originalProtect, &old); }
+        memBps_.erase(it);
+        return true;
+    }
+    return false;
+}
+
+std::vector<MemoryBreakpoint> Debugger::memoryBreakpoints() {
+    std::lock_guard<std::mutex> lock(memBpMutex_);
+    std::vector<MemoryBreakpoint> out;
+    for (const auto& entry : memBps_) out.push_back(entry.info);
+    return out;
+}
+
+void Debugger::rearmMemoryPage(uint64_t pageBase) {
+    std::lock_guard<std::mutex> lock(memBpMutex_);
+    SYSTEM_INFO si{}; GetSystemInfo(&si); const SIZE_T pageSize = si.dwPageSize ? si.dwPageSize : 4096;
+    for (const auto& entry : memBps_) if (entry.info.enabled)
+        for (const auto& page : entry.pages) if (page.base == pageBase) {
+            DWORD old = 0;
+            VirtualProtectEx(hProcess_, reinterpret_cast<LPVOID>(page.base), pageSize, page.originalProtect | PAGE_GUARD, &old);
+            return;
+        }
+}
+
+void Debugger::clearMemoryBreakpoints() {
+    std::lock_guard<std::mutex> lock(memBpMutex_);
+    if (hProcess_) {
+        SYSTEM_INFO si{}; GetSystemInfo(&si); const SIZE_T pageSize = si.dwPageSize ? si.dwPageSize : 4096;
+        for (const auto& entry : memBps_) for (const auto& page : entry.pages) {
+            DWORD old = 0; VirtualProtectEx(hProcess_, reinterpret_cast<LPVOID>(page.base), pageSize, page.originalProtect, &old);
+        }
+    }
+    memBps_.clear(); pendingGuardRearmPages_.clear();
+}
+
 void Debugger::installBreakpoint(Breakpoint& bp) {
     if (bp.installed || !bp.enabled || !hProcess_) return;
     uint8_t orig = 0; SIZE_T rd = 0;
@@ -367,6 +634,79 @@ Registers Debugger::registers() {
         r.fs=(uint16_t)c.SegFs; r.gs=(uint16_t)c.SegGs; r.ss=(uint16_t)c.SegSs;
     }
     return r;
+}
+
+// Evaluador deliberadamente pequeno para condiciones de breakpoint. No ejecuta
+// codigo del proceso ni interpreta expresiones arbitrarias: solamente registros,
+// hit/hits, numeros (decimal o 0xHEX), &, | y comparadores. Esto mantiene la
+// condicion determinista y segura dentro del hilo de depuracion.
+bool Debugger::breakpointConditionMatches(const std::string& expression, uint64_t hits, std::string& error) {
+    error.clear();
+    auto trim = [](std::string s) {
+        const auto begin = s.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) return std::string{};
+        const auto end = s.find_last_not_of(" \t\r\n");
+        return s.substr(begin, end - begin + 1);
+    };
+    std::string expr = trim(expression);
+    if (expr.empty()) return true;
+    std::transform(expr.begin(), expr.end(), expr.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (expr == "true") return true;
+    if (expr == "false") return false;
+
+    const Registers r = registers();
+    auto atom = [&](const std::string& raw, uint64_t& out) -> bool {
+        std::string s = trim(raw);
+        if (s == "hit" || s == "hits") { out = hits; return true; }
+        const std::pair<const char*, uint64_t> regs[] = {
+            {"rax",r.rax},{"rbx",r.rbx},{"rcx",r.rcx},{"rdx",r.rdx},{"rsi",r.rsi},{"rdi",r.rdi},
+            {"rbp",r.rbp},{"rsp",r.rsp},{"rip",r.rip},{"r8",r.r8},{"r9",r.r9},{"r10",r.r10},
+            {"r11",r.r11},{"r12",r.r12},{"r13",r.r13},{"r14",r.r14},{"r15",r.r15},{"eflags",r.eflags},
+            {"eax",r.rax & 0xFFFFFFFFu},{"ebx",r.rbx & 0xFFFFFFFFu},{"ecx",r.rcx & 0xFFFFFFFFu},
+            {"edx",r.rdx & 0xFFFFFFFFu},{"esi",r.rsi & 0xFFFFFFFFu},{"edi",r.rdi & 0xFFFFFFFFu},
+            {"ebp",r.rbp & 0xFFFFFFFFu},{"esp",r.rsp & 0xFFFFFFFFu},{"eip",r.rip & 0xFFFFFFFFu}
+        };
+        for (const auto& reg : regs) if (s == reg.first) { out = reg.second; return true; }
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(s.c_str(), &end, 0);
+        if (end && *end == '\0' && !s.empty()) { out = static_cast<uint64_t>(value); return true; }
+        error = "termino invalido '" + s + "'";
+        return false;
+    };
+    auto term = [&](const std::string& raw, uint64_t& out) -> bool {
+        const std::string s = trim(raw);
+        const size_t op = s.find_first_of("&|");
+        if (op == std::string::npos) return atom(s, out);
+        if (!atom(s.substr(0, op), out)) return false;
+        size_t pos = op;
+        while (pos < s.size()) {
+            const char operation = s[pos++];
+            const size_t next = s.find_first_of("&|", pos);
+            uint64_t rhs = 0;
+            if (!atom(s.substr(pos, next == std::string::npos ? std::string::npos : next - pos), rhs)) return false;
+            out = operation == '&' ? (out & rhs) : (out | rhs);
+            if (next == std::string::npos) break;
+            pos = next;
+        }
+        return true;
+    };
+
+    static const char* comparisons[] = {"==", "!=", ">=", "<=", ">", "<"};
+    for (const char* comparison : comparisons) {
+        const size_t pos = expr.find(comparison);
+        if (pos == std::string::npos) continue;
+        uint64_t lhs = 0, rhs = 0;
+        if (!term(expr.substr(0, pos), lhs) || !term(expr.substr(pos + std::strlen(comparison)), rhs)) return false;
+        if (std::strcmp(comparison, "==") == 0) return lhs == rhs;
+        if (std::strcmp(comparison, "!=") == 0) return lhs != rhs;
+        if (std::strcmp(comparison, ">=") == 0) return lhs >= rhs;
+        if (std::strcmp(comparison, "<=") == 0) return lhs <= rhs;
+        if (std::strcmp(comparison, ">") == 0) return lhs > rhs;
+        return lhs < rhs;
+    }
+    uint64_t value = 0;
+    if (!term(expr, value)) return false;
+    return value != 0;
 }
 
 bool Debugger::setRegister(const std::string& name, uint64_t value) {
@@ -479,6 +819,31 @@ std::vector<LoadedModule> Debugger::modules() {
     return modules_;
 }
 
+std::vector<DebugThread> Debugger::threads() {
+    std::vector<DebugThread> out;
+    if (!pid_) return out;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return out;
+    THREADENTRY32 item{}; item.dwSize = sizeof(item);
+    if (Thread32First(snapshot, &item)) {
+        do {
+            if (item.th32OwnerProcessID != pid_) continue;
+            DebugThread thread; thread.id = item.th32ThreadID; thread.current = item.th32ThreadID == curTid_;
+            HANDLE handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, item.th32ThreadID);
+            if (handle) {
+                DWORD exitCode = STILL_ACTIVE;
+                if (GetExitCodeThread(handle, &exitCode)) thread.exitCode = exitCode;
+                thread.priority = GetThreadPriority(handle);
+                CloseHandle(handle);
+            }
+            out.push_back(std::move(thread));
+        } while (Thread32Next(snapshot, &item));
+    }
+    CloseHandle(snapshot);
+    std::sort(out.begin(), out.end(), [](const DebugThread& a, const DebugThread& b) { return a.id < b.id; });
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Loop de depuracion
 // ---------------------------------------------------------------------------
@@ -507,8 +872,17 @@ void Debugger::debugLoop() {
 
         switch (ev.dwDebugEventCode) {
         case CREATE_PROCESS_DEBUG_EVENT: {
+            // M7: proceso hijo (DEBUG_PROCESS). No lo adoptamos como target; lo
+            // detectamos, reportamos y dejamos correr para no colgarlo.
+            if (pid_ && ev.dwProcessId != pid_) {
+                log("Proceso hijo detectado, PID " + std::to_string(ev.dwProcessId));
+                if (cb_.onEvent) cb_.onEvent("create_process_child", ev.dwProcessId);
+                if (ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
+                break;
+            }
             imageBase_ = (uint64_t)ev.u.CreateProcessInfo.lpBaseOfImage;
             entryPoint_ = (uint64_t)ev.u.CreateProcessInfo.lpStartAddress;
+            relocateTargetImageArtifacts();
             BOOL wow = FALSE;
             IsWow64Process(hProcess_, &wow);
             is64_ = !wow; // en host x64: WOW64 => target de 32 bits
@@ -517,7 +891,8 @@ void Debugger::debugLoop() {
                 + (is64_ ? "  (64 bits)" : "  (32 bits)"));
             if (!symReady_) {
                 SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-                if (SymInitialize(hProcess_, nullptr, TRUE)) symReady_ = true;
+                if (SymInitialize(hProcess_, symSearchPath_.empty() ? nullptr : symSearchPath_.c_str(), TRUE))
+                    symReady_ = true;
             }
             if (ev.u.CreateProcessInfo.hThread) applyHwToThread(ev.u.CreateProcessInfo.hThread);
             if (ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
@@ -525,6 +900,22 @@ void Debugger::debugLoop() {
         }
         case CREATE_THREAD_DEBUG_EVENT: {
             if (ev.u.CreateThread.hThread) applyHwToThread(ev.u.CreateThread.hThread);
+            log("Hilo creado, TID " + std::to_string(ev.dwThreadId));
+            if (eventBreakMask_.load() & BreakOnThreadCreate) {
+                breakVA = registers().ip();
+                pauseUI = true;
+                log("Breakpoint de evento: creacion de hilo.");
+            }
+            break;
+        }
+        case EXIT_THREAD_DEBUG_EVENT: {
+            log("Hilo terminado, TID " + std::to_string(ev.dwThreadId) + ", codigo " +
+                std::to_string(ev.u.ExitThread.dwExitCode));
+            if (eventBreakMask_.load() & BreakOnThreadExit) {
+                breakVA = registers().ip();
+                pauseUI = true;
+                log("Breakpoint de evento: fin de hilo.");
+            }
             break;
         }
         case LOAD_DLL_DEBUG_EVENT: {
@@ -544,10 +935,43 @@ void Debugger::debugLoop() {
             }
             { std::lock_guard<std::mutex> lk(modMutex_); modules_.push_back(m); }
             if (cb_.onModule) cb_.onModule(m);
+            if (cb_.onEvent) cb_.onEvent("load_dll", m.base);
+            if (eventBreakMask_.load() & BreakOnDllLoad) {
+                breakVA = registers().ip();
+                pauseUI = true;
+                log("Breakpoint de evento: carga de DLL.");
+            }
+            break;
+        }
+        case UNLOAD_DLL_DEBUG_EVENT: {
+            const uint64_t base = (uint64_t)ev.u.UnloadDll.lpBaseOfDll;
+            std::string name;
+            {
+                std::lock_guard<std::mutex> lk(modMutex_);
+                for (auto it = modules_.begin(); it != modules_.end(); ++it) {
+                    if (it->base == base) { name = it->name; modules_.erase(it); break; }
+                }
+            }
+            log("DLL descargada" + (name.empty() ? std::string{} : ": " + name) + " @0x" +
+                [&]{ char text[32]; sprintf_s(text, "%llX", (unsigned long long)base); return std::string(text); }());
+            if (cb_.onEvent) cb_.onEvent("unload_dll", base);
+            if (eventBreakMask_.load() & BreakOnDllUnload) {
+                breakVA = registers().ip();
+                pauseUI = true;
+                log("Breakpoint de evento: descarga de DLL.");
+            }
             break;
         }
         case EXIT_PROCESS_DEBUG_EVENT:
+            // M7: si termina un proceso hijo, no confundirlo con el fin del target.
+            if (pid_ && ev.dwProcessId != pid_) {
+                log("Proceso hijo termino, PID " + std::to_string(ev.dwProcessId) +
+                    " codigo " + std::to_string(ev.u.ExitProcess.dwExitCode));
+                if (cb_.onEvent) cb_.onEvent("exit_process_child", ev.dwProcessId);
+                break;
+            }
             log("El proceso termino, codigo " + std::to_string(ev.u.ExitProcess.dwExitCode));
+            if (cb_.onEvent) cb_.onEvent("exit_process", ev.u.ExitProcess.dwExitCode);
             setState(DbgState::Exited);
             if (hThread) CloseHandle(hThread);
             hThread_ = nullptr;
@@ -569,14 +993,23 @@ void Debugger::debugLoop() {
                     log("Breakpoint de sistema (loader). Pon breakpoints y dale Play.");
                     pauseUI = true; breakVA = addr;
                 } else {
-                    bool ours = false, wasOneShot = false;
+                    bool ours = false, wasOneShot = false, shouldPause = true;
+                    std::string condition;
+                    bool logOnly = false;
+                    uint64_t bpHits = 0, breakOnHit = 0;
                     { std::lock_guard<std::mutex> lk(bpMutex_);
                       auto it = bps_.find(addr);
                       if (it != bps_.end() && it->second.installed) {
                           ours = true; wasOneShot = it->second.oneShot;
                           uninstallBreakpoint(it->second);   // restaurar byte original
                           if (wasOneShot) bps_.erase(it);    // one-shot consumido
-                          else pendingRearm_ = addr;         // re-armar tras el siguiente step
+                          else {
+                              pendingRearm_ = addr;          // re-armar tras el siguiente step
+                              bpHits = ++it->second.hits;
+                              breakOnHit = it->second.breakOnHit;
+                              condition = it->second.condition;
+                              logOnly = it->second.logOnly;
+                          }
                       }
                     }
                     if (ours) {
@@ -586,8 +1019,28 @@ void Debugger::debugLoop() {
                             if (findOEP_) findOEPStep(hThread, addr, &dis);
                             else          runToRetStep(hThread, addr, &dis);
                         } else {
+                            std::string conditionError;
+                            const bool conditionMatches = wasOneShot || breakpointConditionMatches(condition, bpHits, conditionError);
+                            if (!conditionError.empty())
+                                log("BP 0x" + [&]{ char text[32]; sprintf_s(text, "%llX", (unsigned long long)addr); return std::string(text); }()
+                                    + ": condicion invalida (" + conditionError + ")");
+                            shouldPause = conditionMatches && (breakOnHit == 0 || bpHits >= breakOnHit);
+                            if (shouldPause && logOnly) {
+                                char text[160];
+                                sprintf_s(text, "BP log-only en 0x%llX (hit %llu)",
+                                          (unsigned long long)addr, (unsigned long long)bpHits);
+                                log(text);
+                                shouldPause = false;
+                            }
+                            if (shouldPause) {
                             pauseUI = true; breakVA = addr;
                             history_.push_back(addr);
+                            } else {
+                            // El breakpoint se alcanza, pero su condicion de hits aun
+                            // no se cumple, o es log-only. Ejecutar la instruccion original una vez y
+                            // reinsertar INT3 en el siguiente single-step.
+                            setTrapFlag(hThread, is64_);
+                            }
                         }
                     } else {
                         // breakpoint no nuestro (p.ej. __debugbreak del propio programa)
@@ -597,7 +1050,48 @@ void Debugger::debugLoop() {
                 }
                 break;
             }
+            case EXCEPTION_GUARD_PAGE: {
+                const uint64_t fault = er.NumberParameters > 1 ? (uint64_t)er.ExceptionInformation[1] : 0;
+                const int accessType = er.NumberParameters > 0 ? (int)er.ExceptionInformation[0] : 0;
+                SYSTEM_INFO si{}; GetSystemInfo(&si);
+                const uint64_t pageSize = si.dwPageSize ? si.dwPageSize : 4096;
+                const uint64_t page = fault & ~(pageSize - 1);
+                bool ours = false, matched = false;
+                {
+                    std::lock_guard<std::mutex> lock(memBpMutex_);
+                    for (auto& entry : memBps_) {
+                        bool guardsPage = false;
+                        for (const auto& p : entry.pages) if (p.base == page) { guardsPage = true; break; }
+                        if (!guardsPage) continue;
+                        ours = true;
+                        const bool inRequestedRange = fault >= entry.info.address && fault - entry.info.address < entry.info.size;
+                        const bool typeMatches = entry.info.type == 0 || entry.info.type == accessType;
+                        if (entry.info.enabled && inRequestedRange && typeMatches) { ++entry.info.hits; matched = true; }
+                    }
+                }
+                if (!ours) { continueStatus = DBG_EXCEPTION_NOT_HANDLED; break; }
+                if (std::find(pendingGuardRearmPages_.begin(), pendingGuardRearmPages_.end(), page) == pendingGuardRearmPages_.end())
+                    pendingGuardRearmPages_.push_back(page);
+                // PAGE_GUARD se borra automaticamente. Reinsertarlo antes de que
+                // la instruccion termine provocaria un bucle; el trap flag permite
+                // rearmarlo en el siguiente EXCEPTION_SINGLE_STEP.
+                setTrapFlag(hThread, is64_);
+                if (matched) {
+                    char text[128]; sprintf_s(text, "Memory BP (%s) en 0x%llX, acceso 0x%llX",
+                        accessType == 1 ? "write" : accessType == 8 ? "execute" : "access",
+                        (unsigned long long)addr, (unsigned long long)fault);
+                    log(text);
+                    pauseUI = true; breakVA = addr; history_.push_back(addr);
+                }
+                continueStatus = DBG_CONTINUE;
+                break;
+            }
             case EXCEPTION_SINGLE_STEP: {
+                if (!pendingGuardRearmPages_.empty()) {
+                    std::vector<uint64_t> pages;
+                    pages.swap(pendingGuardRearmPages_);
+                    for (uint64_t page : pages) rearmMemoryPage(page);
+                }
                 // Hardware breakpoint? DR6 bits 0-3 indican el slot.
                 uint32_t dr6 = readDr6(hThread, is64_);
                 int hwSlot = -1;
@@ -706,10 +1200,28 @@ void Debugger::debugLoop() {
         default: break;
         }
 
+        // Un detach se ejecuta en el propio hilo dueño del debug loop, en un
+        // evento seguro. No mata al proceso que se habia adjuntado.
+        if (detachRequested_.load() && attached_) pauseUI = true;
+
         // ---- Si toca pausar la UI, esperamos el proximo comando ----
         if (pauseUI) {
             setState(DbgState::Paused);
             if (cb_.onBreak) cb_.onBreak(breakVA);
+            if (detachRequested_.load() && attached_) {
+                clearMemoryBreakpoints();
+                const BOOL detached = DebugActiveProcessStop(pid_);
+                log(detached ? "Proceso desadjuntado; continua sin DebuggerJ++." :
+                               "DebugActiveProcessStop fallo " + std::to_string(GetLastError()));
+                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                if (hThread) CloseHandle(hThread);
+                hThread_ = nullptr;
+                if (symReady_ && hProcess_) { SymCleanup(hProcess_); symReady_ = false; }
+                if (hProcess_) { CloseHandle(hProcess_); hProcess_ = nullptr; }
+                attached_ = false; detachRequested_.store(false);
+                setState(DbgState::Idle);
+                return;
+            }
             resumeSignaled_.store(false);
             pending_.store(Cmd::None);
             while (!resumeSignaled_.load() && !quit_.load()) Sleep(5);
@@ -727,6 +1239,8 @@ void Debugger::debugLoop() {
 
             // Preparar la reanudacion segun el comando.
             bool needRearmStep = (pendingRearm_ != 0);
+            bool needGuardRearmStep = !pendingGuardRearmPages_.empty();
+            if (needGuardRearmStep) setTrapFlag(hThread, is64_);
             if (c == Cmd::StepInto) {
                 singleStepping_ = true;
                 setTrapFlag(hThread, is64_);

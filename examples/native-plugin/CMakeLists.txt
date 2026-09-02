@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(DebuggerJppExamplePlugin LANGUAGES CXX)
+add_library(DebuggerJppExamplePlugin SHARED ExamplePlugin.cpp)
+target_compile_features(DebuggerJppExamplePlugin PRIVATE cxx_std_17)
+target_include_directories(DebuggerJppExamplePlugin PRIVATE ../../sdk)

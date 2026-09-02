@@ -75,7 +75,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
 
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
+    // M10: modo headless. --headless oculta la ventana (el MCP y el motor siguen
+    // corriendo) para automatizacion/batch dirigido por MCP.
+    bool headless = std::wstring(GetCommandLineW()).find(L"--headless") != std::wstring::npos;
+    ShowWindow(hwnd, headless ? SW_HIDE : SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
 
     IMGUI_CHECKVERSION();
@@ -96,6 +99,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             bool bindAll = cl.find(L"--bindall") != std::wstring::npos;
             auto p = cl.find(L"--port=");
             if (p != std::wstring::npos) port = _wtoi(cl.c_str() + p + 7);
+            if (cl.find(L"--noauth") != std::wstring::npos) app.cliSetNoAuth(true);
             app.cliStartMcp(port, bindAll);
         }
     }

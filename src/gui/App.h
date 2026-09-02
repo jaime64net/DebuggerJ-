@@ -13,7 +13,9 @@
 #include "core/PackerDetect.h"
 #include "core/StringScan.h"
 #include "core/Unpack.h"
+#include "core/ExprEval.h"
 #include "net/ControlServer.h"
+#include "plugins/PluginManager.h"
 #include "ai/AiClient.h"
 #include "ai/AiConfig.h"
 
@@ -23,6 +25,9 @@ namespace dbg {
 
 struct WinGeom { std::string name; float x=0, y=0, w=0, h=0; };
 struct WinLayout { std::string name; std::vector<WinGeom> wins; };
+struct AnalyzedFunction { uint64_t start=0, end=0; uint32_t instructions=0, calls=0, branches=0; std::string name; };
+struct AnalysisXref { uint64_t from=0, to=0; std::string type; };
+struct AnalysisLoop { uint64_t start=0, end=0, function=0; };
 
 class App {
 public:
@@ -31,15 +36,27 @@ public:
 
     void render();   // se llama cada frame
     void cliStartMcp(int port, bool bindAll); // arranca el MCP desde linea de comandos
+    void cliSetNoAuth(bool on);               // --noauth: bypass del token (antes de cliStartMcp)
 
 private:
     // --- Acciones ---
     void openFile(const std::wstring& path);
+    void addRecent(const std::wstring& path);  // registra un archivo en la lista de recientes
+    void loadRecent();
+    void saveRecent();
     void refreshDisassembly();      // desde el archivo estatico
     void refreshLiveDisassembly(uint64_t around); // desde memoria del proceso
     void refreshStaticStrings();
     void runPackerScan();
     void startDebugSession();
+    void attachToProcess(uint32_t pid);
+    bool saveSession(const std::wstring& path, std::string& error);
+    bool loadSession(const std::wstring& path, std::string& error);
+    std::string buildAnalysisReport();
+    bool saveAnalysisReport(const std::wstring& path, std::string& error);
+    void saveSessionDialog();
+    void loadSessionDialog();
+    void exportReportDialog();
     void sendAiMessage();
     void pushLog(const std::string& s);
 
@@ -55,10 +72,38 @@ private:
     void drawStackContent();
     void drawStringsPanel();
     void drawReferencesPanel();
+    void drawAnalysisPanel();
+    void drawSearchResultsPanel();          // resultados de "Search for" (estilo Olly)
+    void searchAllCommands(const std::string& needle);
+    void searchIntermodularCalls();
+    void searchBinaryString(const std::string& pattern, bool isHex, bool utf16);
+
+    // --- Motor de expresiones (Fase 2) ---
+    bool evalExpr(const std::string& expr, uint64_t& out, std::string& err);
+    EvalContext makeEvalContext();          // arma los callbacks contra el estado actual
+
+    // --- Command bar hibrida (M1) ---
+    void drawCommandBar();
+    void execCommandBar();
+
+    // --- Watch (M2) ---
+    void drawWatchPanel();
+    void refreshWatches();                  // reevalua las expresiones (en cada pausa)
+
+    // --- Trace + IA (M4) ---
+    void summarizeTraceWithAi();
+
+    // --- Struct viewer (M8) ---
+    void drawStructPanel();
+
+    // --- Breakpoints inteligentes (M3): accion al golpear ---
+    void runBreakpointAction(uint64_t addr);   // ejecuta la accion asociada a una VA
     void drawTracePanel();
     void findReferences(uint64_t addr);
     void loadAnnotations();
     void saveAnnotations();
+    bool loadAnalysisCache();
+    void saveAnalysisCache();
     void drawModulesPanel();
     void drawPackerPanel();
     void drawExceptionsPanel();
@@ -69,6 +114,8 @@ private:
     void drawAiPanel();
     void drawCodePanel();
     void drawOptionsWindow();      // Tools -> Options (configuracion de agentes de IA)
+    void drawHelpWindow();
+    void drawAttachWindow();
     void drawStatusBar();          // barra de estado inferior (Running/Paused)
 
     // --- MCP / control remoto ---
@@ -79,6 +126,21 @@ private:
     void        startMcp();
     void        stopMcp();
     void        drawMcpLogPanel();
+    void        appendMcpCache(const std::string& line); // append incremental a mcp_log_cache.txt
+    void        loadMcpLogCache();                        // carga la cache al panel
+    std::string mcpLogJoined();                           // todo el log como texto plano
+    void        loadExternalPlugins();
+    uint64_t    pluginsDirStamp();          // mtime combinado de plugins/ (para hot-reload)
+    bool        pluginAutoReload_ = false;  // M11: recargar plugins al detectar cambios
+    uint64_t    pluginsStamp_ = 0;
+    int         pluginCheckCounter_ = 0;
+    std::string runExternalPluginAction(const std::string& pluginId, const std::string& actionId,
+                                        const std::string& argsJson = "{}");
+    static int  pluginExecuteJson(void* context, const char* command, const char* argsJson,
+                                  char* output, size_t outputCapacity);
+    static void pluginLog(void* context, const char* message);
+    void analyzeCodeAt(uint64_t address);
+    void clearAutoAnalysis();
 
     void gotoAddress(uint64_t va);   // navega el CPU a una VA
     std::string moduleNameAt(uint64_t va);  // modulo que contiene una VA
@@ -107,8 +169,11 @@ private:
     Disassembler  dis_{true};
     std::vector<Instruction> insns_;
     std::wstring  loadedPath_;
+    std::vector<std::wstring> recentFiles_;   // ultimos abiertos (max 10)
     std::string   openError_;
     bool          fileLoaded_ = false;
+    bool          showAttach_ = false;
+    char          attachPid_[16] = {0};
     int           selectedInsn_ = -1;
     int           pendingScroll_ = -1; // indice de instruccion al que hay que desplazar
     uint64_t      disBase_ = 0;      // VA base del listado actual
@@ -159,6 +224,7 @@ private:
     // --- Anotaciones (comentarios/etiquetas) ---
     std::map<uint64_t, std::string> comments_;
     std::map<uint64_t, std::string> labels_;
+    bool          analysisCacheLoaded_ = false;
     char          annotBuf_[256] = {0};
     uint64_t      annotAddr_ = 0;
     bool          annotIsLabel_ = false;
@@ -167,6 +233,43 @@ private:
     // --- Referencias ---
     std::vector<uint64_t> refs_;
     uint64_t      refTarget_ = 0;
+
+    // --- Search for (menu CPU estilo OllyDbg/x64dbg) ---
+    struct SearchHit { uint64_t address = 0; std::string text; };
+    std::vector<SearchHit> searchResults_;
+    std::string   searchResultsTitle_;
+    bool          showSearchResults_ = false;
+    bool          openSearchCmd_ = false;
+    char          searchCmdBuf_[128] = {0};
+    bool          openSearchBin_ = false;
+    char          searchBinBuf_[256] = {0};
+    bool          searchBinHex_ = true;    // true = patron hex, false = texto
+    bool          searchBinUtf16_ = false;
+
+    // --- Command bar (M1) ---
+    char          cmdBar_[512] = {0};
+    bool          cmdBarUseAi_ = false;
+    std::string   cmdBarResult_;
+
+    // --- Watch (M2) ---
+    struct WatchItem { std::string expr; std::string value; bool ok = true; };
+    std::vector<WatchItem> watches_;
+    char          watchInput_[128] = {0};
+
+    // --- Struct viewer (M8) ---
+    struct StructField { int type = 2; char name[32] = {0}; };  // type: 0=byte 1=word 2=dword 3=qword 4=ptr 5=str
+    std::vector<StructField> structFields_;
+    char          structBase_[64] = {0};
+
+    // --- Breakpoints inteligentes (M3) ---
+    std::map<uint64_t, std::string> bpActions_;   // VA -> accion (cmd dbg_*, JSON, o "ai:<prompt>")
+    char          bpActionBuf_[256] = {0};
+    uint64_t      bpActionAddr_ = 0;
+    bool          openBpAction_ = false;
+    std::vector<AnalyzedFunction> analyzedFunctions_;
+    std::vector<AnalysisXref> analysisXrefs_;
+    std::vector<AnalysisLoop> analysisLoops_;
+    std::map<uint64_t, std::string> bookmarks_;
 
     // --- Ensamblador / patch ---
     char          asmBuf_[128] = {0};
@@ -194,6 +297,8 @@ private:
 
     // --- Options (Tools -> Options) ---
     bool          showOptions_ = false;
+    bool          showHelp_ = false;
+    int           helpPage_ = 0; // 0=Basic, 1=MCP, 2=Plugins
     int           optEditIdx_ = -1;        // agente en edicion (-1 = ninguno)
     int           optPresetIdx_ = -1;      // preset elegido en el formulario
     AiAgent       optDraft_;               // copia de trabajo del formulario
@@ -204,6 +309,9 @@ private:
     char          optModel_[128] = {0};
     int           optPort_ = 443;
     std::string   optStatus_;              // mensaje de guardado/validacion
+    char          symPathBuf_[512] = {0};  // symbol server path (M5)
+    void          loadSymPath();
+    void          saveSymPath();
     void          optLoadDraft(int idx);   // llena el formulario desde agents()[idx]
     void          optApplyPreset(int presetIdx);
 
@@ -221,17 +329,25 @@ private:
     uint64_t       pluginOEP_ = 0;
     std::wstring   lastDumpPath_;
     std::string    pluginStatus_;
+    PluginManager  externalPlugins_;
+    bool           allowNativeDllPlugins_ = false;
 
     // --- MCP ---
     ControlServer mcp_;
     int           mcpPort_ = 8377;
     bool          mcpBindAll_ = false;
+    int           mcpAccessLevel_ = 0; // 0=lectura, 1=control, 2=modificacion
+    bool          mcpNoAuth_ = false;  // Bypass: aceptar comandos sin token (solo local)
+    std::string   mcpToken_;
     std::string   mcpStatus_;
     struct McpReq { std::string req; std::promise<std::string> resp; };
     std::mutex    mcpMutex_;
     std::deque<McpReq*> mcpQueue_;
     std::mutex    mcpLogMutex_;
     std::deque<std::string> mcpLog_;
+    std::string   mcpLogView_;         // buffer para el InputText de solo lectura
+    size_t        mcpLogViewCount_ = (size_t)-1; // ultimo tamano volcado a mcpLogView_
+    bool          mcpLogCacheOn_ = true;         // persistir cada linea a disco
 
     // --- layouts de ventanas ---
     std::vector<WinLayout> customLayouts_;

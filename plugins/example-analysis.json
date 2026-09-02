@@ -1,0 +1,23 @@
+{
+  "id": "analysis_helpers",
+  "name": "Analysis helpers",
+  "version": "1.0",
+  "description": "Acciones de consulta para comenzar el analisis de una muestra.",
+  "enabled": true,
+  "actions": [
+    {
+      "id": "overview",
+      "label": "Resumen de proteccion",
+      "description": "Ejecuta el escaneo de packers/protectores.",
+      "command": "packers",
+      "args": {}
+    },
+    {
+      "id": "show_entry",
+      "label": "Ir al EntryPoint",
+      "description": "Lleva la CPU al entrypoint estatico.",
+      "command": "goto_entry",
+      "args": {}
+    }
+  ]
+}

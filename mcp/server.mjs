@@ -6,6 +6,7 @@
 //   Variables de entorno:
 //     DBGJPP_HOST  (def 127.0.0.1)   host del servidor de control
 //     DBGJPP_PORT  (def 8377)        puerto (el mismo del plugin "Claude MCP")
+//     DBGJPP_TOKEN (obligatorio)     token mostrado por DebuggerJ++ al activar MCP
 //
 //   Desde WSL hacia la app en Windows: activa "Bind 0.0.0.0" en el plugin y
 //   pon DBGJPP_HOST = IP del host Windows (ver mcp/README.md).
@@ -15,12 +16,17 @@ import readline from "node:readline";
 
 const HOST = process.env.DBGJPP_HOST || "127.0.0.1";
 const PORT = parseInt(process.env.DBGJPP_PORT || "8377", 10);
+const TOKEN = process.env.DBGJPP_TOKEN || "";
 
 // --- Envia un comando al servidor de control y espera una linea JSON ---
 function sendCommand(cmd, args) {
   return new Promise((resolve) => {
+    if (!TOKEN) {
+      resolve({ ok: false, error: "falta DBGJPP_TOKEN; copialo desde Plugins > MCP Control" });
+      return;
+    }
     const sock = net.createConnection({ host: HOST, port: PORT }, () => {
-      sock.write(JSON.stringify({ cmd, args: args || {} }) + "\n");
+      sock.write(JSON.stringify({ cmd, args: args || {}, token: TOKEN }) + "\n");
     });
     let buf = "";
     sock.setTimeout(35000);
@@ -43,7 +49,18 @@ const S = (props = {}, required = []) => ({ type: "object", properties: props, r
 const HEX = { type: "string", description: "hex (ej '401000' o '0x401000')" };
 const TOOLS = [
   ["status",      "Estado del debugger (arch, imageBase, estado, RIP, OEP).", S()],
+  ["plugin_list", "Lista los plugins JSON externos y sus acciones disponibles.", S()],
+  ["plugin_reload", "Recarga los manifiestos JSON de plugins desde disco.", S()],
+  ["plugin_sdk", "Describe la ABI y exportaciones para generar un plugin DLL x64 compatible.", S()],
+  ["plugin_run",  "Ejecuta una accion declarada por un plugin local JSON/DLL.", S({ plugin: { type: "string" }, action: { type: "string" }, args: { type: "object" } }, ["plugin", "action"])],
   ["open",        "Abre un .exe/.dll para analizar (parsea PE, desensambla).", S({ path: { type: "string" } }, ["path"])],
+  ["save_session", "Guarda objetivo, argumentos, anotaciones y breakpoints en .dbgjsession.", S({ path: { type: "string" } }, ["path"])],
+  ["load_session", "Carga un archivo .dbgjsession sin sesion de debug activa.", S({ path: { type: "string" } }, ["path"])],
+  ["report",      "Genera un informe Markdown del analisis sin escribir en disco.", S()],
+  ["export_report", "Exporta un informe Markdown a path.", S({ path: { type: "string" } }, ["path"])],
+  ["attach",      "Se adjunta a un proceso existente por PID.", S({ pid: { type: "integer", minimum: 1 } }, ["pid"])],
+  ["detach",      "Desadjunta un proceso conectado por Attach sin terminarlo.", S()],
+  ["eval",        "Evalua una expresion (hex por defecto; byte/dword/ptr(a), reg, mod.base/fromname, dis.len, [mem]).", S({ expr: { type: "string" } }, ["expr"])],
   ["launch",      "Lanza el archivo abierto bajo depuracion.", S()],
   ["restart",     "Detiene la sesion actual y reinicia el ejecutable abierto bajo depuracion.", S()],
   ["go",          "Continua la ejecucion (Play).", S()],
@@ -58,16 +75,30 @@ const TOOLS = [
   ["write_mem",   "Escribe memoria (hex).", S({ addr: HEX, hex: { type: "string" } }, ["addr", "hex"])],
   ["disasm",      "Desensambla en una direccion (o RIP). count=n instrucciones.", S({ addr: HEX, count: { type: "integer" } })],
   ["goto",        "Lleva la vista CPU a una direccion para inspeccionarla.", S({ addr: HEX }, ["addr"])],
+  ["goto_entry",  "Lleva la vista CPU al EntryPoint del PE abierto.", S()],
+  ["analyze_code", "Analiza flujo local, destinos y simbolos; agrega etiquetas/comentarios.", S({ addr: HEX })],
+  ["list_functions", "Lista funciones candidatas descubiertas por Analyze this.", S()],
+  ["list_xrefs", "Lista xrefs persistentes de call/jump; addr opcional filtra por origen o destino.", S({ addr: HEX })],
+  ["list_loops", "Lista bucles detectados por saltos hacia atras.", S()],
+  ["set_bookmark", "Agrega un bookmark persistente en una VA.", S({ addr: HEX, text: { type: "string" } }, ["addr"])],
+  ["del_bookmark", "Quita un bookmark persistente.", S({ addr: HEX }, ["addr"])],
+  ["list_bookmarks", "Lista bookmarks persistentes.", S()],
+  ["clear_analysis", "Limpia analisis automatico y sus anotaciones.", S()],
   ["goto_module", "Lleva la vista CPU a la base de un modulo/DLL cargado. name acepta nombre parcial.", S({ name: { type: "string" } }, ["name"])],
   ["stack",       "Lee la pila desde RSP/ESP. count=n entradas.", S({ count: { type: "integer" } })],
-  ["set_bp",      "Pone un breakpoint de software.", S({ addr: HEX, label: { type: "string" } }, ["addr"])],
+  ["set_bp",      "Breakpoint software. condition: rax == 0, ecx & 1 != 0, hit >= 5; log_only registra sin pausar; action al golpear ('ai:<prompt>', 'cmd {args}' o JSON).", S({ addr: HEX, label: { type: "string" }, break_on_hit: { type: "integer", minimum: 0 }, condition: { type: "string" }, log_only: { type: "boolean" }, action: { type: "string" } }, ["addr"])],
   ["del_bp",      "Quita un breakpoint.", S({ addr: HEX }, ["addr"])],
   ["list_bp",     "Lista los breakpoints.", S()],
   ["set_hwbp",    "Hardware breakpoint (DR0-3). type=0 exec/1 write/3 rw, len=1/2/4/8.", S({ addr: HEX, type: { type: "integer" }, len: { type: "integer" } }, ["addr"])],
   ["del_hwbp",    "Quita un hardware breakpoint.", S({ addr: HEX }, ["addr"])],
   ["list_hwbp",   "Lista los hardware breakpoints.", S()],
+  ["set_membp",   "Memory breakpoint PAGE_GUARD. type=0 access/1 write/8 execute; requiere pausa.", S({ addr: HEX, size: { type: "integer", minimum: 1 }, type: { type: "integer", enum: [0, 1, 8] }, label: { type: "string" } }, ["addr"])],
+  ["del_membp",   "Quita un memory breakpoint por id.", S({ id: { type: "integer", minimum: 1 } }, ["id"])],
+  ["list_membp",  "Lista memory breakpoints PAGE_GUARD y sus hits.", S()],
   ["add_exc_bp",  "Breakpoint de excepcion. code=0 (cualquiera) o codigo hex.", S({ code: HEX, addr: HEX })],
   ["list_exc",    "Lista los breakpoints de excepcion.", S()],
+  ["get_event_breaks", "Mascara de BP de eventos: 1 nuevo hilo, 2 fin hilo, 4 carga DLL, 8 descarga DLL.", S()],
+  ["set_event_breaks", "Configura BP de eventos. mask combina 1=create thread, 2=exit thread, 4=load DLL, 8=unload DLL.", S({ mask: { type: "integer", minimum: 0, maximum: 15 } }, ["mask"])],
   ["modules",     "Lista los modulos cargados.", S()],
   ["sections",    "Lista las secciones del PE (con entropia).", S()],
   ["imports",     "Lista los imports del PE.", S()],
@@ -82,7 +113,8 @@ const TOOLS = [
   ["assemble",    "Ensambla texto x86/x64 (Keystone) y lo escribe en memoria.", S({ addr: HEX, text: { type: "string" } }, ["addr", "text"])],
   ["patch",       "Escribe bytes hex en una direccion.", S({ addr: HEX, hex: { type: "string" } }, ["addr", "hex"])],
   ["nop",         "Rellena con NOP (0x90) en una direccion.", S({ addr: HEX, count: { type: "integer" } }, ["addr"])],
-  ["symbol",      "Resuelve el simbolo (DbgHelp) de una direccion.", S({ addr: HEX }, ["addr"])],
+  ["symbol",      "Resuelve simbolo y fuente/linea PDB si existe para una direccion.", S({ addr: HEX }, ["addr"])],
+  ["source",      "Devuelve archivo:linea PDB de una direccion si esta disponible.", S({ addr: HEX }, ["addr"])],
   ["call_stack",  "Camina la pila de llamadas (frames + simbolos).", S()],
   ["tls",         "Lista los TLS callbacks del PE.", S()],
   ["seh",         "Lista la cadena SEH (x86).", S()],
@@ -100,6 +132,26 @@ const TOOLS = [
 const toolDefs = TOOLS.map(([cmd, desc, schema]) => ({
   name: "dbg_" + cmd, description: desc, inputSchema: schema,
 }));
+
+// Las acciones de plugins se descubren desde la aplicacion y se publican como
+// tools MCP reales. Esto permite que una DLL agregue capacidades al cliente
+// MCP sin editar este servidor.
+const pluginTools = new Map();
+const safeName = (s) => String(s).replace(/[^a-zA-Z0-9_]/g, "_");
+async function allToolDefs() {
+  const defs = [...toolDefs];
+  pluginTools.clear();
+  const listed = await sendCommand("plugin_list", {});
+  if (!listed?.ok || !Array.isArray(listed.plugins)) return defs;
+  for (const plugin of listed.plugins) for (const action of (plugin.actions || [])) {
+    const name = `dbg_plugin_${safeName(plugin.id)}_${safeName(action.id)}`;
+    let schema = S();
+    try { schema = typeof action.input_schema === "string" ? JSON.parse(action.input_schema) : (action.input_schema || schema); } catch {}
+    pluginTools.set(name, { plugin: plugin.id, action: action.id });
+    defs.push({ name, description: `[${plugin.name}] ${action.description || action.label || action.id}`, inputSchema: schema });
+  }
+  return defs;
+}
 
 // --- JSON-RPC sobre stdio ---
 function send(msg) { process.stdout.write(JSON.stringify(msg) + "\n"); }
@@ -123,16 +175,23 @@ rl.on("line", async (line) => {
   } else if (method === "ping") {
     send({ jsonrpc: "2.0", id, result: {} });
   } else if (method === "tools/list") {
-    send({ jsonrpc: "2.0", id, result: { tools: toolDefs } });
+    send({ jsonrpc: "2.0", id, result: { tools: await allToolDefs() } });
   } else if (method === "tools/call") {
     const name = params?.name || "";
     const args = params?.arguments || {};
+    const extension = pluginTools.get(name);
     const cmd = name.startsWith("dbg_") ? name.slice(4) : name;
-    const result = await sendCommand(cmd, args);
+    const result = extension
+      ? await sendCommand("plugin_run", { plugin: extension.plugin, action: extension.action, args })
+      : await sendCommand(cmd, args);
     send({ jsonrpc: "2.0", id, result: {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       isError: result && result.ok === false,
     }});
+    // Un cliente MCP que soporte esta notificacion puede refrescar enseguida las
+    // acciones que una DLL/JSON acaba de aportar, sin reiniciar el servidor.
+    if (cmd === "plugin_reload" && result?.ok !== false)
+      send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
   } else if (id !== undefined) {
     send({ jsonrpc: "2.0", id, error: { code: -32601, message: "metodo no soportado: " + method } });
   }
