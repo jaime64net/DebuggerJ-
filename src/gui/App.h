@@ -37,6 +37,7 @@ public:
     void render();   // se llama cada frame
     void cliStartMcp(int port, bool bindAll); // arranca el MCP desde linea de comandos
     void cliSetNoAuth(bool on);               // --noauth: bypass del token (antes de cliStartMcp)
+    void cliSetAccess(int level);             // --access=N: nivel MCP (0/1/2) antes de cliStartMcp
 
 private:
     // --- Acciones ---
@@ -54,6 +55,10 @@ private:
     bool loadSession(const std::wstring& path, std::string& error);
     std::string buildAnalysisReport();
     std::string buildAnalysisReportJson();          // informe estructurado (JSON/SARIF-friendly)
+    std::string buildSarifReport();                 // SARIF 2.1.0 (hallazgos como results)
+    bool saveSarifReport(const std::wstring& path, std::string& error);
+    std::string runScript(const std::string& src, std::string& err);  // mini-lenguaje de scripts
+    bool validateDump(const std::wstring& path, std::string& report); // validación PE del dump (unpacking)
     bool saveAnalysisReport(const std::wstring& path, std::string& error);
     bool saveAnalysisReportJson(const std::wstring& path, std::string& error);
     std::string peContentHash();                     // hash del contenido del PE (M6: DB por hash)
@@ -62,12 +67,21 @@ private:
     struct EventRec { uint64_t seq = 0; std::string type; uint64_t arg = 0; };
     void pushEvent(const std::string& type, uint64_t arg);
 
-    // --- CFG básico (grafo de la función analizada) ---
+    // --- CFG interactivo (bloques básicos) ---
     void drawCfgPanel();
+    struct BasicBlock { uint64_t start=0, end=0; std::vector<int> insnIdx; std::vector<uint64_t> succ; };
+    std::vector<BasicBlock> computeBasicBlocks(uint64_t funcStart, uint64_t funcEnd);
+    uint64_t cfgFunc_ = 0;                 // función cuyo CFG se muestra
+    float    cfgZoom_ = 1.0f;
+    float    cfgPanX_ = 0, cfgPanY_ = 0;
     // --- Comparación de dumps ---
     void drawComparePanel();
     // --- Struct inferido por IA (M8+) ---
     void inferStructWithAi();
+    // --- Scripting ---
+    void drawScriptPanel();
+    char scriptBuf_[8192] = {0};
+    std::string scriptOutput_;
     void saveSessionDialog();
     void loadSessionDialog();
     void exportReportDialog();

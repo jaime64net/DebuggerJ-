@@ -100,6 +100,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             auto p = cl.find(L"--port=");
             if (p != std::wstring::npos) port = _wtoi(cl.c_str() + p + 7);
             if (cl.find(L"--noauth") != std::wstring::npos) app.cliSetNoAuth(true);
+            auto ap = cl.find(L"--access=");
+            if (ap != std::wstring::npos) app.cliSetAccess(_wtoi(cl.c_str() + ap + 9));
             app.cliStartMcp(port, bindAll);
         }
     }

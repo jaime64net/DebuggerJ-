@@ -5,6 +5,7 @@
 #include <commdlg.h>
 #include <algorithm>
 #include <array>
+#include <set>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -654,6 +655,101 @@ bool App::saveAnalysisReportJson(const std::wstring& path, std::string& error) {
     return true;
 }
 
+// Informe SARIF 2.1.0: cada heurística/deteccion es un 'result' con su regla.
+std::string App::buildSarifReport() {
+    njson rules = njson::array();
+    njson results = njson::array();
+    auto addRule = [&](const char* id, const char* name, const char* desc) {
+        rules.push_back({{"id", id}, {"name", name},
+                         {"shortDescription", {{"text", desc}}}});
+    };
+    auto addResult = [&](const char* ruleId, const char* level, const std::string& msg, uint64_t addr) {
+        njson r;
+        r["ruleId"] = ruleId;
+        r["level"] = level;   // note | warning | error
+        r["message"] = {{"text", msg}};
+        njson loc;
+        loc["physicalLocation"]["artifactLocation"]["uri"] = std::string(loadedPath_.begin(), loadedPath_.end());
+        if (addr) loc["physicalLocation"]["region"]["startLine"] = 1, loc["logicalLocations"] = njson::array({{{"name", "0x" + hex64(addr)}}});
+        r["locations"] = njson::array({loc});
+        results.push_back(r);
+    };
+
+    addRule("DBGJ.PACKER", "packer-detected", "Firma o heuristica de packer/protector.");
+    addRule("DBGJ.HIGH_ENTROPY", "high-entropy-section", "Seccion con entropia alta (posible cifrado/empaquetado).");
+    addRule("DBGJ.WX_SECTION", "writable-executable-section", "Seccion escribible y ejecutable a la vez.");
+    addRule("DBGJ.TLS", "tls-callbacks", "El PE declara TLS callbacks (codigo antes del entrypoint).");
+    addRule("DBGJ.LOW_IMPORTS", "few-imports", "Muy pocos imports (tipico de binarios empaquetados).");
+
+    for (const auto& p : packerMatches_)
+        addResult("DBGJ.PACKER", "warning", "Packer: " + p.name + " (" + std::to_string(p.confidence) + "%, " + p.source + ")", pe_.entryPointVA());
+    for (const auto& s : pe_.sections()) {
+        if (s.entropy > 7.2)
+            addResult("DBGJ.HIGH_ENTROPY", "warning", "Seccion " + s.name + " entropia " + std::to_string(s.entropy), pe_.imageBase() + s.virtualAddress);
+        if (s.executable() && s.writable())
+            addResult("DBGJ.WX_SECTION", "error", "Seccion " + s.name + " es W+X", pe_.imageBase() + s.virtualAddress);
+    }
+    if (!pe_.tlsCallbacks().empty())
+        addResult("DBGJ.TLS", "warning", std::to_string(pe_.tlsCallbacks().size()) + " TLS callback(s)", pe_.tlsCallbacks().front());
+    if (pe_.imports().size() < 10 && !pe_.imports().empty())
+        addResult("DBGJ.LOW_IMPORTS", "note", std::to_string(pe_.imports().size()) + " imports", 0);
+
+    njson sarif;
+    sarif["version"] = "2.1.0";
+    sarif["$schema"] = "https://json.schemastore.org/sarif-2.1.0.json";
+    njson run;
+    run["tool"]["driver"] = {{"name", "DebuggerJ++"}, {"informationUri", "https://github.com/jaime64net/DebuggerJ-"},
+                             {"rules", rules}};
+    run["results"] = results;
+    sarif["runs"] = njson::array({run});
+    return sarif.dump(2);
+}
+
+bool App::saveSarifReport(const std::wstring& path, std::string& error) {
+    if (!fileLoaded_) { error = "abre un archivo antes de exportar SARIF"; return false; }
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) { error = "no se pudo crear el SARIF"; return false; }
+    file << buildSarifReport();
+    if (!file) { error = "no se pudo escribir el SARIF"; return false; }
+    return true;
+}
+
+// Validación de un ejecutable volcado (unpacking): carga el PE y revisa coherencia.
+bool App::validateDump(const std::wstring& path, std::string& report) {
+    PeFile dump; std::string err;
+    if (!dump.load(path, err)) { report = "No es un PE válido: " + err; return false; }
+    std::ostringstream o;
+    bool ok = true;
+    o << "Arquitectura: " << (dump.is64Bit() ? "x64" : "x86") << "\n";
+    o << "ImageBase: 0x" << hex64(dump.imageBase()) << "  EntryPoint: 0x" << hex64(dump.entryPointVA()) << "\n";
+
+    // 1) entrypoint dentro de una sección ejecutable
+    uint64_t epRva = dump.entryPointVA() - dump.imageBase();
+    bool epExec = false;
+    for (const auto& s : dump.sections())
+        if (epRva >= s.virtualAddress && epRva < s.virtualAddress + s.virtualSize && s.executable()) epExec = true;
+    o << (epExec ? "[OK] " : "[!!] ") << "EntryPoint " << (epExec ? "cae en sección ejecutable\n" : "NO cae en sección ejecutable (dump sospechoso)\n");
+    if (!epExec) ok = false;
+
+    // 2) entropía por sección (si sigue muy alta, probablemente sigue empacado)
+    int highEntropy = 0;
+    for (const auto& s : dump.sections()) {
+        o << "  " << s.name << "  entropia=" << s.entropy;
+        if (s.executable() && s.entropy > 7.0) { o << "  [!! alta para código]"; highEntropy++; }
+        o << "\n";
+    }
+    if (highEntropy) { o << "[!!] " << highEntropy << " sección(es) de código con entropía alta: puede seguir empacado.\n"; ok = false; }
+    else o << "[OK] Entropía de código en rango normal.\n";
+
+    // 3) IAT / imports
+    if (dump.imports().empty()) { o << "[!!] Sin imports: la IAT no está reconstruida (usa Corregir IAT).\n"; ok = false; }
+    else o << "[OK] " << dump.imports().size() << " imports presentes.\n";
+
+    o << (ok ? "\nRESULTADO: el dump parece válido.\n" : "\nRESULTADO: el dump tiene problemas; revisa OEP/IAT.\n");
+    report = o.str();
+    return ok;
+}
+
 void App::saveSessionDialog() {
     wchar_t path[MAX_PATH] = L"analysis.dbgjsession";
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
@@ -744,6 +840,7 @@ void App::render() {
     if (visible("Struct"))               drawStructPanel();
     if (visible("CFG"))                  drawCfgPanel();
     if (visible("Compare"))              drawComparePanel();
+    if (visible("Script"))               drawScriptPanel();
     if (showSearchResults_)              drawSearchResultsPanel();
     if (showOptions_)                    drawOptionsWindow();
     if (showHelp_)                       drawHelpWindow();
@@ -764,7 +861,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct", "CFG", "Compare"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script"
     };
 }
 
@@ -1056,6 +1153,12 @@ void App::drawMenuBar() {
                 ofn.lpstrFilter = L"JSON\0*.json\0Todos\0*.*\0"; ofn.Flags = OFN_OVERWRITEPROMPT;
                 if (GetSaveFileNameW(&ofn)) { std::string err; if (!saveAnalysisReportJson(path, err)) pushLog("Informe JSON: " + err); else pushLog("Informe JSON exportado."); }
             }
+            if (ImGui::MenuItem("Exportar SARIF...", nullptr, false, fileLoaded_)) {
+                wchar_t path[MAX_PATH] = L"analisis.sarif";
+                OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrFilter = L"SARIF\0*.sarif;*.json\0Todos\0*.*\0"; ofn.Flags = OFN_OVERWRITEPROMPT;
+                if (GetSaveFileNameW(&ofn)) { std::string err; if (!saveSarifReport(path, err)) pushLog("SARIF: " + err); else pushLog("SARIF exportado."); }
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Cerrar", "Alt+F4")) {
                 if (dbgState_ != DbgState::Idle) debugger_.detachAndStop();
@@ -1219,6 +1322,11 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Archivo -> Exportar informe JSON: informe estructurado (secciones, packers, breakpoints, funciones, peHash). Por MCP: report format=json / export_report .json.");
             ImGui::BulletText("Streaming de eventos: los clientes MCP sondean poll_events(since) para recibir load_dll/unload_dll/exit_process/breakpoint/hijos en vivo. Los plugins con una accion 'on_event' se invocan por cada evento.");
             ImGui::BulletText("DB de analisis portable (M6): la cache se guarda tambien por hash del contenido (cache/<hash>.dbj); si mueves o renombras el binario, las anotaciones/funciones se recuperan igual.");
+            ImGui::BulletText("CFG (Window -> CFG): elige una funcion analizada y muestra sus bloques basicos con aristas (verde=condicional, naranja=incondicional/fallthrough). Clic derecho arrastra, rueda hace zoom.");
+            ImGui::BulletText("Script (Window -> Script): mini-lenguaje que automatiza el debugger. Lineas: $v=expr | print expr | log txt | label: | goto label | if expr goto label | cmd key=val. Por MCP: run_script.");
+            ImGui::BulletText("Informes: Archivo -> Exportar SARIF genera SARIF 2.1.0 con las detecciones (packer, entropia, W+X, TLS, pocos imports). Por MCP: report format=sarif.");
+            ImGui::BulletText("Unpacking: Plugins -> 'Validar dump' revisa un ejecutable volcado (entrypoint en seccion ejecutable, entropia de codigo, IAT reconstruida). Por MCP: validate_dump.");
+            ImGui::BulletText("Seguir procesos hijos: hoy se detectan y listan (list_children). Para 'seguir' un hijo: Archivo -> Detach y luego Attach al PID del hijo (conmutacion manual). El seguimiento simultaneo de varios procesos aun no esta.");
             ImGui::BulletText("Archivo -> Guardar/Cargar sesion conserva el objetivo, argumentos, anotaciones y breakpoints; las direcciones de la imagen principal se guardan como RVA. Los memory breakpoints no se guardan: dependen de paginas validas de la ejecucion actual.");
             ImGui::BulletText("Archivo -> Exportar informe Markdown genera un resumen reproducible de PE, secciones, detecciones, estado y breakpoints. Por MCP, report devuelve el texto y export_report lo guarda en una ruta indicada.");
             ImGui::TextDisabled("Las anotaciones se guardan en la cache de analisis. Consulta MCP y Plugins para automatizacion y extensiones.");
@@ -1282,7 +1390,9 @@ void App::drawHelpWindow() {
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Mejoras inspiradas en x64dbg (ver docs/X64DBG_DEV_ANALISIS.md)");
             ImGui::BulletText("HECHO: motor de expresiones (eval/watch/struct), command bar hibrida + comandos de texto, Watch, Struct viewer + inferencia IA, Search for, symbol server, resumen de traza con IA, ai.classify, breakpoints con accion (M3), hot-reload plugins (M11), headless (M10), MCP bypass, bus de eventos + streaming poll_events (Fase 3), DB de analisis portable por hash (M6), informe JSON, comparacion de dumps (diff_files), CFG basico.");
             ImGui::BulletText("PARCIAL: seguir procesos hijos (M7): se detectan/reportan/listan (list_children) pero falta following completo (adoptar el hijo como target activo con su propio contexto). Capa de comandos: falta parser de texto avanzado (solo key=val).");
-            ImGui::BulletText("PENDIENTE (proyectos grandes): unpacking/IAT robusto con validacion; decompilador nativo y CFG completo interactivo; scriptdll/lenguaje de script; informes SARIF completos.");
+            ImGui::BulletText("HECHO (proyectos grandes): lenguaje de scripting (Script/run_script); SARIF 2.1.0; CFG interactivo con bloques basicos (pan/zoom); validacion de dumps (validate_dump).");
+            ImGui::BulletText("PARCIAL: seguir procesos hijos (deteccion+listado+conmutacion manual, falta simultaneo); unpacking/IAT (dump+validacion+fix experimental, falta reconstruccion PE 100%% robusta).");
+            ImGui::BulletText("FUERA DE ALCANCE por ahora: decompilador nativo real (el panel Code da interpretacion por IA, no genera pseudo-C fiel). Es un proyecto en si mismo.");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -2498,6 +2608,18 @@ void App::drawPluginsPanel() {
         ImGui::EndDisabled();
         if (lastDumpPath_.empty()) ImGui::TextDisabled("(genera un Dump antes de reconstruir)");
         ImGui::TextDisabled("Reconstruir es EXPERIMENTAL: verifica el .fixed.exe.");
+        ImGui::BeginDisabled(lastDumpPath_.empty());
+        if (ImGui::Button("Validar dump")) {
+            std::string rep; validateDump(lastDumpPath_, rep);
+            pluginStatus_ = rep; pushLog("Validacion de dump:\n" + rep);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Validar otro...")) {
+            wchar_t f[MAX_PATH]={0}; OPENFILENAMEW o{}; o.lStructSize=sizeof(o); o.lpstrFile=f; o.nMaxFile=MAX_PATH;
+            o.lpstrFilter=L"Ejecutables\0*.exe;*.dll\0Todos\0*.*\0";
+            if (GetOpenFileNameW(&o)) { std::string rep; validateDump(f, rep); pluginStatus_ = rep; pushLog("Validacion de dump:\n" + rep); }
+        }
     }
 
     ImGui::Separator();
@@ -3127,6 +3249,118 @@ void App::drawCommandBar() {
 }
 
 // ---------------------------------------------------------------------------
+// Motor de scripting: mini-lenguaje sobre la capa de comandos + expresiones.
+// Lineas soportadas (una por linea; // = comentario):
+//   $var = <expr>            asigna una variable (hex por defecto)
+//   print <expr>             evalua e imprime
+//   log <texto>              imprime texto (con $var sustituidas)
+//   <label>:                 define una etiqueta
+//   goto <label>             salta
+//   if <expr> goto <label>   salta si expr != 0
+//   <cmd> key=val, ...       ejecuta una tool dbg_* (o JSON crudo con {})
+// ---------------------------------------------------------------------------
+std::string App::runScript(const std::string& src, std::string& err) {
+    std::vector<std::string> lines;
+    { std::string cur; for (char c : src) { if (c == '\n') { lines.push_back(cur); cur.clear(); } else if (c != '\r') cur.push_back(c); } lines.push_back(cur); }
+
+    std::map<std::string, uint64_t> vars;
+    std::map<std::string, int> labels;
+    for (int i = 0; i < (int)lines.size(); ++i) {
+        std::string t = lines[i];
+        auto a = t.find_first_not_of(" \t"); if (a == std::string::npos) continue;
+        t = t.substr(a);
+        if (!t.empty() && t.back() == ':' && t.find(' ') == std::string::npos) labels[t.substr(0, t.size()-1)] = i;
+    }
+
+    auto substVars = [&](std::string s) {
+        for (auto& [k, v] : vars) {
+            std::string needle = "$" + k, rep = "0x" + hex64(v);
+            size_t p; while ((p = s.find(needle)) != std::string::npos) s.replace(p, needle.size(), rep);
+        }
+        return s;
+    };
+
+    std::string out;
+    int steps = 0;
+    for (int ip = 0; ip < (int)lines.size(); ++ip) {
+        if (++steps > 100000) { err = "limite de pasos (posible bucle infinito)"; break; }
+        std::string t = lines[ip];
+        auto a = t.find_first_not_of(" \t"); if (a == std::string::npos) continue;
+        t = t.substr(a);
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+        if (t.empty() || t.rfind("//", 0) == 0) continue;
+        if (t.back() == ':' && t.find(' ') == std::string::npos) continue;   // label
+
+        // asignacion $var = expr
+        if (t[0] == '$') {
+            auto eq = t.find('=');
+            if (eq != std::string::npos) {
+                std::string name = t.substr(1, eq-1);
+                while (!name.empty() && (name.back()==' '||name.back()=='\t')) name.pop_back();
+                uint64_t v = 0; std::string e;
+                if (!evalExpr(substVars(t.substr(eq+1)), v, e)) { err = "linea " + std::to_string(ip+1) + ": " + e; break; }
+                vars[name] = v; continue;
+            }
+        }
+        std::string kw = t.substr(0, t.find(' '));
+        std::string rest = (t.size() > kw.size()) ? t.substr(kw.size()+1) : "";
+        if (kw == "print") {
+            uint64_t v = 0; std::string e;
+            if (!evalExpr(substVars(rest), v, e)) { err = "linea " + std::to_string(ip+1) + ": " + e; break; }
+            out += "0x" + hex64(v) + "  (" + std::to_string(v) + ")\n";
+        } else if (kw == "log") {
+            out += substVars(rest) + "\n";
+        } else if (kw == "goto") {
+            auto it = labels.find(rest); if (it == labels.end()) { err = "label desconocido: " + rest; break; }
+            ip = it->second; continue;
+        } else if (kw == "if") {
+            auto g = rest.find(" goto ");
+            if (g == std::string::npos) { err = "if sin goto (linea " + std::to_string(ip+1) + ")"; break; }
+            std::string cond = rest.substr(0, g), lbl = rest.substr(g+6);
+            uint64_t v = 0; std::string e;
+            if (!evalExpr(substVars(cond), v, e)) { err = "linea " + std::to_string(ip+1) + ": " + e; break; }
+            if (v) { auto it = labels.find(lbl); if (it == labels.end()) { err = "label desconocido: " + lbl; break; } ip = it->second; }
+            continue;
+        } else {
+            // comando dbg_*: reusa el parseo key=val / JSON del command bar.
+            std::string cmd = kw, args = substVars(rest);
+            njson jargs = njson::object();
+            std::string tr = args; while (!tr.empty() && tr.front()==' ') tr.erase(tr.begin());
+            if (!tr.empty() && tr[0]=='{') { try { jargs = njson::parse(tr); } catch (...) {} }
+            else if (!tr.empty()) {
+                std::string kv; std::vector<std::string> pairs;
+                for (char c : args) { if (c==',') { pairs.push_back(kv); kv.clear(); } else kv.push_back(c); }
+                if (!kv.empty()) pairs.push_back(kv);
+                for (auto& pr : pairs) { auto eq=pr.find('='); if (eq==std::string::npos) continue;
+                    std::string k=pr.substr(0,eq), val=pr.substr(eq+1);
+                    auto trim=[&](std::string&s){while(!s.empty()&&s.front()==' ')s.erase(s.begin());while(!s.empty()&&s.back()==' ')s.pop_back();};
+                    trim(k); trim(val);
+                    if (val=="true") jargs[k]=true; else if (val=="false") jargs[k]=false;
+                    else if (!val.empty() && (isxdigit((unsigned char)val[0])||val.rfind("0x",0)==0)) jargs[k]=(uint64_t)strtoull(val.c_str(),nullptr,16);
+                    else jargs[k]=val;
+                }
+            }
+            njson req; req["cmd"]=cmd; req["args"]=jargs;
+            std::string r = execDbgCommand(req.dump());
+            out += kw + ": " + (r.size()>200 ? r.substr(0,200)+"..." : r) + "\n";
+        }
+    }
+    return out;
+}
+
+void App::drawScriptPanel() {
+    ImGui::Begin("Script");
+    ImGui::TextDisabled("$v=expr | print expr | log txt | label: | goto label | if expr goto label | cmd key=val");
+    ImGui::InputTextMultiline("##script", scriptBuf_, sizeof(scriptBuf_), ImVec2(-1, ImGui::GetContentRegionAvail().y - 130));
+    if (ImGui::Button("Ejecutar")) { std::string err; scriptOutput_ = runScript(scriptBuf_, err); if (!err.empty()) scriptOutput_ += "\n[error] " + err; }
+    ImGui::SameLine();
+    if (ImGui::Button("Limpiar salida")) scriptOutput_.clear();
+    ImGui::Separator();
+    ImGui::InputTextMultiline("##scriptout", scriptOutput_.data(), scriptOutput_.size()+1, ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
 // Watch (M2): evalua una lista de expresiones en cada pausa
 // ---------------------------------------------------------------------------
 void App::refreshWatches() {
@@ -3201,55 +3435,129 @@ void App::runBreakpointAction(uint64_t addr) {
     pushLog("  -> " + (out.size() > 200 ? out.substr(0, 200) + "..." : out));
 }
 
+// Divide una función en bloques básicos sobre insns_ (líderes = entry, targets de
+// saltos dentro del rango, y la instrucción posterior a un salto/ret).
+std::vector<App::BasicBlock> App::computeBasicBlocks(uint64_t funcStart, uint64_t funcEnd) {
+    std::vector<BasicBlock> blocks;
+    // índice de insns dentro del rango
+    std::vector<int> idx;
+    std::map<uint64_t,int> addrToIdx;
+    for (int i = 0; i < (int)insns_.size(); ++i)
+        if (insns_[i].address >= funcStart && insns_[i].address <= funcEnd) { addrToIdx[insns_[i].address] = (int)idx.size(); idx.push_back(i); }
+    if (idx.empty()) return blocks;
+
+    std::set<uint64_t> leaders;
+    leaders.insert(insns_[idx.front()].address);
+    for (size_t k = 0; k < idx.size(); ++k) {
+        const auto& in = insns_[idx[k]];
+        bool isUncond = in.isJump && in.text.rfind("jmp", 0) == 0;
+        if (in.isJump || in.isRet) {
+            if (in.hasBranchTarget && in.branchTarget >= funcStart && in.branchTarget <= funcEnd) leaders.insert(in.branchTarget);
+            if (k + 1 < idx.size()) leaders.insert(insns_[idx[k+1]].address);   // fallthrough leader
+        }
+        (void)isUncond;
+    }
+    // construir bloques
+    BasicBlock cur; bool open = false;
+    auto closeBlock = [&](int lastIdx) {
+        const auto& last = insns_[lastIdx];
+        cur.end = last.address;
+        bool isUncond = last.isJump && last.text.rfind("jmp", 0) == 0;
+        if (last.hasBranchTarget && last.branchTarget >= funcStart && last.branchTarget <= funcEnd) cur.succ.push_back(last.branchTarget);
+        if (!last.isRet && !isUncond) {
+            // fallthrough al siguiente líder
+            auto it = addrToIdx.find(last.address);
+            if (it != addrToIdx.end() && it->second + 1 < (int)idx.size()) cur.succ.push_back(insns_[idx[it->second+1]].address);
+        }
+        blocks.push_back(cur); cur = BasicBlock(); open = false;
+    };
+    for (size_t k = 0; k < idx.size(); ++k) {
+        const auto& in = insns_[idx[k]];
+        if (!open || leaders.count(in.address)) { if (open) closeBlock(idx[k-1]); cur = BasicBlock(); cur.start = in.address; open = true; }
+        cur.insnIdx.push_back(idx[k]);
+        bool ends = in.isJump || in.isRet || (k+1 < idx.size() && leaders.count(insns_[idx[k+1]].address));
+        if (ends) closeBlock(idx[k]);
+    }
+    if (open) closeBlock(idx.back());
+    return blocks;
+}
+
 // ---------------------------------------------------------------------------
-// CFG básico: dibuja las funciones analizadas y sus xrefs como grafo simple
+// CFG interactivo: bloques básicos de una función, con pan (arrastrar) y zoom.
 // ---------------------------------------------------------------------------
 void App::drawCfgPanel() {
     ImGui::Begin("CFG");
-    ImGui::TextDisabled("Grafo de funciones analizadas (Analyze this) y sus xrefs. Doble clic en un nodo = ir.");
     if (analyzedFunctions_.empty()) {
-        ImGui::TextDisabled("No hay funciones analizadas. Usa clic derecho -> Analyze en el CPU.");
+        ImGui::TextDisabled("No hay funciones analizadas. Clic derecho -> Analyze en el CPU.");
         ImGui::End(); return;
     }
-    ImGui::Separator();
-    ImGui::BeginChild("cfgcanvas", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    // selector de función
+    std::string curName = cfgFunc_ ? ("0x" + hex64(cfgFunc_)) : "(elige función)";
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::BeginCombo("Función", curName.c_str())) {
+        for (const auto& f : analyzedFunctions_) {
+            std::string nm = (f.name.empty() ? ("sub_" + hex64(f.start)) : f.name);
+            if (ImGui::Selectable(nm.c_str(), f.start == cfgFunc_)) cfgFunc_ = f.start;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine(); ImGui::Text("zoom %.0f%%", cfgZoom_ * 100);
+    ImGui::SameLine(); if (ImGui::SmallButton("Reset")) { cfgZoom_ = 1.0f; cfgPanX_ = cfgPanY_ = 0; }
+    if (!cfgFunc_) { ImGui::TextDisabled("Elige una función."); ImGui::End(); return; }
+
+    uint64_t fend = 0;
+    for (const auto& f : analyzedFunctions_) if (f.start == cfgFunc_) fend = f.end;
+    auto blocks = computeBasicBlocks(cfgFunc_, fend);
+
+    ImGui::BeginChild("cfgcanvas", ImVec2(0, 0), true, ImGuiWindowFlags_NoMove);
+    // pan con arrastre del boton medio o izquierdo sobre vacio
+    if (ImGui::IsWindowHovered()) {
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) { cfgPanX_ += ImGui::GetIO().MouseDelta.x; cfgPanY_ += ImGui::GetIO().MouseDelta.y; }
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0) { cfgZoom_ *= (wheel > 0 ? 1.1f : 0.9f); if (cfgZoom_ < 0.3f) cfgZoom_ = 0.3f; if (cfgZoom_ > 3.0f) cfgZoom_ = 3.0f; }
+    }
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 origin = ImGui::GetCursorScreenPos();
-    // Layout en rejilla: un nodo por función.
-    std::map<uint64_t, ImVec2> centers;
-    const float BW = 200, BH = 46, GAPX = 60, GAPY = 40;
-    int cols = 3, i = 0;
-    for (const auto& f : analyzedFunctions_) {
-        int r = i / cols, c = i % cols;
-        ImVec2 tl(origin.x + 10 + c * (BW + GAPX), origin.y + 10 + r * (BH + GAPY));
-        ImVec2 br(tl.x + BW, tl.y + BH);
-        centers[f.start] = ImVec2((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
-        dl->AddRectFilled(tl, br, ImGui::GetColorU32(ImVec4(0.16f,0.18f,0.22f,1)), 5);
-        dl->AddRect(tl, br, ImGui::GetColorU32(ImVec4(0.5f,0.7f,1,1)), 5);
-        std::string name = f.name.empty() ? ("sub_" + hex64(f.start)) : f.name;
-        char info[96]; std::snprintf(info, sizeof(info), "%s\n%u ins  %u calls  %u br",
-                     name.c_str(), f.instructions, f.calls, f.branches);
-        dl->AddText(ImVec2(tl.x + 6, tl.y + 5), ImGui::GetColorU32(ImVec4(0.9f,0.95f,1,1)), info);
-        // zona clicable
-        ImGui::SetCursorScreenPos(tl);
-        ImGui::PushID((int)(f.start ^ (f.start >> 32)));
-        if (ImGui::InvisibleButton("node", ImVec2(BW, BH)) && ImGui::IsMouseDoubleClicked(0)) gotoAddress(f.start);
-        ImGui::PopID();
-        i++;
+    ImVec2 org = ImGui::GetCursorScreenPos();
+    float z = cfgZoom_;
+    const float BW = 260 * z, GAPY = 34 * z, PAD = 6 * z;
+    float lineH = ImGui::GetTextLineHeight() * z;
+
+    // layout vertical por orden; posición Y acumulada
+    std::map<uint64_t, ImVec2> blockTopCenter, blockBotCenter;
+    float y = org.y + 10 + cfgPanY_;
+    float x = org.x + 20 + cfgPanX_;
+    for (auto& b : blocks) {
+        int n = (int)b.insnIdx.size();
+        float bh = PAD * 2 + n * lineH + lineH;   // header + instrucciones
+        ImVec2 tl(x, y), br(x + BW, y + bh);
+        blockTopCenter[b.start] = ImVec2(x + BW*0.5f, y);
+        blockBotCenter[b.start] = ImVec2(x + BW*0.5f, y + bh);
+        dl->AddRectFilled(tl, br, ImGui::GetColorU32(ImVec4(0.14f,0.16f,0.2f,1)), 4);
+        dl->AddRect(tl, br, ImGui::GetColorU32(ImVec4(0.45f,0.6f,0.9f,1)), 4);
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize()*z, ImVec2(tl.x+PAD, tl.y+PAD),
+                    ImGui::GetColorU32(ImVec4(0.7f,0.9f,1,1)), ("loc_" + hex64(b.start)).c_str());
+        float ty = tl.y + PAD + lineH;
+        for (int ii : b.insnIdx) {
+            std::string line = insns_[ii].text;
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize()*z, ImVec2(tl.x+PAD, ty),
+                        ImGui::GetColorU32(ImVec4(0.85f,0.85f,0.85f,1)), line.c_str());
+            ty += lineH;
+        }
+        y += bh + GAPY;
     }
-    // Aristas por xrefs entre funciones conocidas.
-    for (const auto& x : analysisXrefs_) {
-        auto a = centers.find(x.from), b = centers.find(x.to);
-        // conectar el xref a la función que lo contiene (aprox: from dentro de alguna func)
-        uint64_t fromFunc = 0;
-        for (const auto& f : analyzedFunctions_) if (x.from >= f.start && x.from <= f.end) { fromFunc = f.start; break; }
-        auto fa = centers.find(fromFunc);
-        if (fa != centers.end() && b != centers.end())
-            dl->AddLine(fa->second, b->second, ImGui::GetColorU32(ImVec4(0.95f,0.7f,0.25f,0.6f)), 1.5f);
-        (void)a;
+    // aristas entre bloques
+    for (auto& b : blocks) {
+        auto from = blockBotCenter.find(b.start); if (from == blockBotCenter.end()) continue;
+        for (uint64_t s : b.succ) {
+            auto to = blockTopCenter.find(s); if (to == blockTopCenter.end()) continue;
+            ImU32 col = ImGui::GetColorU32(b.succ.size() > 1 ? ImVec4(0.4f,0.9f,0.5f,0.8f) : ImVec4(0.9f,0.7f,0.3f,0.8f));
+            dl->AddLine(from->second, to->second, col, 1.5f * z);
+            dl->AddCircleFilled(to->second, 2.5f * z, col);
+        }
     }
-    ImGui::Dummy(ImVec2((float)cols * (BW + GAPX) + 20, (float)((analyzedFunctions_.size()+cols-1)/cols) * (BH + GAPY) + 20));
+    ImGui::Dummy(ImVec2(BW + 60, y - org.y + 40));
     ImGui::EndChild();
+    ImGui::TextDisabled("Arrastra con clic derecho para desplazar; rueda para zoom. %zu bloques.", blocks.size());
     ImGui::End();
 }
 
@@ -3639,7 +3947,7 @@ static std::string hexBytes(const uint8_t* p, size_t n) {
 static int mcpRequiredAccess(const std::string& cmd) {
     if (cmd == "save_session" || cmd == "load_session" || cmd == "export_report" || cmd == "write_mem" || cmd == "set_reg" || cmd == "assemble" || cmd == "patch" ||
         cmd == "nop" || cmd == "dump" || cmd == "fix_iat" || cmd == "antidebug" ||
-        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv") return 2;
+        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script") return 2;
     if (cmd == "attach" || cmd == "detach" || cmd == "launch" || cmd == "restart" || cmd == "go" || cmd == "pause" ||
         cmd == "step_into" || cmd == "step_over" || cmd == "step_to_ret" || cmd == "stop" ||
         cmd == "set_bp" || cmd == "del_bp" || cmd == "set_hwbp" || cmd == "del_hwbp" ||
@@ -3679,6 +3987,7 @@ void App::startMcp() {
 void App::stopMcp() { mcp_.stop(); mcpToken_.clear(); mcpStatus_ = "MCP detenido; el token de sesion fue invalidado."; pushLog(mcpStatus_); }
 void App::cliStartMcp(int port, bool bindAll) { mcpPort_ = port; mcpBindAll_ = bindAll; startMcp(); }
 void App::cliSetNoAuth(bool on) { mcpNoAuth_ = on; }
+void App::cliSetAccess(int level) { mcpAccessLevel_ = level < 0 ? 0 : (level > 2 ? 2 : level); }
 
 void App::loadExternalPlugins() {
     externalPlugins_.load(exeSiblingDir() + "\\plugins", allowNativeDllPlugins_);
@@ -3839,8 +4148,21 @@ std::string App::handleMcpCommand(const std::string& line) {
     }
     else if (cmd == "report") {
         if (!fileLoaded_) { res["ok"] = false; res["error"] = "abre un archivo primero"; }
-        else if (a.value("format", "markdown") == "json") res["json"] = buildAnalysisReportJson();
-        else res["markdown"] = buildAnalysisReport();
+        else {
+            std::string fmt = a.value("format", "markdown");
+            if (fmt == "json") res["json"] = buildAnalysisReportJson();
+            else if (fmt == "sarif") res["sarif"] = buildSarifReport();
+            else res["markdown"] = buildAnalysisReport();
+        }
+    }
+    else if (cmd == "run_script") {
+        std::string e; res["output"] = runScript(a.value("src", ""), e);
+        if (!e.empty()) { res["ok"] = false; res["error"] = e; }
+    }
+    else if (cmd == "validate_dump") {
+        std::string p = a.value("path", "");
+        if (p.empty()) { res["ok"] = false; res["error"] = "path requerido"; }
+        else { std::string rep; res["valid"] = validateDump(std::wstring(p.begin(), p.end()), rep); res["report"] = rep; }
     }
     else if (cmd == "export_report") {
         const std::string path = a.value("path", "");
@@ -4339,6 +4661,8 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("poll_events", "Sondea el bus de eventos (streaming). Devuelve eventos con seq > 'since' y el ultimo seq.", obj({{"since", INT}}, {}));
     add("diff_files",  "Compara dos archivos byte a byte y devuelve los rangos que difieren.", obj({{"a", STR}, {"b", STR}}, {"a","b"}));
     add("list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", obj(EMPTY, {}));
+    add("run_script",  "Ejecuta un script (mini-lenguaje: $v=expr, print, log, label:, goto, if..goto, cmd key=val).", obj({{"src", STR}}, {"src"}));
+    add("validate_dump","Valida un ejecutable volcado (entrypoint, entropia de codigo, IAT).", obj({{"path", STR}}, {"path"}));
     add("infer_struct","Pide a la IA que infiera la struct en una direccion (resultado en el panel IA).", obj({{"addr", HEX}}, {"addr"}));
     add("rm_exc_bp",   "Quita un breakpoint de excepcion por id.", obj({{"id", INT}}, {"id"}));
     return t;
