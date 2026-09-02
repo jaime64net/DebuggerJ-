@@ -1066,19 +1066,23 @@ void App::applyMagneticSnap() {
     if (np.x != p.x || np.y != p.y) mv->Pos = np;   // imanta esta ventana este frame
 }
 
-// Ruta del archivo .ini de un layout con nombre (sanitizado).
-static std::string layoutIniPath(const std::string& name) {
+// Ruta base de los archivos de un layout (una por seccion: _main.ini, _cont.ini, _meta.txt).
+// Se usan archivos SEPARADOS porque el .ini de ImGui contiene lineas con '[' (p.ej.
+// [Window][CPU]) que colisionarian con delimitadores de seccion en un solo archivo.
+static std::string layoutPath(const std::string& name, const char* suffix) {
     wchar_t exe[MAX_PATH] = {0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring w(exe); auto p = w.find_last_of(L"\\/");
     std::wstring dir = (p == std::wstring::npos) ? L"." : w.substr(0, p);
     std::string safe; for (char c : name) safe += (std::isalnum((unsigned char)c) ? c : '_');
-    std::wstring path = dir + L"\\layout_" + std::wstring(safe.begin(), safe.end()) + L".ini";
+    std::string s(suffix);
+    std::wstring path = dir + L"\\layout_" + std::wstring(safe.begin(), safe.end()) + std::wstring(s.begin(), s.end());
     return std::string(path.begin(), path.end());
 }
+static std::string readAllFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : std::string();
+}
 
-// Un layout completo guarda: el .ini del contexto principal (posiciones/tamanos/docking del
-// main), el .ini del contexto Contenedor, que paneles estan en el Contenedor, si estaba
-// abierto y la geometria de la ventana OS del Contenedor. Todo en un archivo con secciones.
 void App::captureLayout(const std::string& name) {
     std::string mainIni;
     { size_t sz = 0; const char* ini = ImGui::SaveIniSettingsToMemory(&sz); if (ini) mainIni.assign(ini, sz); }
@@ -1089,19 +1093,17 @@ void App::captureLayout(const std::string& name) {
         size_t sz2 = 0; const char* ini2 = ImGui::SaveIniSettingsToMemory(&sz2); if (ini2) contIni.assign(ini2, sz2);
         ImGui::SetCurrentContext(prev);
     }
-    // geometria de la ventana OS del Contenedor
     int cx=0,cy=0,cw=0,ch=0;
     if (contHwnd_) { RECT rc; if (GetWindowRect((HWND)contHwnd_, &rc)) { cx=rc.left; cy=rc.top; cw=rc.right-rc.left; ch=rc.bottom-rc.top; } }
 
-    std::ofstream f(layoutIniPath(name), std::ios::binary | std::ios::trunc);
-    if (f) {
-        f << "[meta]\n";
-        f << "open|" << (containerOpen_?1:0) << "\n";
-        f << "contwin|" << cx << "|" << cy << "|" << cw << "|" << ch << "\n";
-        for (auto& [k,v] : winContainer_) if (v) f << "panel|" << k << "\n";
-        f << "[main_ini]\n" << mainIni << "\n";
-        f << "[cont_ini]\n" << contIni << "\n";
-    }
+    { std::ofstream f(layoutPath(name, "_main.ini"), std::ios::binary | std::ios::trunc); if (f) f << mainIni; }
+    { std::ofstream f(layoutPath(name, "_cont.ini"), std::ios::binary | std::ios::trunc); if (f) f << contIni; }
+    { std::ofstream f(layoutPath(name, "_meta.txt"), std::ios::binary | std::ios::trunc);
+      if (f) {
+          f << "open|" << (containerOpen_?1:0) << "\n";
+          f << "contwin|" << cx << "|" << cy << "|" << cw << "|" << ch << "\n";
+          for (auto& [k,v] : winContainer_) if (v) f << "panel|" << k << "\n";
+      } }
     for (auto& e : customLayouts_) if (e.name == name) { saveLayouts(); pushLog("Layout actualizado: " + name); return; }
     WinLayout L; L.name = name;
     customLayouts_.push_back(L);
@@ -1110,18 +1112,10 @@ void App::captureLayout(const std::string& name) {
 }
 
 void App::applyLayout(const WinLayout& L) {
-    std::ifstream f(layoutIniPath(L.name), std::ios::binary);
-    if (!f) { pushLog("Layout sin archivo: " + L.name); return; }
-    std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    // separar secciones
-    auto section = [&](const std::string& tag) -> std::string {
-        std::string open = "[" + tag + "]\n";
-        auto s = all.find(open); if (s == std::string::npos) return "";
-        s += open.size();
-        auto e = all.find("\n[", s);
-        return all.substr(s, e == std::string::npos ? std::string::npos : e - s);
-    };
-    std::string meta = section("meta"), mainIni = section("main_ini"), contIni = section("cont_ini");
+    std::string meta = readAllFile(layoutPath(L.name, "_meta.txt"));
+    std::string mainIni = readAllFile(layoutPath(L.name, "_main.ini"));
+    std::string contIni = readAllFile(layoutPath(L.name, "_cont.ini"));
+    if (meta.empty() && mainIni.empty()) { pushLog("Layout sin archivos: " + L.name); return; }
 
     // meta: paneles del contenedor, open, geometria
     winContainer_.clear();
