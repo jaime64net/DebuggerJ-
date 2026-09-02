@@ -66,6 +66,7 @@ const TOOLS = [
   ["notes_get",   "Devuelve las notas globales y las del binario actual.", S()],
   ["notes_set",   "Guarda notas. scope: 'global' o 'debuggee' (por binario).", S({ scope: { type: "string" }, text: { type: "string" } }, ["text"])],
   ["run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", S({ addr: HEX }, ["addr"])],
+  ["run_until",   "Single-step hasta que una expresion sea != 0 (o se agote max). over=true usa step over. Requiere pausado.", S({ expr: { type: "string" }, over: { type: "boolean" }, max: { type: "integer" } }, ["expr"])],
   ["thread_ctrl", "Controla un hilo. action: suspend|resume|kill|priority|name; value=prioridad/exitcode; name=nombre.", S({ tid: { type: "integer" }, action: { type: "string" }, value: { type: "integer" }, name: { type: "string" } }, ["tid", "action"])],
   ["mem_alloc",   "Reserva memoria en el proceso (VirtualAllocEx). size, protect (hex, def 0x40=RWX). Requiere pausado.", S({ size: { type: "integer" }, protect: HEX })],
   ["mem_free",    "Libera memoria reservada (VirtualFreeEx). Requiere pausado.", S({ addr: HEX }, ["addr"])],

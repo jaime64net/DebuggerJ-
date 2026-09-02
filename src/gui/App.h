@@ -56,6 +56,15 @@ private:
     uint32_t pendingSwitchPid_ = 0;          // attach pendiente tras el detach (conmutacion)
     void runToAddress(uint64_t va);          // ejecuta hasta una direccion (BP temporal + go)
     std::set<uint64_t> runToTemp_;           // BPs temporales de run-to que se quitan al golpear
+    // Run until expression / trace condicional (paridad x64dbg): single-step evaluando
+    // una expresion en cada paso; para cuando la expresion es != 0 o se alcanza el tope.
+    bool          runUntilActive_ = false;
+    std::string   runUntilExpr_;
+    int           runUntilMode_ = 0;         // 0 = step into, 1 = step over
+    int           runUntilCount_ = 0;
+    int           runUntilMax_ = 100000;
+    void          startRunUntil(const std::string& expr, int mode, int maxSteps);
+    void          tickRunUntil();            // llamado al pausar; hace el siguiente paso o para
     bool saveSession(const std::wstring& path, std::string& error);
     bool loadSession(const std::wstring& path, std::string& error);
     std::string buildAnalysisReport();

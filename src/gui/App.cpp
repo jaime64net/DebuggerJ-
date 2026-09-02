@@ -446,6 +446,26 @@ void App::switchToChild(uint32_t pid) {
 
 // Run to cursor: pone un breakpoint temporal en 'va' y continua. Al pausar en esa
 // direccion (ver render()), el breakpoint se retira automaticamente.
+// Run until expression: arranca el bucle de single-step condicional.
+void App::startRunUntil(const std::string& expr, int mode, int maxSteps) {
+    if (dbgState_ != DbgState::Paused) { pushLog("Run until: el proceso debe estar pausado."); return; }
+    runUntilExpr_ = expr; runUntilMode_ = mode; runUntilMax_ = maxSteps > 0 ? maxSteps : 100000;
+    runUntilCount_ = 0; runUntilActive_ = true;
+    pushLog("Run until '" + expr + "' iniciado.");
+    tickRunUntil();
+}
+// Llamado en cada pausa: evalua la expresion; si es cierta o se agoto el tope, para;
+// si no, da el siguiente single-step (into/over).
+void App::tickRunUntil() {
+    if (!runUntilActive_ || dbgState_ != DbgState::Paused) return;
+    uint64_t v = 0; std::string err;
+    bool okEval = evalExpr(runUntilExpr_, v, err);
+    if (okEval && v != 0) { runUntilActive_ = false; pushLog("Run until: condicion cumplida en 0x" + hex64(currentIp_) + " tras " + std::to_string(runUntilCount_) + " pasos."); return; }
+    if (runUntilCount_ >= runUntilMax_) { runUntilActive_ = false; pushLog("Run until: tope de " + std::to_string(runUntilMax_) + " pasos alcanzado."); return; }
+    runUntilCount_++;
+    if (runUntilMode_ == 1) debugger_.stepOver(); else debugger_.stepInto();
+}
+
 void App::runToAddress(uint64_t va) {
     if (dbgState_ != DbgState::Paused) { pushLog("Run hasta: el proceso debe estar pausado."); return; }
     bool already = false;
@@ -840,6 +860,7 @@ void App::render() {
             refreshWatches();
             // Run to cursor: si pausamos en un BP temporal, retirarlo.
             if (runToTemp_.count(currentIp_)) { debugger_.removeBreakpoint(currentIp_); runToTemp_.erase(currentIp_); }
+            if (runUntilActive_) tickRunUntil();   // Obj E: run until expression
             runBreakpointAction(currentIp_);   // M3: accion al golpear un BP
             // Re-aplicar anti-anti-debug si esta activado (el malware puede re-chequear)
             if (antiReapply_ && antiActive_) {
@@ -1369,6 +1390,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("System (Window -> System): privilegios del token del proceso, conexiones TCP (IPv4) y conteo de handles. Por MCP: system_info.");
             ImGui::BulletText("Operaciones de memoria (solo por MCP, requieren pausa): mem_alloc, mem_free, mem_fill, mem_copy, mem_save, page_protect.");
             ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
+            ImGui::BulletText("Run until expression (MCP run_until {expr, over, max}): single-step hasta que una expresion sea cierta (p.ej. 'eax == 0' o 'dword(esp) > 0x400000'). Requiere pausado.");
             ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin. Packers muestra firmas y heuristicas.");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
             ImGui::Separator();
@@ -4306,7 +4328,7 @@ static int mcpRequiredAccess(const std::string& cmd) {
         cmd == "set_membp" || cmd == "del_membp" ||
         cmd == "add_exc_bp" || cmd == "rm_exc_bp" || cmd == "set_event_breaks" ||
         cmd == "set_bookmark" || cmd == "del_bookmark" || cmd == "clear_analysis" ||
-        cmd == "set_follow_children" || cmd == "switch_to_child" || cmd == "run_to" ||
+        cmd == "set_follow_children" || cmd == "switch_to_child" || cmd == "run_to" || cmd == "run_until" ||
         cmd == "find_oep" || cmd == "run_trace") return 1;
     return 0;
 }
@@ -4797,6 +4819,12 @@ std::string App::handleMcpCommand(const std::string& line) {
         if (!need_paused()) goto done;
         runToAddress(jU64(a["addr"]));
     }
+    else if (cmd == "run_until") {
+        if (!need_paused()) goto done;
+        int mode = a.value("over", false) ? 1 : 0;
+        startRunUntil(a.value("expr", ""), mode, (int)a.value("max", 100000));
+        res["mode"] = mode ? "over" : "into";
+    }
     else if (cmd == "mem_alloc") {
         if (!need_paused()) goto done;
         size_t size = (size_t)a.value("size", 4096);
@@ -5107,6 +5135,7 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("notes_get",   "Devuelve las notas globales y las del binario actual.", obj(EMPTY, {}));
     add("notes_set",   "Guarda notas. scope: 'global' o 'debuggee' (por binario).", obj({{"scope", STR}, {"text", STR}}, {"text"}));
     add("run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));
+    add("run_until",   "Single-step hasta que una expresion sea != 0 (o se agote max). over=true usa step over. Requiere pausado.", obj({{"expr", STR}, {"over", njson{{"type","boolean"}}}, {"max", INT}}, {"expr"}));
     add("thread_ctrl", "Controla un hilo. action: suspend|resume|kill|priority|name; value=prioridad/exitcode; name=nombre.", obj({{"tid", INT}, {"action", STR}, {"value", INT}, {"name", STR}}, {"tid","action"}));
     add("mem_alloc",   "Reserva memoria en el proceso (VirtualAllocEx). size, protect (hex, def 0x40=RWX). Requiere pausado.", obj({{"size", INT}, {"protect", HEX}}, {}));
     add("mem_free",    "Libera memoria reservada (VirtualFreeEx). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));
