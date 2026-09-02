@@ -1185,8 +1185,13 @@ void App::drawWindowMenu() {
                 st.WindowRounding = 0.0f; st.Colors[ImGuiCol_WindowBg].w = 1.0f;
             }
         }
-        if (vp) ImGui::TextDisabled("  Arrastra la barra del Contenedor fuera del main. Si parpadea, desactivalo.");
+        if (vp) ImGui::TextDisabled("  Arrastra la barra del Contenedor fuera del main.");
     }
+    // VSync: apagarlo suele quitar el parpadeo cuando una ventana esta en un monitor con
+    // distinta frecuencia de refresco (a costa de posible tearing y mas uso de GPU).
+    if (ImGui::MenuItem("VSync", nullptr, &vsyncOn_)) {}
+    ImGui::TextDisabled("  Si el Contenedor parpadea en otro monitor: apaga VSync o iguala");
+    ImGui::TextDisabled("  la frecuencia de refresco de ambos monitores (p.ej. ambos a 60 Hz).");
 
     if (ImGui::BeginMenu("Show")) {
         ensureVisibilityKeys();

@@ -178,7 +178,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             ImGui::RenderPlatformWindowsDefault();
         }
 
-        g_pSwapChain->Present(1, 0);
+        g_pSwapChain->Present(app.vsyncInterval(), 0);
     }
 
     ImGui_ImplDX11_Shutdown();

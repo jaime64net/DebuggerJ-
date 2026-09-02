@@ -36,6 +36,7 @@ public:
     ~App();
 
     void render();   // se llama cada frame
+    int  vsyncInterval() const { return vsyncOn_ ? 1 : 0; }  // sync interval para Present
     void cliStartMcp(int port, bool bindAll); // arranca el MCP desde linea de comandos
     void cliSetNoAuth(bool on);               // --noauth: bypass del token (antes de cliStartMcp)
     void cliSetAccess(int level);             // --access=N: nivel MCP (0/1/2) antes de cliStartMcp
@@ -463,6 +464,7 @@ private:
     char          newLayoutName_[64] = {0};
     float         toolbarHeight_ = 44.0f;
     bool          magneticSnap_ = true;   // pegar ventanas por imantacion al arrastrar
+    bool          vsyncOn_ = true;        // Present con vsync (apagar reduce parpadeo multi-monitor)
 };
 
 } // namespace dbg
