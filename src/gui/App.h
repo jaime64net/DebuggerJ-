@@ -127,6 +127,10 @@ private:
     void drawMenuBar();
     void drawToolbar();
     void drawCpuPanel();          // ventana CPU compuesta estilo Olly
+    // Tamaños (px) de las 4 sub-regiones del CPU, ajustables con splitters.
+    float cpuTopH_=0, cpuBotH_=0;        // alturas de las filas superior/inferior
+    float cpuDisasmW_=0, cpuRegsW_=0;    // anchos fila superior (desensamblado / registros)
+    float cpuDumpW_=0, cpuStackW_=0;     // anchos fila inferior (dump / pila)
     void drawCpuContent();        // solo el desensamblado
     void drawRegistersContent();
     void drawBreakpointsPanel();

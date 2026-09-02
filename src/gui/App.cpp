@@ -1689,30 +1689,64 @@ void App::drawAttachWindow() {
 // ---------------------------------------------------------------------------
 // Ventana CPU compuesta estilo OllyDbg: desensamblado + registros (arriba) y
 // volcado hex + pila (abajo), todo en una sola ventana con 4 sub-regiones.
+// Splitter arrastrable (patron oficial de ImGui): ajusta dos tamanos adyacentes.
+static bool CpuSplitter(const char* id, bool vertical, float thickness, float* a, float* b, float minA, float minB, float longAxis) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    ImGuiID gid = window->GetID(id);
+    ImVec2 cur = window->DC.CursorPos;
+    ImRect bb;
+    bb.Min = ImVec2(cur.x + (vertical ? *a : 0.0f), cur.y + (vertical ? 0.0f : *a));
+    ImVec2 sz = ImGui::CalcItemSize(vertical ? ImVec2(thickness, longAxis) : ImVec2(longAxis, thickness), 0, 0);
+    bb.Max = ImVec2(bb.Min.x + sz.x, bb.Min.y + sz.y);
+    return ImGui::SplitterBehavior(bb, gid, vertical ? ImGuiAxis_X : ImGuiAxis_Y, a, b, minA, minB, 1.0f);
+}
+
 void App::drawCpuPanel() {
     std::string title = "CPU";
     if (dbgState_ == DbgState::Paused && !curModule_.empty()) title += " - " + curModule_;
     title += "###CPU"; // ID estable aunque cambie el titulo visible
     { bool was = winVisible_["CPU"]; ImGui::Begin(title.c_str(), &winVisible_["CPU"]);
       if (was && !winVisible_["CPU"]) saveVisibility(); }
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    float topH = avail.y * 0.58f;
-    float leftW = avail.x * 0.62f;
 
-    ImGui::BeginChild("cpu_disasm", ImVec2(leftW, topH), true);
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float sp = 6.0f;   // grosor del separador
+    const float minS = 50.0f;
+    // Inicializar / reajustar tamanos (px) a partir de las proporciones por defecto.
+    if (cpuTopH_ <= 0) { cpuTopH_ = avail.y * 0.58f; cpuBotH_ = avail.y - cpuTopH_ - sp; }
+    if (cpuDisasmW_ <= 0) { cpuDisasmW_ = avail.x * 0.62f; cpuRegsW_ = avail.x - cpuDisasmW_ - sp; }
+    if (cpuDumpW_ <= 0) { cpuDumpW_ = avail.x * 0.62f; cpuStackW_ = avail.x - cpuDumpW_ - sp; }
+    // Mantener sumas = espacio disponible (por si la ventana cambio de tamano).
+    cpuBotH_ = avail.y - cpuTopH_ - sp; if (cpuBotH_ < minS) { cpuBotH_ = minS; cpuTopH_ = avail.y - cpuBotH_ - sp; }
+    cpuRegsW_ = avail.x - cpuDisasmW_ - sp; if (cpuRegsW_ < minS) { cpuRegsW_ = minS; cpuDisasmW_ = avail.x - cpuRegsW_ - sp; }
+    cpuStackW_ = avail.x - cpuDumpW_ - sp; if (cpuStackW_ < minS) { cpuStackW_ = minS; cpuDumpW_ = avail.x - cpuStackW_ - sp; }
+
+    // ---- Fila superior: desensamblado | pila de registros ----
+    ImGui::BeginChild("cpu_top", ImVec2(0, cpuTopH_), false);
+    ImGui::BeginChild("cpu_disasm", ImVec2(cpuDisasmW_, 0), true);
     drawCpuContent();
     ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild("cpu_regs", ImVec2(0, topH), true);
+    ImGui::SameLine(0, 0);
+    CpuSplitter("##vsplit_top", true, sp, &cpuDisasmW_, &cpuRegsW_, minS, minS, cpuTopH_);
+    ImGui::SameLine(0, 0);
+    ImGui::BeginChild("cpu_regs", ImVec2(0, 0), true);
     drawRegistersContent();
     ImGui::EndChild();
+    ImGui::EndChild();
 
-    ImGui::BeginChild("cpu_dump", ImVec2(leftW, 0), true);
+    // ---- Separador horizontal entre filas ----
+    CpuSplitter("##hsplit", false, sp, &cpuTopH_, &cpuBotH_, minS, minS, avail.x);
+
+    // ---- Fila inferior: volcado hex | pila ----
+    ImGui::BeginChild("cpu_bot", ImVec2(0, 0), false);
+    ImGui::BeginChild("cpu_dump", ImVec2(cpuDumpW_, 0), true);
     drawHexDumpContent();
     ImGui::EndChild();
-    ImGui::SameLine();
+    ImGui::SameLine(0, 0);
+    CpuSplitter("##vsplit_bot", true, sp, &cpuDumpW_, &cpuStackW_, minS, minS, ImGui::GetContentRegionAvail().y);
+    ImGui::SameLine(0, 0);
     ImGui::BeginChild("cpu_stack", ImVec2(0, 0), true);
     drawStackContent();
+    ImGui::EndChild();
     ImGui::EndChild();
 
     ImGui::End();
