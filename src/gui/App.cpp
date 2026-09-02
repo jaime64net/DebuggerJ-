@@ -1166,6 +1166,23 @@ void App::drawWindowMenu() {
 
     if (ImGui::MenuItem("Arrange Windows (reorganizar)")) dockNeedsInit_ = true;   // reconstruye el layout de docking
 
+    // Multi-monitor: permite sacar ventanas (p.ej. el Contenedor) fuera del main a otros
+    // monitores. Se puede apagar en caliente si en tu GPU/driver la interfaz parpadea.
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        bool vp = (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+        if (ImGui::MenuItem("Multi-monitor (sacar ventanas fuera del main)", nullptr, vp)) {
+            if (vp) io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+            else {
+                io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+                io.ConfigViewportsNoAutoMerge = false;
+                ImGuiStyle& st = ImGui::GetStyle();
+                st.WindowRounding = 0.0f; st.Colors[ImGuiCol_WindowBg].w = 1.0f;
+            }
+        }
+        if (vp) ImGui::TextDisabled("  Arrastra la barra del Contenedor fuera del main. Si parpadea, desactivalo.");
+    }
+
     if (ImGui::BeginMenu("Show")) {
         ensureVisibilityKeys();
         for (auto nm : managedWindows()) {
@@ -1486,7 +1503,8 @@ void App::drawHelpWindow() {
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Ventanas: docking, X para cerrar y Contenedor");
             ImGui::BulletText("Cada ventana tiene una X en su barra de titulo para cerrarla (se reactiva en Window -> Show).");
             ImGui::BulletText("Docking: arrastra la barra de titulo de una ventana sobre otra o sobre los bordes para anclarla; las ventanas se agrupan en pestanas y paneles divididos dentro del main.");
-            ImGui::BulletText("Ventana Contenedor (Window -> Show -> Contenedor): un segundo espacio de anclaje. Arrastra su barra de titulo FUERA del main para convertirla en una ventana del sistema (con minimizar/maximizar/cerrar) y llevarla a OTRO MONITOR. Ancla dentro las ventanas que no caben en un solo monitor.");
+            ImGui::BulletText("Ventana Contenedor (Window -> Show -> Contenedor): un segundo espacio de anclaje con botones minimizar/maximizar/cerrar. Ancla dentro las ventanas que no caben en un solo monitor.");
+            ImGui::BulletText("Sacar el Contenedor a OTRO MONITOR: activa Window -> 'Multi-monitor (sacar ventanas fuera del main)' y arrastra la barra de titulo del Contenedor fuera de la ventana principal; se vuelve una ventana del sistema. Si la interfaz parpadea en tu GPU/driver, desactiva esa opcion (o usa el docking dentro del main).");
             ImGui::BulletText("Window -> Custom -> Add to custom: guarda el layout COMPLETO (posiciones, tamanos y el docking del main Y del Contenedor) en un .ini con nombre; elige el nombre para restaurarlo. Se guarda y carga para ambos contenedores.");
             ImGui::BulletText("CFG (Window -> CFG): grafo de las funciones analizadas (Analyze this) y sus xrefs; doble clic en un nodo navega a la funcion.");
             ImGui::BulletText("Compare (Window -> Compare): compara dos archivos/dumps byte a byte y lista los rangos que difieren. Tambien por MCP: diff_files.");
