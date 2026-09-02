@@ -911,7 +911,9 @@ void App::render() {
 
     // DockSpace del main: permite anclar (dock) las ventanas dentro de la ventana
     // principal. PassthruCentralNode deja el centro transparente para el fondo.
-    ImGuiID mainDock = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+    // Nodo central OPACO (sin PassthruCentralNode): el central transparente parpadea como
+    // recuadros con multi-viewport al dejar ver el fondo.
+    ImGuiID mainDock = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
     if (dockNeedsInit_) { dockNeedsInit_ = false; buildDefaultDock(mainDock); }
 
     // Animate (step animado): mientras esté activo y pausado, da un paso cada ~15 frames.
@@ -4412,7 +4414,7 @@ bool App::beginManaged(const char* name) {
 // derecha. Evita que las ventanas se solapen sueltas al abrir por primera vez.
 void App::buildDefaultDock(unsigned int dockspaceId) {
     ImGui::DockBuilderRemoveNode(dockspaceId);
-    ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->WorkSize);
 
     ImGuiID center = dockspaceId;
