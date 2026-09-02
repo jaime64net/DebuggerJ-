@@ -177,6 +177,11 @@ void Debugger::detachAndStop() {
     state_.store(DbgState::Idle);
 }
 
+std::vector<uint32_t> Debugger::childPids() {
+    std::lock_guard<std::mutex> lk(childMutex_);
+    return childPids_;
+}
+
 void Debugger::setSymbolSearchPath(const std::string& path) {
     symSearchPath_ = path;
     // Si ya hay una sesion con DbgHelp activo, aplica el nuevo path y recarga modulos.
@@ -876,6 +881,7 @@ void Debugger::debugLoop() {
             // detectamos, reportamos y dejamos correr para no colgarlo.
             if (pid_ && ev.dwProcessId != pid_) {
                 log("Proceso hijo detectado, PID " + std::to_string(ev.dwProcessId));
+                { std::lock_guard<std::mutex> lk(childMutex_); childPids_.push_back(ev.dwProcessId); }
                 if (cb_.onEvent) cb_.onEvent("create_process_child", ev.dwProcessId);
                 if (ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
                 break;

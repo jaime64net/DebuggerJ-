@@ -53,7 +53,21 @@ private:
     bool saveSession(const std::wstring& path, std::string& error);
     bool loadSession(const std::wstring& path, std::string& error);
     std::string buildAnalysisReport();
+    std::string buildAnalysisReportJson();          // informe estructurado (JSON/SARIF-friendly)
     bool saveAnalysisReport(const std::wstring& path, std::string& error);
+    bool saveAnalysisReportJson(const std::wstring& path, std::string& error);
+    std::string peContentHash();                     // hash del contenido del PE (M6: DB por hash)
+
+    // --- Bus de eventos / streaming (Fase 3) ---
+    struct EventRec { uint64_t seq = 0; std::string type; uint64_t arg = 0; };
+    void pushEvent(const std::string& type, uint64_t arg);
+
+    // --- CFG básico (grafo de la función analizada) ---
+    void drawCfgPanel();
+    // --- Comparación de dumps ---
+    void drawComparePanel();
+    // --- Struct inferido por IA (M8+) ---
+    void inferStructWithAi();
     void saveSessionDialog();
     void loadSessionDialog();
     void exportReportDialog();
@@ -261,6 +275,16 @@ private:
     struct StructField { int type = 2; char name[32] = {0}; };  // type: 0=byte 1=word 2=dword 3=qword 4=ptr 5=str
     std::vector<StructField> structFields_;
     char          structBase_[64] = {0};
+
+    // --- Bus de eventos / streaming (Fase 3) ---
+    std::deque<EventRec> events_;
+    std::mutex    eventsMutex_;
+    uint64_t      eventSeq_ = 0;
+
+    // --- Comparación de dumps ---
+    char          cmpPathA_[512] = {0};
+    char          cmpPathB_[512] = {0};
+    std::string   cmpResult_;
 
     // --- Breakpoints inteligentes (M3) ---
     std::map<uint64_t, std::string> bpActions_;   // VA -> accion (cmd dbg_*, JSON, o "ai:<prompt>")

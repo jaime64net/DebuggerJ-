@@ -154,6 +154,7 @@ public:
     // detecta/continua los hijos (sin adoptarlos como target). Fijar antes de launch.
     void     setFollowChildren(bool on) { followChildren_ = on; }
     bool     followChildren() const { return followChildren_; }
+    std::vector<uint32_t> childPids();   // PIDs de procesos hijos detectados
     uint64_t imageBase() const { return imageBase_; }
     void*    processHandle() const { return hProcess_; }   // HANDLE del proceso
     uint32_t pid() const { return pid_; }
@@ -307,6 +308,8 @@ private:
     bool symReady_ = false;         // DbgHelp inicializado
     std::string symSearchPath_;     // path de simbolos (symsrv); vacio = por defecto
     bool followChildren_ = false;   // M7: seguir/detectar procesos hijos
+    std::mutex childMutex_;
+    std::vector<uint32_t> childPids_;
 
     DbgCallbacks cb_;
     bool attached_ = false;

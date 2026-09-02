@@ -111,11 +111,13 @@ App::App() {
     // Callbacks del motor: solo para logging thread-safe.
     DbgCallbacks cb;
     cb.onLog    = [this](const std::string& m){ pushLog(m); };
-    cb.onModule = [this](const LoadedModule& m){ pushLog("DLL: " + m.name + "  @0x" + hex64(m.base)); };
-    // Fase 3: bus de eventos CB_*. Se publica al log (y queda disponible para
-    // plugins/IA/MCP como punto de extension futuro).
+    cb.onModule = [this](const LoadedModule& m){ pushLog("DLL: " + m.name + "  @0x" + hex64(m.base)); pushEvent("load_dll", m.base); };
+    cb.onBreak  = [this](uint64_t va){ pushEvent("breakpoint", va); };
+    // Fase 3: bus de eventos CB_*. Se publica al log y a la cola de eventos que
+    // los clientes MCP sondean con poll_events (streaming por polling).
     cb.onEvent  = [this](const std::string& type, uint64_t arg){
         pushLog("[evento] " + type + "  0x" + hex64(arg));
+        pushEvent(type, arg);
     };
     debugger_.setCallbacks(cb);
 
@@ -143,6 +145,24 @@ void App::pushLog(const std::string& s) {
     std::lock_guard<std::mutex> lk(logMutex_);
     log_.push_back(s);
     while (log_.size() > 500) log_.pop_front();
+}
+
+// Fase 3: encola un evento para poll_events (streaming por MCP) y para plugins.
+void App::pushEvent(const std::string& type, uint64_t arg) {
+    { std::lock_guard<std::mutex> lk(eventsMutex_);
+      events_.push_back({ ++eventSeq_, type, arg });
+      while (events_.size() > 2000) events_.pop_front(); }
+    // Reenvio a plugins: si un plugin JSON declara una accion con id "on_event",
+    // se invoca con el tipo y el argumento (suscripcion declarativa).
+    for (const auto& p : externalPlugins_.plugins()) {
+        if (!p.enabled) continue;
+        for (const auto& a : p.actions) {
+            if (a.id == "on_event") {
+                njson args; args["type"] = type; args["arg"] = arg;
+                runExternalPluginAction(p.id, a.id, args.dump());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +608,52 @@ bool App::saveAnalysisReport(const std::wstring& path, std::string& error) {
     return true;
 }
 
+// Hash del contenido del PE (FNV-1a 64). Identificador estable para la DB por hash (M6).
+std::string App::peContentHash() {
+    if (!fileLoaded_) return "";
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t b : pe_.raw()) { h ^= b; h *= 1099511628211ull; }
+    char buf[20]; std::snprintf(buf, sizeof(buf), "%016llX", (unsigned long long)h);
+    return buf;
+}
+
+// Informe estructurado en JSON (base para integraciones/SARIF).
+std::string App::buildAnalysisReportJson() {
+    njson j;
+    j["tool"] = "DebuggerJ++";
+    j["target"] = std::string(loadedPath_.begin(), loadedPath_.end());
+    j["peHash"] = peContentHash();
+    j["arch"] = pe_.is64Bit() ? "x64" : "x86";
+    j["imageBase"] = pe_.imageBase();
+    j["entryPoint"] = pe_.entryPointVA();
+    j["overallEntropy"] = pe_.overallEntropy();
+    const char* state = dbgState_ == DbgState::Paused ? "paused" : dbgState_ == DbgState::Running ? "running" :
+                        dbgState_ == DbgState::Launching ? "launching" : dbgState_ == DbgState::Exited ? "exited" : "idle";
+    j["state"] = state;
+    for (const auto& s : pe_.sections())
+        j["sections"].push_back({{"name", s.name}, {"rva", s.virtualAddress}, {"vsize", s.virtualSize},
+                                 {"entropy", s.entropy}, {"exec", s.executable()}, {"write", s.writable()}});
+    for (const auto& p : packerMatches_)
+        j["packers"].push_back({{"name", p.name}, {"confidence", p.confidence}, {"source", p.source}});
+    for (const auto& bp : debugger_.breakpoints()) if (!bp.oneShot)
+        j["breakpoints"].push_back({{"addr", bp.address}, {"hits", bp.hits}, {"break_on_hit", bp.breakOnHit},
+                                    {"condition", bp.condition}, {"log_only", bp.logOnly}});
+    for (const auto& f : analyzedFunctions_)
+        j["functions"].push_back({{"start", f.start}, {"end", f.end}, {"instructions", f.instructions},
+                                  {"calls", f.calls}, {"branches", f.branches}, {"name", f.name}});
+    j["note"] = "Informe de sesion; no prueba por si solo comportamiento malicioso. Ejecutar en VM aislada.";
+    return j.dump(2);
+}
+
+bool App::saveAnalysisReportJson(const std::wstring& path, std::string& error) {
+    if (!fileLoaded_) { error = "abre un archivo antes de exportar el informe"; return false; }
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) { error = "no se pudo crear el informe JSON"; return false; }
+    file << buildAnalysisReportJson();
+    if (!file) { error = "no se pudo escribir el informe JSON"; return false; }
+    return true;
+}
+
 void App::saveSessionDialog() {
     wchar_t path[MAX_PATH] = L"analysis.dbgjsession";
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
@@ -676,6 +742,8 @@ void App::render() {
     if (visible("Command"))              drawCommandBar();
     if (visible("Watch"))                drawWatchPanel();
     if (visible("Struct"))               drawStructPanel();
+    if (visible("CFG"))                  drawCfgPanel();
+    if (visible("Compare"))              drawComparePanel();
     if (showSearchResults_)              drawSearchResultsPanel();
     if (showOptions_)                    drawOptionsWindow();
     if (showHelp_)                       drawHelpWindow();
@@ -696,7 +764,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct"
+        "Command", "Watch", "Struct", "CFG", "Compare"
     };
 }
 
@@ -982,6 +1050,12 @@ void App::drawMenuBar() {
             if (ImGui::MenuItem("Guardar sesion...", nullptr, false, fileLoaded_)) saveSessionDialog();
             if (ImGui::MenuItem("Cargar sesion...", nullptr, false, dbgState_ == DbgState::Idle)) loadSessionDialog();
             if (ImGui::MenuItem("Exportar informe Markdown...", nullptr, false, fileLoaded_)) exportReportDialog();
+            if (ImGui::MenuItem("Exportar informe JSON...", nullptr, false, fileLoaded_)) {
+                wchar_t path[MAX_PATH] = L"analisis.json";
+                OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrFilter = L"JSON\0*.json\0Todos\0*.*\0"; ofn.Flags = OFN_OVERWRITEPROMPT;
+                if (GetSaveFileNameW(&ofn)) { std::string err; if (!saveAnalysisReportJson(path, err)) pushLog("Informe JSON: " + err); else pushLog("Informe JSON exportado."); }
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Cerrar", "Alt+F4")) {
                 if (dbgState_ != DbgState::Idle) debugger_.detachAndStop();
@@ -1138,6 +1212,13 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Plugins -> Hot-reload (M11): recarga los plugins automaticamente al detectar cambios en la carpeta plugins/.");
             ImGui::BulletText("--headless (M10): oculta la ventana y deja el MCP corriendo para automatizacion/batch. --noauth arranca el MCP sin token.");
             ImGui::BulletText("Snap magnetico (Window -> Snap magnetico): al arrastrar una ventana cerca de otra o del borde de la pantalla, se pega por imantacion (umbral 14 px). Desactivable desde el menu.");
+            ImGui::BulletText("CFG (Window -> CFG): grafo de las funciones analizadas (Analyze this) y sus xrefs; doble clic en un nodo navega a la funcion.");
+            ImGui::BulletText("Compare (Window -> Compare): compara dos archivos/dumps byte a byte y lista los rangos que difieren. Tambien por MCP: diff_files.");
+            ImGui::BulletText("Struct -> Inferir con IA: pide a la IA una struct probable a partir de los bytes en la direccion base. Tambien por MCP: infer_struct.");
+            ImGui::BulletText("Command bar: acepta 'cmd key=val, key=val' (args por pares) y varios comandos separados por ';', ademas de '?expr' y JSON.");
+            ImGui::BulletText("Archivo -> Exportar informe JSON: informe estructurado (secciones, packers, breakpoints, funciones, peHash). Por MCP: report format=json / export_report .json.");
+            ImGui::BulletText("Streaming de eventos: los clientes MCP sondean poll_events(since) para recibir load_dll/unload_dll/exit_process/breakpoint/hijos en vivo. Los plugins con una accion 'on_event' se invocan por cada evento.");
+            ImGui::BulletText("DB de analisis portable (M6): la cache se guarda tambien por hash del contenido (cache/<hash>.dbj); si mueves o renombras el binario, las anotaciones/funciones se recuperan igual.");
             ImGui::BulletText("Archivo -> Guardar/Cargar sesion conserva el objetivo, argumentos, anotaciones y breakpoints; las direcciones de la imagen principal se guardan como RVA. Los memory breakpoints no se guardan: dependen de paginas validas de la ejecucion actual.");
             ImGui::BulletText("Archivo -> Exportar informe Markdown genera un resumen reproducible de PE, secciones, detecciones, estado y breakpoints. Por MCP, report devuelve el texto y export_report lo guarda en una ruta indicada.");
             ImGui::TextDisabled("Las anotaciones se guardan en la cache de analisis. Consulta MCP y Plugins para automatizacion y extensiones.");
@@ -1199,9 +1280,9 @@ void App::drawHelpWindow() {
             ImGui::TextDisabled("Prioridad recomendada: procesos hijos y simbolos -> CFG/referencias -> unpacking robusto -> scripts e informes.");
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Mejoras inspiradas en x64dbg (ver docs/X64DBG_DEV_ANALISIS.md)");
-            ImGui::BulletText("HECHO: motor de expresiones extensible (eval/watch/struct), command bar hibrida, Watch, Struct viewer, Search for, symbol server, resumen de traza con IA, IA como funcion de expresion (ai.classify), breakpoints con accion al golpear (M3), hot-reload de plugins (M11), modo headless (M10), MCP bypass sin token.");
-            ImGui::BulletText("PARCIAL: seguir procesos hijos (M7): detecta y reporta hijos, falta following completo (cambiar de target). Bus de eventos CB_* (Fase 3): publica load_dll/unload_dll/exit_process/hijos al log; falta exponerlo a plugins/IA/MCP como suscripcion. Capa unica de comandos: IA/MCP/plugins comparten dbg_*, falta front-end de texto completo.");
-            ImGui::BulletText("PENDIENTE: streaming de eventos por MCP (push); scriptdll/lenguaje de script; struct viewer con inferencia por IA; comparacion de dumps.");
+            ImGui::BulletText("HECHO: motor de expresiones (eval/watch/struct), command bar hibrida + comandos de texto, Watch, Struct viewer + inferencia IA, Search for, symbol server, resumen de traza con IA, ai.classify, breakpoints con accion (M3), hot-reload plugins (M11), headless (M10), MCP bypass, bus de eventos + streaming poll_events (Fase 3), DB de analisis portable por hash (M6), informe JSON, comparacion de dumps (diff_files), CFG basico.");
+            ImGui::BulletText("PARCIAL: seguir procesos hijos (M7): se detectan/reportan/listan (list_children) pero falta following completo (adoptar el hijo como target activo con su propio contexto). Capa de comandos: falta parser de texto avanzado (solo key=val).");
+            ImGui::BulletText("PENDIENTE (proyectos grandes): unpacking/IAT robusto con validacion; decompilador nativo y CFG completo interactivo; scriptdll/lenguaje de script; informes SARIF completos.");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -2504,9 +2585,19 @@ void App::saveAnalysisCache() {
         cache["loops"] = njson::array();
         for (const auto& loop : analysisLoops_)
             cache["loops"].push_back({{"start", loop.start}, {"end", loop.end}, {"function", loop.function}});
+        cache["peHash"] = peContentHash();   // M6: identidad por contenido (portable)
 
+        const std::string dump = cache.dump(1);
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
-        if (file) file << cache.dump(1);
+        if (file) file << dump;
+        // M6: copia portable indexada por hash del contenido (sigue al binario si se mueve).
+        std::string h = peContentHash();
+        if (!h.empty()) {
+            std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+                                  std::wstring(h.begin(), h.end()) + L".dbj";
+            std::ofstream db(dbPath, std::ios::binary | std::ios::trunc);
+            if (db) db << dump;
+        }
     } catch (const std::exception& e) {
         pushLog(std::string("Cache de analisis: no se pudo guardar: ") + e.what());
     }
@@ -2520,35 +2611,18 @@ bool App::loadAnalysisCache() {
     uint64_t sourceSize = 0, sourceWriteTime = 0;
     if (!analysisSourceStamp(loadedPath_, sourceSize, sourceWriteTime)) return false;
 
-    try {
-        std::ifstream file(path, std::ios::binary);
-        if (!file) return false;
-        const njson cache = njson::parse(file);
-        if (cache.value("schemaVersion", 0) != 1 ||
-            cache.value("sourceSize", uint64_t{0}) != sourceSize ||
-            cache.value("sourceWriteTime", uint64_t{0}) != sourceWriteTime ||
-            cache.value("minStringLength", size_t{0}) != minStrLen_)
-            return false;
-
-        strings_.clear();
-        packerMatches_.clear();
-        labels_.clear();
-        comments_.clear();
-        bookmarks_.clear();
-        analyzedFunctions_.clear(); analysisXrefs_.clear(); analysisLoops_.clear();
+    // Aplica el contenido de un JSON de cache al estado. Devuelve true si se aplicó.
+    auto applyCache = [this](const njson& cache) {
+        strings_.clear(); packerMatches_.clear(); labels_.clear(); comments_.clear();
+        bookmarks_.clear(); analyzedFunctions_.clear(); analysisXrefs_.clear(); analysisLoops_.clear();
         for (const auto& item : cache.value("strings", njson::array())) {
-            FoundString s;
-            s.address = item.value("address", uint64_t{0});
+            FoundString s; s.address = item.value("address", uint64_t{0});
             s.kind = item.value("kind", "ascii") == "utf16" ? StrKind::Utf16 : StrKind::Ascii;
-            s.text = item.value("text", "");
-            strings_.push_back(std::move(s));
+            s.text = item.value("text", ""); strings_.push_back(std::move(s));
         }
         for (const auto& item : cache.value("packers", njson::array())) {
-            PackerMatch p;
-            p.name = item.value("name", "");
-            p.source = item.value("source", "");
-            p.confidence = item.value("confidence", 0);
-            packerMatches_.push_back(std::move(p));
+            PackerMatch p; p.name = item.value("name", ""); p.source = item.value("source", "");
+            p.confidence = item.value("confidence", 0); packerMatches_.push_back(std::move(p));
         }
         for (const auto& item : cache.value("labels", njson::array()))
             labels_[item.value("address", uint64_t{0})] = item.value("text", "");
@@ -2564,10 +2638,41 @@ bool App::loadAnalysisCache() {
             analysisXrefs_.push_back({item.value("from", uint64_t{0}), item.value("to", uint64_t{0}), item.value("type", "")});
         for (const auto& item : cache.value("loops", njson::array()))
             analysisLoops_.push_back({item.value("start", uint64_t{0}), item.value("end", uint64_t{0}), item.value("function", uint64_t{0})});
-
         analysisCacheLoaded_ = true;
-        pushLog("Cache de analisis cargada: strings, packers, anotaciones, funciones y xrefs restaurados.");
-        return true;
+    };
+
+    try {
+        std::ifstream file(path, std::ios::binary);
+        bool matched = false;
+        if (file) {
+            const njson cache = njson::parse(file);
+            if (cache.value("schemaVersion", 0) == 1 &&
+                cache.value("sourceSize", uint64_t{0}) == sourceSize &&
+                cache.value("sourceWriteTime", uint64_t{0}) == sourceWriteTime &&
+                cache.value("minStringLength", size_t{0}) == minStrLen_) {
+                applyCache(cache);
+                pushLog("Cache de analisis cargada (por ruta).");
+                return true;
+            }
+        }
+        // M6: fallback portable por hash de contenido (binario movido/renombrado).
+        if (!matched) {
+            std::string h = peContentHash();
+            if (!h.empty()) {
+                std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+                                      std::wstring(h.begin(), h.end()) + L".dbj";
+                std::ifstream db(dbPath, std::ios::binary);
+                if (db) {
+                    const njson cache = njson::parse(db);
+                    if (cache.value("peHash", std::string{}) == h) {
+                        applyCache(cache);
+                        pushLog("Cache de analisis cargada (DB portable por hash " + h + ").");
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     } catch (const std::exception& e) {
         pushLog(std::string("Cache de analisis ignorada: ") + e.what());
         return false;
@@ -2948,21 +3053,60 @@ void App::execCommandBar() {
         cmdBar_[0] = '\0';
         return;
     }
-    if (line[0] == '?') {                 // evaluar expresion, estilo x64dbg
-        uint64_t v = 0; std::string err;
-        if (evalExpr(line.substr(1), v, err))
-            cmdBarResult_ = "= 0x" + hex64(v) + "  (" + std::to_string(v) + ")";
-        else cmdBarResult_ = "error: " + err;
-    } else if (line[0] == '{') {          // comando MCP crudo
-        cmdBarResult_ = execDbgCommand(line);
-    } else {                              // "cmd" o "cmd {json}"
-        std::string cmd = line, args = "{}";
-        auto sp = line.find(' ');
-        if (sp != std::string::npos) { cmd = line.substr(0, sp); args = line.substr(sp + 1); }
-        njson req; req["cmd"] = cmd;
-        try { req["args"] = njson::parse(args); } catch (...) { req["args"] = njson::object(); }
-        cmdBarResult_ = execDbgCommand(req.dump());
+    // Varios comandos separados por ';' (fuera de llaves).
+    std::vector<std::string> parts;
+    {
+        std::string cur; int depth = 0;
+        for (char c : line) {
+            if (c == '{') depth++;
+            if (c == '}') depth--;
+            if (c == ';' && depth == 0) { parts.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) parts.push_back(cur);
     }
+    std::string out;
+    for (std::string seg : parts) {
+        while (!seg.empty() && std::isspace((unsigned char)seg.front())) seg.erase(seg.begin());
+        while (!seg.empty() && std::isspace((unsigned char)seg.back())) seg.pop_back();
+        if (seg.empty()) continue;
+        if (seg[0] == '?') {                 // evaluar expresion, estilo x64dbg
+            uint64_t v = 0; std::string err;
+            out += evalExpr(seg.substr(1), v, err) ? ("= 0x" + hex64(v) + "  (" + std::to_string(v) + ")\n")
+                                                   : ("error: " + err + "\n");
+        } else if (seg[0] == '{') {          // comando MCP crudo
+            out += execDbgCommand(seg) + "\n";
+        } else {                             // "cmd {json}"  o  "cmd key=val, key=val"
+            std::string cmd = seg, rest;
+            auto sp = seg.find(' ');
+            if (sp != std::string::npos) { cmd = seg.substr(0, sp); rest = seg.substr(sp + 1); }
+            njson args = njson::object();
+            if (!rest.empty()) {
+                std::string t = rest; while (!t.empty() && std::isspace((unsigned char)t.front())) t.erase(t.begin());
+                if (!t.empty() && t[0] == '{') { try { args = njson::parse(t); } catch (...) {} }
+                else {   // key=val, key=val  -> objeto JSON (numeros hex, strings, bool)
+                    std::string kv; std::vector<std::string> pairs;
+                    for (char c : rest) { if (c == ',') { pairs.push_back(kv); kv.clear(); } else kv.push_back(c); }
+                    if (!kv.empty()) pairs.push_back(kv);
+                    for (auto& pr : pairs) {
+                        auto eq = pr.find('=');
+                        if (eq == std::string::npos) continue;
+                        std::string k = pr.substr(0, eq), val = pr.substr(eq + 1);
+                        auto trim=[&](std::string& s){ while(!s.empty()&&std::isspace((unsigned char)s.front()))s.erase(s.begin()); while(!s.empty()&&std::isspace((unsigned char)s.back()))s.pop_back(); };
+                        trim(k); trim(val);
+                        if (val == "true") args[k] = true;
+                        else if (val == "false") args[k] = false;
+                        else if (!val.empty() && (isxdigit((unsigned char)val[0]) || val.rfind("0x",0)==0)) {
+                            uint64_t n = strtoull(val.c_str(), nullptr, 16); args[k] = n;
+                        } else args[k] = val;
+                    }
+                }
+            }
+            njson req; req["cmd"] = cmd; req["args"] = args;
+            out += execDbgCommand(req.dump()) + "\n";
+        }
+    }
+    cmdBarResult_ = out;
     cmdBar_[0] = '\0';
 }
 
@@ -3058,6 +3202,134 @@ void App::runBreakpointAction(uint64_t addr) {
 }
 
 // ---------------------------------------------------------------------------
+// CFG básico: dibuja las funciones analizadas y sus xrefs como grafo simple
+// ---------------------------------------------------------------------------
+void App::drawCfgPanel() {
+    ImGui::Begin("CFG");
+    ImGui::TextDisabled("Grafo de funciones analizadas (Analyze this) y sus xrefs. Doble clic en un nodo = ir.");
+    if (analyzedFunctions_.empty()) {
+        ImGui::TextDisabled("No hay funciones analizadas. Usa clic derecho -> Analyze en el CPU.");
+        ImGui::End(); return;
+    }
+    ImGui::Separator();
+    ImGui::BeginChild("cfgcanvas", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    // Layout en rejilla: un nodo por función.
+    std::map<uint64_t, ImVec2> centers;
+    const float BW = 200, BH = 46, GAPX = 60, GAPY = 40;
+    int cols = 3, i = 0;
+    for (const auto& f : analyzedFunctions_) {
+        int r = i / cols, c = i % cols;
+        ImVec2 tl(origin.x + 10 + c * (BW + GAPX), origin.y + 10 + r * (BH + GAPY));
+        ImVec2 br(tl.x + BW, tl.y + BH);
+        centers[f.start] = ImVec2((tl.x + br.x) * 0.5f, (tl.y + br.y) * 0.5f);
+        dl->AddRectFilled(tl, br, ImGui::GetColorU32(ImVec4(0.16f,0.18f,0.22f,1)), 5);
+        dl->AddRect(tl, br, ImGui::GetColorU32(ImVec4(0.5f,0.7f,1,1)), 5);
+        std::string name = f.name.empty() ? ("sub_" + hex64(f.start)) : f.name;
+        char info[96]; std::snprintf(info, sizeof(info), "%s\n%u ins  %u calls  %u br",
+                     name.c_str(), f.instructions, f.calls, f.branches);
+        dl->AddText(ImVec2(tl.x + 6, tl.y + 5), ImGui::GetColorU32(ImVec4(0.9f,0.95f,1,1)), info);
+        // zona clicable
+        ImGui::SetCursorScreenPos(tl);
+        ImGui::PushID((int)(f.start ^ (f.start >> 32)));
+        if (ImGui::InvisibleButton("node", ImVec2(BW, BH)) && ImGui::IsMouseDoubleClicked(0)) gotoAddress(f.start);
+        ImGui::PopID();
+        i++;
+    }
+    // Aristas por xrefs entre funciones conocidas.
+    for (const auto& x : analysisXrefs_) {
+        auto a = centers.find(x.from), b = centers.find(x.to);
+        // conectar el xref a la función que lo contiene (aprox: from dentro de alguna func)
+        uint64_t fromFunc = 0;
+        for (const auto& f : analyzedFunctions_) if (x.from >= f.start && x.from <= f.end) { fromFunc = f.start; break; }
+        auto fa = centers.find(fromFunc);
+        if (fa != centers.end() && b != centers.end())
+            dl->AddLine(fa->second, b->second, ImGui::GetColorU32(ImVec4(0.95f,0.7f,0.25f,0.6f)), 1.5f);
+        (void)a;
+    }
+    ImGui::Dummy(ImVec2((float)cols * (BW + GAPX) + 20, (float)((analyzedFunctions_.size()+cols-1)/cols) * (BH + GAPY) + 20));
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// Comparación de dumps: diff byte a byte de dos archivos, lista rangos distintos
+// ---------------------------------------------------------------------------
+void App::drawComparePanel() {
+    ImGui::Begin("Compare");
+    ImGui::TextDisabled("Compara dos archivos (dumps) byte a byte y lista los rangos que difieren.");
+    ImGui::InputTextWithHint("A", "ruta del archivo A", cmpPathA_, sizeof(cmpPathA_));
+    ImGui::SameLine();
+    if (ImGui::SmallButton("...##a")) {
+        wchar_t f[MAX_PATH]={0}; OPENFILENAMEW o{}; o.lStructSize=sizeof(o); o.lpstrFile=f; o.nMaxFile=MAX_PATH;
+        o.lpstrFilter=L"Todos\0*.*\0"; if (GetOpenFileNameW(&o)) { std::wstring w(f); std::string s(w.begin(),w.end()); std::snprintf(cmpPathA_,sizeof(cmpPathA_),"%s",s.c_str()); }
+    }
+    ImGui::InputTextWithHint("B", "ruta del archivo B", cmpPathB_, sizeof(cmpPathB_));
+    ImGui::SameLine();
+    if (ImGui::SmallButton("...##b")) {
+        wchar_t f[MAX_PATH]={0}; OPENFILENAMEW o{}; o.lStructSize=sizeof(o); o.lpstrFile=f; o.nMaxFile=MAX_PATH;
+        o.lpstrFilter=L"Todos\0*.*\0"; if (GetOpenFileNameW(&o)) { std::wstring w(f); std::string s(w.begin(),w.end()); std::snprintf(cmpPathB_,sizeof(cmpPathB_),"%s",s.c_str()); }
+    }
+    if (ImGui::Button("Comparar") && cmpPathA_[0] && cmpPathB_[0]) {
+        auto readAll = [](const char* p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        std::vector<uint8_t> A = readAll(cmpPathA_), B = readAll(cmpPathB_);
+        if (A.empty() || B.empty()) { cmpResult_ = "No se pudo leer uno de los archivos."; }
+        else {
+            size_t n = A.size() < B.size() ? A.size() : B.size();
+            std::string r = "A=" + std::to_string(A.size()) + " bytes, B=" + std::to_string(B.size()) + " bytes\n";
+            int ranges = 0; size_t diffCount = 0;
+            for (size_t k = 0; k < n; ) {
+                if (A[k] != B[k]) {
+                    size_t start = k; while (k < n && A[k] != B[k]) { k++; diffCount++; }
+                    if (ranges < 200) r += "  0x" + hex64(start) + " .. 0x" + hex64(k-1) + "  (" + std::to_string(k-start) + " bytes)\n";
+                    ranges++;
+                } else k++;
+            }
+            if (A.size() != B.size()) r += "  (tamaños distintos; sobran " + std::to_string((A.size()>B.size()?A.size():B.size())-n) + " bytes)\n";
+            r = "Diferencias: " + std::to_string(diffCount) + " bytes en " + std::to_string(ranges) + " rangos\n" + r;
+            if (ranges > 200) r += "  ...(mas de 200 rangos, truncado)\n";
+            cmpResult_ = r;
+        }
+    }
+    ImGui::Separator();
+    ImGui::InputTextMultiline("##cmpres", cmpResult_.data(), cmpResult_.size()+1, ImVec2(-1,-1), ImGuiInputTextFlags_ReadOnly);
+    ImGui::End();
+}
+
+// M8+: pide a la IA que infiera la struct en la direccion base a partir de los bytes.
+void App::inferStructWithAi() {
+    if (aiBusy_) return;
+    const AiAgent* ag = aiConfig_.current();
+    if (!ag) { pushLog("No hay agente de IA."); return; }
+    ai_.setAgent(*ag);
+    uint64_t base = 0; std::string err;
+    if (!structBase_[0] || !evalExpr(structBase_, base, err)) { pushLog("Base de struct invalida: " + err); return; }
+    uint8_t buf[128] = {0};
+    size_t got = (dbgState_==DbgState::Paused) ? debugger_.readMemory(base, buf, sizeof(buf))
+               : (fileLoaded_ ? pe_.readAtRva((uint32_t)(base-pe_.imageBase()), buf, sizeof(buf)) : 0);
+    std::string hexs; for (size_t k=0;k<got;k++){ char b[4]; std::snprintf(b,sizeof(b),"%02X ",buf[k]); hexs+=b; }
+    { std::lock_guard<std::mutex> lk(aiMutex_); chat_.push_back({"user","[Inferir struct en 0x"+hex64(base)+"]"}); }
+    aiBusy_ = true;
+    if (aiThread_.joinable()) aiThread_.join();
+    aiThread_ = std::thread([this, hexs, base]() {
+        std::vector<ChatMessage> h; h.push_back({"user",
+            "Bytes (" + std::to_string(hexs.size()/3) + ") en 0x" + hex64(base) + ": " + hexs +
+            ". Infiere una posible estructura C: lista campos con tipo (BYTE/WORD/DWORD/QWORD/ptr/char[]) "
+            "y un nombre tentativo, uno por linea como 'offset tipo nombre'. Se conciso."});
+        std::string er;
+        std::string resp = ai_.send("Eres un experto en ingenieria inversa de estructuras en memoria. Responde en espanol.", h, 1024, er);
+        std::lock_guard<std::mutex> lk(aiMutex_);
+        chat_.push_back({"assistant", resp.empty() ? ("[error] "+er) : resp});
+        aiBusy_ = false;
+    });
+    pushLog("Inferencia de struct enviada a la IA (ver panel IA).");
+}
+
+// ---------------------------------------------------------------------------
 // Struct viewer (M8): aplica una definicion de campos a una direccion base
 // ---------------------------------------------------------------------------
 void App::drawStructPanel() {
@@ -3069,6 +3341,10 @@ void App::drawStructPanel() {
     if (ImGui::Button("+ Campo")) structFields_.push_back(StructField{});
     ImGui::SameLine();
     if (ImGui::Button("Limpiar##struct")) structFields_.clear();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(aiBusy_);
+    if (ImGui::Button("Inferir con IA")) inferStructWithAi();
+    ImGui::EndDisabled();
 
     uint64_t base = 0; std::string baseErr;
     bool baseOk = structBase_[0] && evalExpr(structBase_, base, baseErr);
@@ -3563,12 +3839,42 @@ std::string App::handleMcpCommand(const std::string& line) {
     }
     else if (cmd == "report") {
         if (!fileLoaded_) { res["ok"] = false; res["error"] = "abre un archivo primero"; }
+        else if (a.value("format", "markdown") == "json") res["json"] = buildAnalysisReportJson();
         else res["markdown"] = buildAnalysisReport();
     }
     else if (cmd == "export_report") {
         const std::string path = a.value("path", "");
         if (path.empty()) { res["ok"] = false; res["error"] = "path requerido"; }
-        else { std::string error; res["ok"] = saveAnalysisReport(std::wstring(path.begin(), path.end()), error); if (!res["ok"]) res["error"] = error; }
+        else {
+            std::string error;
+            std::wstring wp(path.begin(), path.end());
+            bool asJson = a.value("format", "") == "json" || (path.size() > 5 && path.substr(path.size()-5) == ".json");
+            res["ok"] = asJson ? saveAnalysisReportJson(wp, error) : saveAnalysisReport(wp, error);
+            if (!res["ok"]) res["error"] = error;
+        }
+    }
+    else if (cmd == "diff_files") {
+        auto readAll = [](const std::string& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        std::vector<uint8_t> A = readAll(a.value("a","")), B = readAll(a.value("b",""));
+        if (A.empty() || B.empty()) { res["ok"] = false; res["error"] = "no se pudo leer a/b"; }
+        else {
+            size_t n = A.size() < B.size() ? A.size() : B.size(); size_t diffs = 0; int ranges = 0;
+            for (size_t k = 0; k < n; ) {
+                if (A[k] != B[k]) { size_t s = k; while (k < n && A[k] != B[k]) { k++; diffs++; }
+                    if (ranges < 500) res["ranges"].push_back({{"start", s}, {"end", k-1}, {"len", k-s}}); ranges++; }
+                else k++;
+            }
+            res["sizeA"] = A.size(); res["sizeB"] = B.size(); res["diffBytes"] = diffs; res["rangeCount"] = ranges;
+        }
+    }
+    else if (cmd == "infer_struct") {
+        uint64_t base = 0; std::string err;
+        if (!evalExpr(a.value("addr","0"), base, err)) { res["ok"]=false; res["error"]=err; }
+        else { std::snprintf(structBase_, sizeof(structBase_), "0x%llX", (unsigned long long)base);
+               inferStructWithAi(); res["queued"] = true; res["addr"] = base; }
     }
     else if (cmd == "attach") {
         const uint32_t pid = static_cast<uint32_t>(a.value("pid", 0));
@@ -3780,6 +4086,17 @@ std::string App::handleMcpCommand(const std::string& line) {
         uint64_t v = 0; std::string err;
         if (evalExpr(expr, v, err)) { res["value"] = v; res["hex"] = "0x" + hex64(v); }
         else { res["ok"] = false; res["error"] = err; }
+    }
+    else if (cmd == "list_children") {
+        res["follow"] = debugger_.followChildren();
+        for (uint32_t p : debugger_.childPids()) res["children"].push_back(p);
+    }
+    else if (cmd == "poll_events") {
+        uint64_t since = jU64(a.value("since", njson(0)));
+        std::lock_guard<std::mutex> lk(eventsMutex_);
+        res["last"] = eventSeq_;
+        for (auto& e : events_) if (e.seq > since)
+            res["events"].push_back({{"seq", e.seq}, {"type", e.type}, {"arg", e.arg}});
     }
     else if (cmd == "symsrv") {
         std::string path = a.value("path", "");
@@ -4019,6 +4336,10 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("get_trace",   "Devuelve el log del run-trace.", obj(EMPTY, {}));
     add("eval",        "Evalua una expresion (hex por defecto; byte/dword/ptr(a), reg, mod.base/fromname, dis.len, [mem]).", obj({{"expr", STR}}, {"expr"}));
     add("symsrv",      "Configura la ruta de simbolos (symsrv), ej 'srv*C:\\\\symbols*https://msdl.microsoft.com/download/symbols'.", obj({{"path", STR}}, {"path"}));
+    add("poll_events", "Sondea el bus de eventos (streaming). Devuelve eventos con seq > 'since' y el ultimo seq.", obj({{"since", INT}}, {}));
+    add("diff_files",  "Compara dos archivos byte a byte y devuelve los rangos que difieren.", obj({{"a", STR}, {"b", STR}}, {"a","b"}));
+    add("list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", obj(EMPTY, {}));
+    add("infer_struct","Pide a la IA que infiera la struct en una direccion (resultado en el panel IA).", obj({{"addr", HEX}}, {"addr"}));
     add("rm_exc_bp",   "Quita un breakpoint de excepcion por id.", obj({{"id", INT}}, {"id"}));
     return t;
 }
