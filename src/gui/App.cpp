@@ -1449,7 +1449,7 @@ void App::drawToolbar() {
         else if (paused) debugger_.go();
     }
     ImGui::EndDisabled();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(active ? "Continuar (F9)" : "Lanzar bajo debug (F9)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(active ? "Continuar (F5)" : "Lanzar bajo debug (F5)");
 
     ImGui::SameLine();
     ImGui::BeginDisabled(dbgState_ != DbgState::Running);
@@ -1465,28 +1465,30 @@ void App::drawToolbar() {
 
     ImGui::BeginDisabled(!paused);
     if (ImGui::Button("-> Step Into", ImVec2(110, 30))) debugger_.stepInto();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, entrando a los call (F7)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, entrando a los call (F8)");
     ImGui::SameLine();
     if (ImGui::Button(">> Step Over", ImVec2(110, 30))) debugger_.stepOver();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, saltando los call (F8)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, saltando los call (F10)");
     ImGui::SameLine();
     if (ImGui::Button("<- Step to Ret", ImVec2(120, 30))) debugger_.stepToRet();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ejecuta hasta el 'ret' de la funcion actual (Ctrl+F9)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ejecuta hasta el 'ret' de la funcion actual (F11)");
     ImGui::EndDisabled();
 
     ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
     ImGui::SetNextItemWidth(260);
     ImGui::InputTextWithHint("##args", "argumentos de linea de comandos", launchArgs_, sizeof(launchArgs_));
 
-    // Atajos de teclado
+    // Atajos de teclado: F5 = Play/continuar/lanzar, F8 = Step Into, F10 = Step Over,
+    // F11 = Step to Ret (estilo depurador).
     if (paused) {
-        if (ImGui::IsKeyPressed(ImGuiKey_F7)) debugger_.stepInto();
-        if (ImGui::IsKeyPressed(ImGuiKey_F8)) debugger_.stepOver();
-        bool ctrl = ImGui::GetIO().KeyCtrl;
-        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_F9)) debugger_.stepToRet();
-        else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_F9)) debugger_.go();
+        if (ImGui::IsKeyPressed(ImGuiKey_F8))  debugger_.stepInto();
+        if (ImGui::IsKeyPressed(ImGuiKey_F10)) debugger_.stepOver();
+        if (ImGui::IsKeyPressed(ImGuiKey_F11)) debugger_.stepToRet();
     }
-    if (ImGui::IsKeyPressed(ImGuiKey_F9) && !active) startDebugSession();
+    if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
+        if (!active) startDebugSession();
+        else if (paused) debugger_.go();
+    }
 
     toolbarHeight_ = ImGui::GetWindowSize().y;
     ImGui::End();
@@ -1508,7 +1510,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Condiciones y acciones: un BP software acepta registros, hit/hits, &, | y comparadores; por ejemplo rax == 0, ecx & 1 != 0 o hit >= 5. Con 'solo log' registra la coincidencia y continua. Numeros en decimal o con prefijo 0x.");
             ImGui::BulletText("Excepciones incluye breakpoints de eventos: crear/terminar hilo y cargar/descargar DLL. Son utiles para observar carga dinamica e inyeccion.");
             ImGui::BulletText("Los breakpoints de la imagen principal se relocalizan automaticamente cuando ASLR cambia la base al lanzar o adjuntarse.");
-            ImGui::BulletText("Play/F9 inicia o continua; F7 entra en calls; F8 los salta; Ctrl+F9 ejecuta hasta ret; Pause detiene una sesion activa.");
+            ImGui::BulletText("F5 lanza o continua; F8 entra en calls (step into); F10 los salta (step over); F11 ejecuta hasta ret; Pause detiene una sesion activa.");
             ImGui::BulletText("Depurar -> Adjuntar a PID permite analizar un proceso existente. 'Desadjuntar' lo deja ejecutando sin DebuggerJ++; Detener finaliza la sesion. Requiere permisos suficientes y se recomienda usarlo solo en la VM de analisis.");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
             ImGui::TextUnformatted("Paneles de analisis");
