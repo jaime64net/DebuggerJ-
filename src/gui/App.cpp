@@ -440,6 +440,16 @@ void App::switchToChild(uint32_t pid) {
     else { debugger_.detachAndStop(); pendingSwitchPid_ = pid; pushLog("Conmutando al hijo PID " + std::to_string(pid) + "..."); }
 }
 
+// Run to cursor: pone un breakpoint temporal en 'va' y continua. Al pausar en esa
+// direccion (ver render()), el breakpoint se retira automaticamente.
+void App::runToAddress(uint64_t va) {
+    if (dbgState_ != DbgState::Paused) { pushLog("Run hasta: el proceso debe estar pausado."); return; }
+    bool already = false;
+    for (auto& b : debugger_.breakpoints()) if (b.address == va) already = true;
+    if (!already) { debugger_.addBreakpoint(va, "run-to"); runToTemp_.insert(va); }
+    debugger_.go();
+}
+
 void App::attachToProcess(uint32_t pid) {
     if (!pid) { pushLog("Adjuntar: PID invalido."); return; }
     if (debugger_.state() == DbgState::Exited) debugger_.detachAndStop();
@@ -824,6 +834,8 @@ void App::render() {
             memMap_ = debugger_.memoryMap();
             if (debugger_.foundOEP()) pluginOEP_ = debugger_.foundOEP();
             refreshWatches();
+            // Run to cursor: si pausamos en un BP temporal, retirarlo.
+            if (runToTemp_.count(currentIp_)) { debugger_.removeBreakpoint(currentIp_); runToTemp_.erase(currentIp_); }
             runBreakpointAction(currentIp_);   // M3: accion al golpear un BP
             // Re-aplicar anti-anti-debug si esta activado (el malware puede re-chequear)
             if (antiReapply_ && antiActive_) {
@@ -858,6 +870,7 @@ void App::render() {
     if (visible("Packers / Proteccion")) drawPackerPanel();
     if (visible("Excepciones"))          drawExceptionsPanel();
     if (visible("Call stack"))           drawCallStackPanel();
+    if (visible("Threads"))              drawThreadsPanel();
     if (visible("Executable modules"))   drawExecModulesPanel();
     if (visible("Referencias"))          drawReferencesPanel();
     if (visible("Analysis"))             drawAnalysisPanel();
@@ -893,7 +906,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads"
     };
 }
 
@@ -1043,7 +1056,7 @@ void App::ensureVisibilityKeys() {
     // Paneles auxiliares nuevos: ocultos por defecto para no saturar la pantalla al abrir
     // (se activan desde Window -> Show). El resto arranca visible.
     static const std::set<std::string> hiddenByDefault = {
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads"
     };
     for (auto nm : managedWindows())
         if (winVisible_.find(nm) == winVisible_.end())
@@ -1345,6 +1358,8 @@ void App::drawHelpWindow() {
             ImGui::TextUnformatted("Paneles de analisis");
             ImGui::BulletText("Modulos & Simbolos: doble clic en una DLL o archivo para ver su desensamblado; consulta TLS, SEH, imports y exports.");
             ImGui::BulletText("Call stack usa StackWalk64/DbgHelp. Si Windows puede localizar un PDB, muestra simbolos y archivo:linea; de otro modo conserva las direcciones disponibles.");
+            ImGui::BulletText("Threads (Window -> Threads): lista los hilos del proceso (TID, hilo actual, prioridad, descripcion). Por MCP: threads.");
+            ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
             ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin. Packers muestra firmas y heuristicas.");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
             ImGui::Separator();
@@ -1651,6 +1666,7 @@ void App::drawCpuContent() {
                         std::snprintf(annotBuf_, sizeof(annotBuf_), "%s", it==labels_.end()?"":it->second.c_str());
                         openAnnot_ = true;
                     }
+                    if (ImGui::MenuItem("Ejecutar hasta aqui", nullptr, false, dbgState_==DbgState::Paused)) runToAddress(in.address);
                     if (ImGui::MenuItem("Buscar referencias")) findReferences(in.address);
                     if (ImGui::BeginMenu("Search for")) {
                         if (ImGui::MenuItem("All commands...")) { searchCmdBuf_[0] = '\0'; openSearchCmd_ = true; }
@@ -4064,6 +4080,52 @@ void App::drawCallStackPanel() {
     ImGui::End();
 }
 
+void App::drawThreadsPanel() {
+    ImGui::Begin("Threads");
+    if (dbgState_ == DbgState::Idle || dbgState_ == DbgState::Exited) {
+        ImGui::TextDisabled("(sin sesion de depuracion)"); ImGui::End(); return;
+    }
+    auto threads = debugger_.threads();
+    ImGui::Text("%zu hilo(s)", threads.size());
+    ImGui::Separator();
+    if (ImGui::BeginTable("threads", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY)) {
+        ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("Actual", ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn("Prioridad", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("Descripcion / estado", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+        for (const auto& t : threads) {
+            ImGui::TableNextRow();
+            if (t.current) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.25f,0.30f,0.10f,1)));
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushID((int)t.id);
+            ImGui::Text("%u", t.id);
+            if (ImGui::BeginPopupContextItem("thctx")) {
+                if (ImGui::MenuItem("Suspender")) debugger_.suspendThread(t.id);
+                if (ImGui::MenuItem("Reanudar")) debugger_.resumeThread(t.id);
+                if (ImGui::MenuItem("Terminar hilo")) debugger_.killThread(t.id);
+                if (ImGui::BeginMenu("Prioridad")) {
+                    if (ImGui::MenuItem("Idle (-15)")) debugger_.setThreadPriority(t.id, THREAD_PRIORITY_IDLE);
+                    if (ImGui::MenuItem("Below normal (-1)")) debugger_.setThreadPriority(t.id, THREAD_PRIORITY_BELOW_NORMAL);
+                    if (ImGui::MenuItem("Normal (0)")) debugger_.setThreadPriority(t.id, THREAD_PRIORITY_NORMAL);
+                    if (ImGui::MenuItem("Above normal (+1)")) debugger_.setThreadPriority(t.id, THREAD_PRIORITY_ABOVE_NORMAL);
+                    if (ImGui::MenuItem("Highest (+2)")) debugger_.setThreadPriority(t.id, THREAD_PRIORITY_HIGHEST);
+                    ImGui::EndMenu();
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(t.current ? "->" : "");
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%d", t.priority);
+            ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(t.description.empty() ? "-" : t.description.c_str());
+        }
+        ImGui::TextDisabled("Clic derecho en un TID: suspender/reanudar/terminar/prioridad.");
+        ImGui::EndTable();
+    }
+    ImGui::End();
+}
+
 // ---------------------------------------------------------------------------
 // MCP: control remoto para Claude
 // ---------------------------------------------------------------------------
@@ -4089,14 +4151,14 @@ static std::string hexBytes(const uint8_t* p, size_t n) {
 static int mcpRequiredAccess(const std::string& cmd) {
     if (cmd == "save_session" || cmd == "load_session" || cmd == "export_report" || cmd == "write_mem" || cmd == "set_reg" || cmd == "assemble" || cmd == "patch" ||
         cmd == "nop" || cmd == "dump" || cmd == "fix_iat" || cmd == "antidebug" ||
-        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script") return 2;
+        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script" || cmd == "thread_ctrl") return 2;
     if (cmd == "attach" || cmd == "detach" || cmd == "launch" || cmd == "restart" || cmd == "go" || cmd == "pause" ||
         cmd == "step_into" || cmd == "step_over" || cmd == "step_to_ret" || cmd == "stop" ||
         cmd == "set_bp" || cmd == "del_bp" || cmd == "set_hwbp" || cmd == "del_hwbp" ||
         cmd == "set_membp" || cmd == "del_membp" ||
         cmd == "add_exc_bp" || cmd == "rm_exc_bp" || cmd == "set_event_breaks" ||
         cmd == "set_bookmark" || cmd == "del_bookmark" || cmd == "clear_analysis" ||
-        cmd == "set_follow_children" || cmd == "switch_to_child" ||
+        cmd == "set_follow_children" || cmd == "switch_to_child" || cmd == "run_to" ||
         cmd == "find_oep" || cmd == "run_trace") return 1;
     return 0;
 }
@@ -4562,6 +4624,25 @@ std::string App::handleMcpCommand(const std::string& line) {
         if (evalExpr(expr, v, err)) { res["value"] = v; res["hex"] = "0x" + hex64(v); }
         else { res["ok"] = false; res["error"] = err; }
     }
+    else if (cmd == "threads") {
+        for (const auto& t : debugger_.threads())
+            res["threads"].push_back({{"tid", t.id}, {"current", t.current}, {"priority", t.priority}, {"description", t.description}});
+    }
+    else if (cmd == "run_to") {
+        if (!need_paused()) goto done;
+        runToAddress(jU64(a["addr"]));
+    }
+    else if (cmd == "thread_ctrl") {
+        uint32_t tid = (uint32_t)a.value("tid", 0);
+        std::string action = a.value("action", "");
+        if (!tid || action.empty()) { res["ok"] = false; res["error"] = "tid y action requeridos"; }
+        else if (action == "suspend") res["ok"] = debugger_.suspendThread(tid);
+        else if (action == "resume")  res["ok"] = debugger_.resumeThread(tid);
+        else if (action == "kill")    res["ok"] = debugger_.killThread(tid, (uint32_t)a.value("value", 0));
+        else if (action == "priority") res["ok"] = debugger_.setThreadPriority(tid, (int)a.value("value", 0));
+        else if (action == "name")    res["ok"] = debugger_.setThreadName(tid, a.value("name", ""));
+        else { res["ok"] = false; res["error"] = "action: suspend|resume|kill|priority|name"; }
+    }
     else if (cmd == "list_children") {
         res["follow"] = debugger_.followChildren();
         for (uint32_t p : debugger_.childPids()) res["children"].push_back(p);
@@ -4822,6 +4903,9 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("symsrv",      "Configura la ruta de simbolos (symsrv), ej 'srv*C:\\\\symbols*https://msdl.microsoft.com/download/symbols'.", obj({{"path", STR}}, {"path"}));
     add("poll_events", "Sondea el bus de eventos (streaming). Devuelve eventos con seq > 'since' y el ultimo seq.", obj({{"since", INT}}, {}));
     add("diff_files",  "Compara dos archivos byte a byte y devuelve los rangos que difieren.", obj({{"a", STR}, {"b", STR}}, {"a","b"}));
+    add("threads",     "Lista los hilos del proceso depurado (TID, actual, prioridad, descripcion).", obj(EMPTY, {}));
+    add("run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));
+    add("thread_ctrl", "Controla un hilo. action: suspend|resume|kill|priority|name; value=prioridad/exitcode; name=nombre.", obj({{"tid", INT}, {"action", STR}, {"value", INT}, {"name", STR}}, {"tid","action"}));
     add("list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", obj(EMPTY, {}));
     add("set_follow_children","Activa/desactiva seguir procesos hijos (fijar antes de lanzar).", obj({{"on", njson{{"type","boolean"}}}}, {}));
     add("switch_to_child","Conmuta el target: desadjunta el actual y adjunta el proceso hijo indicado.", obj({{"pid", INT}}, {"pid"}));

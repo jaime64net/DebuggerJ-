@@ -2,6 +2,7 @@
 #include <deque>
 #include <future>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -53,6 +54,8 @@ private:
     void attachToProcess(uint32_t pid);
     void switchToChild(uint32_t pid);        // conmuta el target: detach del actual -> attach al hijo
     uint32_t pendingSwitchPid_ = 0;          // attach pendiente tras el detach (conmutacion)
+    void runToAddress(uint64_t va);          // ejecuta hasta una direccion (BP temporal + go)
+    std::set<uint64_t> runToTemp_;           // BPs temporales de run-to que se quitan al golpear
     bool saveSession(const std::wstring& path, std::string& error);
     bool loadSession(const std::wstring& path, std::string& error);
     std::string buildAnalysisReport();
@@ -139,6 +142,7 @@ private:
     void drawExceptionsPanel();
     void drawExecModulesPanel();   // "Executable modules" estilo Olly
     void drawCallStackPanel();     // Call stack (cadena de frames)
+    void drawThreadsPanel();       // hilos del proceso depurado
     void drawPluginsPanel();
     void drawLogPanel();
     void drawAiPanel();

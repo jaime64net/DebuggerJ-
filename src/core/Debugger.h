@@ -202,6 +202,13 @@ public:
     std::vector<LoadedModule> modules();
     std::vector<DebugThread> threads();
 
+    // Control de hilos (paridad x64dbg: suspendthread/resumethread/killthread/priority/name).
+    bool suspendThread(uint32_t tid);
+    bool resumeThread(uint32_t tid);
+    bool killThread(uint32_t tid, uint32_t exitCode = 0);
+    bool setThreadPriority(uint32_t tid, int priority);
+    bool setThreadName(uint32_t tid, const std::string& name);
+
     // Symbol server (M5): path de busqueda de simbolos (formato DbgHelp/symsrv),
     // ej. "srv*C:\\sym*https://msdl.microsoft.com/download/symbols". Se aplica en el
     // proximo SymInitialize; si ya hay sesion, refresca de inmediato.

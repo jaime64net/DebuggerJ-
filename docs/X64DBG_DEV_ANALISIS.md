@@ -257,3 +257,30 @@ portable). Luego las que cierran gaps de malware: **M5** (symbols), **M7** (hijo
 **PENDIENTE:**
 - scriptdll / lenguaje de script (M6 scripting); struct viewer con **inferencia por IA**;
   comparación de dumps; M6 DB portable formalizada por hash (hoy la cache es por ruta).
+
+---
+
+## 8. Plan de paridad con x64dbg (usuario) — 2026-09-02
+
+Comparado el inventario completo de x64dbg con DebuggerJ++. **Ya presente**: CPU
+(disasm/regs/dump/stack), Log, Breakpoints (soft cond/hits/log, hardware, memoria
+PAGE_GUARD, excepción, DLL/evento), Memory Map, Call Stack (StackWalk64), SEH, Script,
+Symbols/Modules, Source (PDB), References, Threads, Watch, Struct, Trace, CFG, Patches
+(patch/nop/assemble), Comments/Bookmarks/Labels, Search (hex/text/patrones), Intermodular
+calls, Analysis (functions/xrefs/loops), Expresiones, Symbol server, anti-debug, import
+reconstructor (Scylla≈fix_iat), Run to cursor, **IA + MCP (x64dbg no los tiene)**.
+
+**Objetivos de paridad (todos expuestos por MCP):**
+- **A. Control de hilos**: suspend/resume/kill/priority/setname (x64dbg suspendthread…).
+- **B. Notes**: notas globales + por-binario persistentes.
+- **C. Handles / conexiones TCP / privilegios**: enumeración del sistema.
+- **D. Operaciones de memoria**: alloc/free/memset/memcpy/savedata/minidump.
+- **E. Run until expression + conditional tracing** (trace into/over until condition).
+- **F. Animate (step animado) + skip + undo instruction**.
+- **G. Watchdog** (alerta al cambiar una expresión) + string formatting en watch/log.
+- **H. Favourites** (herramientas/scripts/comandos externos con sustituciones).
+- **I. Change command line, Restart as Admin, Entropy view**.
+- **J. Variables globales** ($vars) para script/expresiones.
+
+Se ejecutan por lotes con commit+push por objetivo. Fuera de alcance (proyecto aparte):
+decompilador nativo real; depuración simultánea de varios procesos.

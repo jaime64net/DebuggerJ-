@@ -182,6 +182,42 @@ std::vector<uint32_t> Debugger::childPids() {
     return childPids_;
 }
 
+bool Debugger::suspendThread(uint32_t tid) {
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+    if (!h) return false;
+    bool ok = (SuspendThread(h) != (DWORD)-1);
+    CloseHandle(h); return ok;
+}
+bool Debugger::resumeThread(uint32_t tid) {
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+    if (!h) return false;
+    bool ok = (ResumeThread(h) != (DWORD)-1);
+    CloseHandle(h); return ok;
+}
+bool Debugger::killThread(uint32_t tid, uint32_t exitCode) {
+    HANDLE h = OpenThread(THREAD_TERMINATE, FALSE, tid);
+    if (!h) return false;
+    bool ok = TerminateThread(h, exitCode) != 0;
+    CloseHandle(h); return ok;
+}
+bool Debugger::setThreadPriority(uint32_t tid, int priority) {
+    HANDLE h = OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
+    if (!h) return false;
+    bool ok = ::SetThreadPriority(h, priority) != 0;
+    CloseHandle(h); return ok;
+}
+bool Debugger::setThreadName(uint32_t tid, const std::string& name) {
+    HANDLE h = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, tid);
+    if (!h) return false;
+    std::wstring w(name.begin(), name.end());
+    // SetThreadDescription (Win10+); enlazado dinamico para no exigirlo en link.
+    typedef HRESULT (WINAPI *SetThreadDescFn)(HANDLE, PCWSTR);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    auto fn = k32 ? (SetThreadDescFn)GetProcAddress(k32, "SetThreadDescription") : nullptr;
+    bool ok = fn ? SUCCEEDED(fn(h, w.c_str())) : false;
+    CloseHandle(h); return ok;
+}
+
 void Debugger::setSymbolSearchPath(const std::string& path) {
     symSearchPath_ = path;
     // Si ya hay una sesion con DbgHelp activo, aplica el nuevo path y recarga modulos.
