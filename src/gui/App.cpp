@@ -1008,8 +1008,14 @@ bool App::visible(const char* name) {
     return it == winVisible_.end() ? true : it->second;
 }
 void App::ensureVisibilityKeys() {
+    // Paneles auxiliares nuevos: ocultos por defecto para no saturar la pantalla al abrir
+    // (se activan desde Window -> Show). El resto arranca visible.
+    static const std::set<std::string> hiddenByDefault = {
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script"
+    };
     for (auto nm : managedWindows())
-        if (winVisible_.find(nm) == winVisible_.end()) winVisible_[nm] = true;
+        if (winVisible_.find(nm) == winVisible_.end())
+            winVisible_[nm] = (hiddenByDefault.count(nm) == 0);
 }
 static std::string visFilePath() {
     wchar_t exe[MAX_PATH] = {0};
@@ -1347,6 +1353,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Plugins -> MCP Control -> Activar MCP. Por defecto escucha en 127.0.0.1:8377 y crea un token aleatorio de sesion.");
             ImGui::BulletText("Copia el token a la variable DBGJPP_TOKEN del cliente MCP. Sin token, la app rechaza todo comando.");
             ImGui::BulletText("Bypass: la casilla 'aceptar comandos SIN token' (o --noauth por CLI) desactiva la autenticacion. Comodo para uso local, pero cualquiera que alcance el puerto controla el debugger: usar solo en 127.0.0.1 o red de confianza.");
+            ImGui::BulletText("Si el puerto elegido esta ocupado (p.ej. un socket huerfano), el servidor prueba automaticamente los 10 siguientes; el estado indica que puerto quedo en uso. Flag --access=N fija el nivel (0/1/2) por CLI.");
             ImGui::BulletText("Elige permiso: Solo lectura, Control de sesion o Modificacion. Bind 0.0.0.0 solo para WSL/red de confianza.");
             ImGui::BulletText("Registra mcp/server.mjs en tu cliente MCP. Consulta mcp/README.md para comandos exactos.");
             ImGui::TextUnformatted("Tools principales");
@@ -4069,9 +4076,19 @@ void App::startMcp() {
         return;
     }
     auto disp = [this](const std::string& line) -> std::string { return execDbgCommand(line); };
-    if (mcp_.start(mcpPort_, mcpBindAll_, mcpToken_, mcpAccessLevel_, disp, err, mcpNoAuth_)) {
+    // Fallback de puerto: si el bind falla (p.ej. un socket huerfano ocupa el puerto),
+    // prueba los siguientes hasta 10 puertos antes de rendirse.
+    int basePort = mcpPort_;
+    bool started = false;
+    for (int off = 0; off < 10 && !started; ++off) {
+        int tryPort = basePort + off;
+        started = mcp_.start(tryPort, mcpBindAll_, mcpToken_, mcpAccessLevel_, disp, err, mcpNoAuth_);
+        if (started) mcpPort_ = tryPort;
+    }
+    if (started) {
         mcpStatus_ = "MCP escuchando en " + std::string(mcpBindAll_ ? "0.0.0.0:" : "127.0.0.1:") + std::to_string(mcpPort_) +
-                     (mcpNoAuth_ ? " (BYPASS: sin token)" : " (token y permiso de sesion requeridos)");
+                     (mcpNoAuth_ ? " (BYPASS: sin token)" : " (token y permiso de sesion requeridos)") +
+                     (mcpPort_ != basePort ? "  [puerto " + std::to_string(basePort) + " ocupado, se uso " + std::to_string(mcpPort_) + "]" : "");
     } else mcpStatus_ = "Error: " + err;
     pushLog(mcpStatus_);
 }

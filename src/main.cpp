@@ -4,6 +4,9 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <tchar.h>
+#include <cstdlib>
+#include <crtdbg.h>
+#include <memory>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -65,7 +68,17 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+// Handler de parametro invalido del CRT: por defecto ucrtbase llama __fastfail
+// (0xC0000409) y aborta el proceso ante un parametro invalido (p.ej. algun printf/
+// conversion sensible al locale/timing). Con un handler propio la ejecucion continua
+// en vez de abortar, evitando el crash intermitente de arranque.
+static void crtInvalidParam(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, uintptr_t) {}
+
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
+    _set_invalid_parameter_handler(crtInvalidParam);
+#ifdef _DEBUG
+    _CrtSetReportMode(_CRT_ASSERT, 0);
+#endif
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, hInst, nullptr, nullptr, nullptr, nullptr,
                        L"DebuggerJpp", nullptr };
     RegisterClassExW(&wc);
@@ -89,22 +102,33 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    dbg::App app;
+    // Construccion defensiva: si algun load del constructor lanza, se reintenta una vez
+    // (una excepcion no capturada aqui llamaria std::terminate -> abort).
+    std::unique_ptr<dbg::App> appPtr;
+    for (int attempt = 0; attempt < 3 && !appPtr; ++attempt) {
+        try { appPtr = std::make_unique<dbg::App>(); }
+        catch (...) { appPtr.reset(); }
+    }
+    if (!appPtr) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
+    dbg::App& app = *appPtr;
 
     // Arranque opcional del MCP por linea de comandos: --mcp [--bindall] [--port=NNNN]
+    // Se DIFIERE al segundo frame: arrancar el hilo de red concurrentemente con la
+    // inicializacion de D3D/ImGui provocaba un crash intermitente en el arranque.
+    bool wantMcp = false; int mcpPort = 8377; bool mcpBindAll = false;
     {
         std::wstring cl = GetCommandLineW();
         if (cl.find(L"--mcp") != std::wstring::npos) {
-            int port = 8377;
-            bool bindAll = cl.find(L"--bindall") != std::wstring::npos;
+            wantMcp = true;
+            mcpBindAll = cl.find(L"--bindall") != std::wstring::npos;
             auto p = cl.find(L"--port=");
-            if (p != std::wstring::npos) port = _wtoi(cl.c_str() + p + 7);
+            if (p != std::wstring::npos) mcpPort = _wtoi(cl.c_str() + p + 7);
             if (cl.find(L"--noauth") != std::wstring::npos) app.cliSetNoAuth(true);
             auto ap = cl.find(L"--access=");
             if (ap != std::wstring::npos) app.cliSetAccess(_wtoi(cl.c_str() + ap + 9));
-            app.cliStartMcp(port, bindAll);
         }
     }
+    int frameCount = 0;
 
     bool done = false;
     while (!done) {
@@ -120,7 +144,13 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        app.render();
+        try {
+            app.render();
+            // Arranque diferido del MCP: tras un par de frames, ya inicializado todo.
+            if (wantMcp && ++frameCount == 2) { app.cliStartMcp(mcpPort, mcpBindAll); wantMcp = false; }
+        } catch (...) {
+            // Una excepcion dentro de un panel no debe tumbar la app; se ignora este frame.
+        }
 
         ImGui::Render();
         const float clear[4] = { 0.09f, 0.09f, 0.11f, 1.0f };

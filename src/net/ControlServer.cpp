@@ -42,7 +42,8 @@ bool ControlServer::start(int port, bool bindAll, const std::string& token, int 
     }
     listenSock_ = (uintptr_t)s;
     running_.store(true);
-    acceptThread_ = std::thread([this]() { acceptLoop(); });
+    // Un throw sin capturar dentro de un hilo llama std::terminate (fastfail 0xC0000409).
+    acceptThread_ = std::thread([this]() { try { acceptLoop(); } catch (...) {} });
     return true;
 }
 
@@ -70,7 +71,7 @@ void ControlServer::acceptLoop() {
         sockaddr_in cli{}; int len = sizeof(cli);
         SOCKET c = accept((SOCKET)listenSock_, (sockaddr*)&cli, &len);
         if (c == INVALID_SOCKET) { if (!running_.load()) break; continue; }
-        std::thread([this, c]() { handleClient((uintptr_t)c); }).detach();
+        std::thread([this, c]() { try { handleClient((uintptr_t)c); } catch (...) { closesocket((SOCKET)c); } }).detach();
     }
 }
 
