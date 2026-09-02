@@ -430,6 +430,16 @@ void App::startDebugSession() {
     if (!debugger_.launch(loadedPath_, args, err)) pushLog("No se pudo lanzar: " + err);
 }
 
+// Conmuta el target a un proceso hijo: desadjunta el actual (lo deja corriendo) y
+// programa el attach al hijo cuando el motor vuelva a Idle (se completa en render()).
+void App::switchToChild(uint32_t pid) {
+    if (!pid) { pushLog("Conmutar: PID invalido."); return; }
+    if (dbgState_ == DbgState::Idle) { attachToProcess(pid); return; }
+    std::string err;
+    if (debugger_.detach(err)) { pendingSwitchPid_ = pid; pushLog("Conmutando al hijo PID " + std::to_string(pid) + " (desadjuntando el actual)..."); }
+    else { debugger_.detachAndStop(); pendingSwitchPid_ = pid; pushLog("Conmutando al hijo PID " + std::to_string(pid) + "..."); }
+}
+
 void App::attachToProcess(uint32_t pid) {
     if (!pid) { pushLog("Adjuntar: PID invalido."); return; }
     if (debugger_.state() == DbgState::Exited) debugger_.detachAndStop();
@@ -809,6 +819,12 @@ void App::render() {
 
     drainMcpQueue();
 
+    // Conmutacion a proceso hijo: cuando el detach del actual termina (Idle), adjunta el hijo.
+    if (pendingSwitchPid_ && debugger_.state() == DbgState::Idle) {
+        uint32_t pid = pendingSwitchPid_; pendingSwitchPid_ = 0;
+        attachToProcess(pid);
+    }
+
     // M11: hot-reload de plugins (cada ~120 frames si esta activado).
     if (pluginAutoReload_ && ++pluginCheckCounter_ >= 120) {
         pluginCheckCounter_ = 0;
@@ -1184,6 +1200,14 @@ void App::drawMenuBar() {
             bool follow = debugger_.followChildren();
             if (ImGui::MenuItem("Seguir procesos hijos", nullptr, follow, dbgState_ == DbgState::Idle))
                 debugger_.setFollowChildren(!follow);
+            auto children = debugger_.childPids();
+            if (ImGui::BeginMenu("Conmutar a proceso hijo", !children.empty())) {
+                for (uint32_t cpid : children) {
+                    char lbl[32]; std::snprintf(lbl, sizeof(lbl), "PID %u", cpid);
+                    if (ImGui::MenuItem(lbl)) switchToChild(cpid);
+                }
+                ImGui::EndMenu();
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Tools")) {
@@ -1332,7 +1356,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Script (Window -> Script): mini-lenguaje que automatiza el debugger. Lineas: $v=expr | print expr | log txt | label: | goto label | if expr goto label | cmd key=val. Por MCP: run_script.");
             ImGui::BulletText("Informes: Archivo -> Exportar SARIF genera SARIF 2.1.0 con las detecciones (packer, entropia, W+X, TLS, pocos imports). Por MCP: report format=sarif.");
             ImGui::BulletText("Unpacking: Plugins -> 'Validar dump' revisa un ejecutable volcado (entrypoint en seccion ejecutable, entropia de codigo, IAT reconstruida). Por MCP: validate_dump.");
-            ImGui::BulletText("Seguir procesos hijos: hoy se detectan y listan (list_children). Para 'seguir' un hijo: Archivo -> Detach y luego Attach al PID del hijo (conmutacion manual). El seguimiento simultaneo de varios procesos aun no esta.");
+            ImGui::BulletText("Seguir procesos hijos: activa Depurar -> Seguir procesos hijos antes de lanzar. Los hijos se detectan y listan. Depurar -> Conmutar a proceso hijo (o MCP switch_to_child) desadjunta el actual y adjunta el hijo en un paso. El seguimiento SIMULTANEO de varios procesos a la vez aun no esta (se depura uno a la vez por conmutacion).");
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Navegacion del CPU (estilo OllyDbg)");
             ImGui::BulletText("Clic en una linea SELECCIONA (ya no pone breakpoint). El BP se pone/quita con F2 sobre la seleccion o desde el menu contextual -> Breakpoints.");
@@ -4052,6 +4076,7 @@ static int mcpRequiredAccess(const std::string& cmd) {
         cmd == "set_membp" || cmd == "del_membp" ||
         cmd == "add_exc_bp" || cmd == "rm_exc_bp" || cmd == "set_event_breaks" ||
         cmd == "set_bookmark" || cmd == "del_bookmark" || cmd == "clear_analysis" ||
+        cmd == "set_follow_children" || cmd == "switch_to_child" ||
         cmd == "find_oep" || cmd == "run_trace") return 1;
     return 0;
 }
@@ -4521,6 +4546,15 @@ std::string App::handleMcpCommand(const std::string& line) {
         res["follow"] = debugger_.followChildren();
         for (uint32_t p : debugger_.childPids()) res["children"].push_back(p);
     }
+    else if (cmd == "switch_to_child") {
+        uint32_t pid = static_cast<uint32_t>(a.value("pid", 0));
+        if (!pid) { res["ok"] = false; res["error"] = "pid requerido"; }
+        else { switchToChild(pid); res["pid"] = pid; res["state"] = "switching"; }
+    }
+    else if (cmd == "set_follow_children") {
+        debugger_.setFollowChildren(a.value("on", true));
+        res["follow"] = debugger_.followChildren();
+    }
     else if (cmd == "poll_events") {
         uint64_t since = jU64(a.value("since", njson(0)));
         std::lock_guard<std::mutex> lk(eventsMutex_);
@@ -4769,6 +4803,8 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("poll_events", "Sondea el bus de eventos (streaming). Devuelve eventos con seq > 'since' y el ultimo seq.", obj({{"since", INT}}, {}));
     add("diff_files",  "Compara dos archivos byte a byte y devuelve los rangos que difieren.", obj({{"a", STR}, {"b", STR}}, {"a","b"}));
     add("list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", obj(EMPTY, {}));
+    add("set_follow_children","Activa/desactiva seguir procesos hijos (fijar antes de lanzar).", obj({{"on", njson{{"type","boolean"}}}}, {}));
+    add("switch_to_child","Conmuta el target: desadjunta el actual y adjunta el proceso hijo indicado.", obj({{"pid", INT}}, {"pid"}));
     add("run_script",  "Ejecuta un script (mini-lenguaje: $v=expr, print, log, label:, goto, if..goto, cmd key=val).", obj({{"src", STR}}, {"src"}));
     add("validate_dump","Valida un ejecutable volcado (entrypoint, entropia de codigo, IAT).", obj({{"path", STR}}, {"path"}));
     add("infer_struct","Pide a la IA que infiera la struct en una direccion (resultado en el panel IA).", obj({{"addr", HEX}}, {"addr"}));

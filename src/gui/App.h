@@ -51,6 +51,8 @@ private:
     void runPackerScan();
     void startDebugSession();
     void attachToProcess(uint32_t pid);
+    void switchToChild(uint32_t pid);        // conmuta el target: detach del actual -> attach al hijo
+    uint32_t pendingSwitchPid_ = 0;          // attach pendiente tras el detach (conmutacion)
     bool saveSession(const std::wstring& path, std::string& error);
     bool loadSession(const std::wstring& path, std::string& error);
     std::string buildAnalysisReport();

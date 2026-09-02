@@ -62,6 +62,8 @@ const TOOLS = [
   ["diff_files",  "Compara dos archivos byte a byte; devuelve los rangos que difieren.", S({ a: { type: "string" }, b: { type: "string" } }, ["a", "b"])],
   ["infer_struct","Pide a la IA que infiera la struct en una direccion (resultado en el panel IA).", S({ addr: HEX }, ["addr"])],
   ["list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", S()],
+  ["set_follow_children","Activa/desactiva seguir procesos hijos (fijar antes de lanzar).", S({ on: { type: "boolean" } })],
+  ["switch_to_child","Conmuta el target: desadjunta el actual y adjunta el proceso hijo indicado.", S({ pid: { type: "integer", minimum: 1 } }, ["pid"])],
   ["export_report", "Exporta un informe Markdown a path.", S({ path: { type: "string" } }, ["path"])],
   ["attach",      "Se adjunta a un proceso existente por PID.", S({ pid: { type: "integer", minimum: 1 } }, ["pid"])],
   ["detach",      "Desadjunta un proceso conectado por Attach sin terminarlo.", S()],
