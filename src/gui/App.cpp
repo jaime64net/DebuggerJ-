@@ -127,6 +127,7 @@ App::App() {
     loadExternalPlugins();
     loadRecent();
     loadSymPath();
+    loadNotes();
     loadLayouts();
     loadVisibility();
     ensureVisibilityKeys();
@@ -871,6 +872,7 @@ void App::render() {
     if (visible("Excepciones"))          drawExceptionsPanel();
     if (visible("Call stack"))           drawCallStackPanel();
     if (visible("Threads"))              drawThreadsPanel();
+    if (visible("Notes"))                drawNotesPanel();
     if (visible("Executable modules"))   drawExecModulesPanel();
     if (visible("Referencias"))          drawReferencesPanel();
     if (visible("Analysis"))             drawAnalysisPanel();
@@ -906,7 +908,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes"
     };
 }
 
@@ -1056,7 +1058,7 @@ void App::ensureVisibilityKeys() {
     // Paneles auxiliares nuevos: ocultos por defecto para no saturar la pantalla al abrir
     // (se activan desde Window -> Show). El resto arranca visible.
     static const std::set<std::string> hiddenByDefault = {
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes"
     };
     for (auto nm : managedWindows())
         if (winVisible_.find(nm) == winVisible_.end())
@@ -1358,7 +1360,8 @@ void App::drawHelpWindow() {
             ImGui::TextUnformatted("Paneles de analisis");
             ImGui::BulletText("Modulos & Simbolos: doble clic en una DLL o archivo para ver su desensamblado; consulta TLS, SEH, imports y exports.");
             ImGui::BulletText("Call stack usa StackWalk64/DbgHelp. Si Windows puede localizar un PDB, muestra simbolos y archivo:linea; de otro modo conserva las direcciones disponibles.");
-            ImGui::BulletText("Threads (Window -> Threads): lista los hilos del proceso (TID, hilo actual, prioridad, descripcion). Por MCP: threads.");
+            ImGui::BulletText("Threads (Window -> Threads): lista los hilos del proceso (TID, hilo actual, prioridad, descripcion) y clic derecho para suspender/reanudar/terminar/prioridad. Por MCP: threads, thread_ctrl.");
+            ImGui::BulletText("Notes (Window -> Notes): notas GLOBALES (siempre) y por BINARIO (guardadas por hash del contenido). Por MCP: notes_get, notes_set.");
             ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
             ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin. Packers muestra firmas y heuristicas.");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
@@ -4080,6 +4083,56 @@ void App::drawCallStackPanel() {
     ImGui::End();
 }
 
+// ---------------------------------------------------------------------------
+// Notes (paridad x64dbg): notas globales (notes_global.txt) y por-binario (por hash).
+// ---------------------------------------------------------------------------
+static std::string notesGlobalPath() {
+    wchar_t exe[MAX_PATH] = {0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring w(exe); auto p = w.find_last_of(L"\\/");
+    std::wstring dir = (p == std::wstring::npos) ? L"." : w.substr(0, p);
+    std::wstring path = dir + L"\\notes_global.txt";
+    return std::string(path.begin(), path.end());
+}
+static std::string notesDebuggeePath(const std::string& hash) {
+    wchar_t exe[MAX_PATH] = {0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring w(exe); auto p = w.find_last_of(L"\\/");
+    std::wstring dir = (p == std::wstring::npos) ? L"." : w.substr(0, p);
+    std::wstring path = dir + L"\\cache\\" + std::wstring(hash.begin(), hash.end()) + L".notes.txt";
+    return std::string(path.begin(), path.end());
+}
+static std::string readFileText(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : std::string();
+}
+void App::loadNotes() {
+    std::snprintf(notesGlobal_, sizeof(notesGlobal_), "%s", readFileText(notesGlobalPath()).c_str());
+    std::string h = peContentHash();
+    if (!h.empty()) { notesDebuggeeHash_ = h; std::snprintf(notesDebuggee_, sizeof(notesDebuggee_), "%s", readFileText(notesDebuggeePath(h)).c_str()); }
+}
+void App::saveNotesGlobal() { std::ofstream f(notesGlobalPath(), std::ios::binary | std::ios::trunc); if (f) f << notesGlobal_; }
+void App::saveNotesDebuggee() {
+    if (notesDebuggeeHash_.empty()) return;
+    std::ofstream f(notesDebuggeePath(notesDebuggeeHash_), std::ios::binary | std::ios::trunc);
+    if (f) f << notesDebuggee_;
+}
+void App::drawNotesPanel() {
+    ImGui::Begin("Notes");
+    std::string h = peContentHash();
+    if (!h.empty() && h != notesDebuggeeHash_) { notesDebuggeeHash_ = h; std::snprintf(notesDebuggee_, sizeof(notesDebuggee_), "%s", readFileText(notesDebuggeePath(h)).c_str()); }
+
+    float half = ImGui::GetContentRegionAvail().y * 0.5f - 30;
+    ImGui::TextDisabled("Notas globales (persisten siempre):");
+    ImGui::InputTextMultiline("##ng", notesGlobal_, sizeof(notesGlobal_), ImVec2(-1, half));
+    if (ImGui::Button("Guardar globales")) saveNotesGlobal();
+    ImGui::Separator();
+    ImGui::TextDisabled("Notas de este binario (%s):", h.empty() ? "abre un archivo" : h.c_str());
+    ImGui::BeginDisabled(h.empty());
+    ImGui::InputTextMultiline("##nd", notesDebuggee_, sizeof(notesDebuggee_), ImVec2(-1, half));
+    if (ImGui::Button("Guardar del binario")) saveNotesDebuggee();
+    ImGui::EndDisabled();
+    ImGui::End();
+}
+
 void App::drawThreadsPanel() {
     ImGui::Begin("Threads");
     if (dbgState_ == DbgState::Idle || dbgState_ == DbgState::Exited) {
@@ -4151,7 +4204,7 @@ static std::string hexBytes(const uint8_t* p, size_t n) {
 static int mcpRequiredAccess(const std::string& cmd) {
     if (cmd == "save_session" || cmd == "load_session" || cmd == "export_report" || cmd == "write_mem" || cmd == "set_reg" || cmd == "assemble" || cmd == "patch" ||
         cmd == "nop" || cmd == "dump" || cmd == "fix_iat" || cmd == "antidebug" ||
-        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script" || cmd == "thread_ctrl") return 2;
+        cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script" || cmd == "thread_ctrl" || cmd == "notes_set") return 2;
     if (cmd == "attach" || cmd == "detach" || cmd == "launch" || cmd == "restart" || cmd == "go" || cmd == "pause" ||
         cmd == "step_into" || cmd == "step_over" || cmd == "step_to_ret" || cmd == "stop" ||
         cmd == "set_bp" || cmd == "del_bp" || cmd == "set_hwbp" || cmd == "del_hwbp" ||
@@ -4628,6 +4681,20 @@ std::string App::handleMcpCommand(const std::string& line) {
         for (const auto& t : debugger_.threads())
             res["threads"].push_back({{"tid", t.id}, {"current", t.current}, {"priority", t.priority}, {"description", t.description}});
     }
+    else if (cmd == "notes_get") {
+        std::string h = peContentHash();
+        if (!h.empty() && h != notesDebuggeeHash_) loadNotes();
+        res["global"] = std::string(notesGlobal_);
+        res["debuggee"] = std::string(notesDebuggee_);
+    }
+    else if (cmd == "notes_set") {
+        std::string scope = a.value("scope", "debuggee"), text = a.value("text", "");
+        if (scope == "global") { std::snprintf(notesGlobal_, sizeof(notesGlobal_), "%s", text.c_str()); saveNotesGlobal(); }
+        else {
+            if (notesDebuggeeHash_.empty()) notesDebuggeeHash_ = peContentHash();
+            std::snprintf(notesDebuggee_, sizeof(notesDebuggee_), "%s", text.c_str()); saveNotesDebuggee();
+        }
+    }
     else if (cmd == "run_to") {
         if (!need_paused()) goto done;
         runToAddress(jU64(a["addr"]));
@@ -4904,6 +4971,8 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("poll_events", "Sondea el bus de eventos (streaming). Devuelve eventos con seq > 'since' y el ultimo seq.", obj({{"since", INT}}, {}));
     add("diff_files",  "Compara dos archivos byte a byte y devuelve los rangos que difieren.", obj({{"a", STR}, {"b", STR}}, {"a","b"}));
     add("threads",     "Lista los hilos del proceso depurado (TID, actual, prioridad, descripcion).", obj(EMPTY, {}));
+    add("notes_get",   "Devuelve las notas globales y las del binario actual.", obj(EMPTY, {}));
+    add("notes_set",   "Guarda notas. scope: 'global' o 'debuggee' (por binario).", obj({{"scope", STR}, {"text", STR}}, {"text"}));
     add("run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));
     add("thread_ctrl", "Controla un hilo. action: suspend|resume|kill|priority|name; value=prioridad/exitcode; name=nombre.", obj({{"tid", INT}, {"action", STR}, {"value", INT}, {"name", STR}}, {"tid","action"}));
     add("list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", obj(EMPTY, {}));

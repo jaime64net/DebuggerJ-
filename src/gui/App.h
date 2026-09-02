@@ -143,6 +143,10 @@ private:
     void drawExecModulesPanel();   // "Executable modules" estilo Olly
     void drawCallStackPanel();     // Call stack (cadena de frames)
     void drawThreadsPanel();       // hilos del proceso depurado
+    void drawNotesPanel();         // notas globales + por-binario (paridad x64dbg)
+    void loadNotes();
+    void saveNotesGlobal();
+    void saveNotesDebuggee();
     void drawPluginsPanel();
     void drawLogPanel();
     void drawAiPanel();
@@ -295,6 +299,11 @@ private:
     struct WatchItem { std::string expr; std::string value; bool ok = true; };
     std::vector<WatchItem> watches_;
     char          watchInput_[128] = {0};
+
+    // --- Notes (paridad x64dbg) ---
+    char          notesGlobal_[8192] = {0};
+    char          notesDebuggee_[8192] = {0};
+    std::string   notesDebuggeeHash_;   // hash del binario cuyas notas están cargadas
 
     // --- Struct viewer (M8) ---
     struct StructField { int type = 2; char name[32] = {0}; };  // type: 0=byte 1=word 2=dword 3=qword 4=ptr 5=str

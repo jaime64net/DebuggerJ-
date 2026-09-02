@@ -62,6 +62,8 @@ const TOOLS = [
   ["diff_files",  "Compara dos archivos byte a byte; devuelve los rangos que difieren.", S({ a: { type: "string" }, b: { type: "string" } }, ["a", "b"])],
   ["infer_struct","Pide a la IA que infiera la struct en una direccion (resultado en el panel IA).", S({ addr: HEX }, ["addr"])],
   ["threads",     "Lista los hilos del proceso depurado (TID, actual, prioridad, descripcion).", S()],
+  ["notes_get",   "Devuelve las notas globales y las del binario actual.", S()],
+  ["notes_set",   "Guarda notas. scope: 'global' o 'debuggee' (por binario).", S({ scope: { type: "string" }, text: { type: "string" } }, ["text"])],
   ["run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", S({ addr: HEX }, ["addr"])],
   ["thread_ctrl", "Controla un hilo. action: suspend|resume|kill|priority|name; value=prioridad/exitcode; name=nombre.", S({ tid: { type: "integer" }, action: { type: "string" }, value: { type: "integer" }, name: { type: "string" } }, ["tid", "action"])],
   ["list_children","Lista los PIDs de procesos hijos detectados (requiere 'Seguir procesos hijos').", S()],
