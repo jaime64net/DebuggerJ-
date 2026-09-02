@@ -940,6 +940,7 @@ void App::render() {
     if (visible("Threads"))              drawThreadsPanel();
     if (visible("Notes"))                drawNotesPanel();
     if (visible("System"))               drawSystemPanel();
+    if (visible("Entropy"))              drawEntropyPanel();
     if (visible("Executable modules"))   drawExecModulesPanel();
     if (visible("Referencias"))          drawReferencesPanel();
     if (visible("Analysis"))             drawAnalysisPanel();
@@ -975,7 +976,7 @@ std::vector<const char*> App::managedWindows() {
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
         "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System", "Entropy"
     };
 }
 
@@ -1125,7 +1126,7 @@ void App::ensureVisibilityKeys() {
     // Paneles auxiliares nuevos: ocultos por defecto para no saturar la pantalla al abrir
     // (se activan desde Window -> Show). El resto arranca visible.
     static const std::set<std::string> hiddenByDefault = {
-        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System"
+        "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System", "Entropy"
     };
     for (auto nm : managedWindows())
         if (winVisible_.find(nm) == winVisible_.end())
@@ -1456,6 +1457,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Threads (Window -> Threads): lista los hilos del proceso (TID, hilo actual, prioridad, descripcion) y clic derecho para suspender/reanudar/terminar/prioridad. Por MCP: threads, thread_ctrl.");
             ImGui::BulletText("Notes (Window -> Notes): notas GLOBALES (siempre) y por BINARIO (guardadas por hash del contenido). Por MCP: notes_get, notes_set.");
             ImGui::BulletText("System (Window -> System): privilegios del token del proceso, conexiones TCP (IPv4) y conteo de handles. Por MCP: system_info.");
+            ImGui::BulletText("Entropy (Window -> Entropy): entropia global y por seccion con barras (verde bajo, amarillo medio, rojo alto >7.2 = posible cifrado/empaquetado).");
             ImGui::BulletText("Operaciones de memoria (solo por MCP, requieren pausa): mem_alloc, mem_free, mem_fill, mem_copy, mem_save, page_protect.");
             ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
             ImGui::BulletText("Run until expression (MCP run_until {expr, over, max}): single-step hasta que una expresion sea cierta (p.ej. 'eax == 0' o 'dword(esp) > 0x400000'). Requiere pausado.");
@@ -4332,6 +4334,26 @@ std::string App::systemInfoJson() {
         }
     }
     return j.dump();
+}
+
+void App::drawEntropyPanel() {
+    ImGui::Begin("Entropy");
+    if (!fileLoaded_) { ImGui::TextDisabled("Abre un archivo."); ImGui::End(); return; }
+    ImGui::Text("Entropia global: %.3f / 8.0", pe_.overallEntropy());
+    ImGui::TextDisabled("0 = uniforme, 8 = maxima aleatoriedad. >7.2 suele indicar cifrado/empaquetado.");
+    ImGui::Separator();
+    for (const auto& s : pe_.sections()) {
+        float e = (float)s.entropy;
+        float frac = e / 8.0f;
+        ImVec4 col = e > 7.2f ? ImVec4(0.9f,0.3f,0.3f,1) : e > 6.0f ? ImVec4(0.9f,0.8f,0.3f,1) : ImVec4(0.4f,0.8f,0.4f,1);
+        ImGui::Text("%-10s", s.name.c_str());
+        ImGui::SameLine(110);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
+        char ov[24]; std::snprintf(ov, sizeof(ov), "%.3f", e);
+        ImGui::ProgressBar(frac, ImVec2(-1, 0), ov);
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
 }
 
 void App::drawSystemPanel() {

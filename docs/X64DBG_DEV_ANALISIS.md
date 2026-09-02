@@ -284,3 +284,20 @@ reconstructor (Scylla≈fix_iat), Run to cursor, **IA + MCP (x64dbg no los tiene
 
 Se ejecutan por lotes con commit+push por objetivo. Fuera de alcance (proyecto aparte):
 decompilador nativo real; depuración simultánea de varios procesos.
+
+### Estado de ejecución del plan (2026-09-02) — TODOS COMPLETADOS
+- **A. Control de hilos** ✓ (Threads panel + thread_ctrl: suspend/resume/kill/priority/name).
+- **B. Notes** ✓ (globales + por-binario; notes_get/notes_set).
+- **C. Handles/TCP/privilegios** ✓ (System panel + system_info; handles = conteo).
+- **D. Operaciones de memoria** ✓ (mem_alloc/free/fill/copy/save, page_protect).
+- **E. Run until expression / trace condicional** ✓ (run_until).
+- **F. Animate/Skip/Undo** ✓ (animate, skip_instruction, undo_instruction).
+- **G. Watchdog** ✓ (checkbox en Watch, avisa al cambiar).
+- **H. Favourites** ✓ (menú + favourites.txt).
+- **I. Restart admin + Entropy view** ✓ (Tools→Reiniciar admin; panel Entropy con barras).
+- **J. Variables globales** ✓ (var_set/get/list, usables en expresiones).
+
+Además, en esta fase: crash de arranque resuelto, following de hijos (switch_to_child),
+unpacking con validación reforzada, y navegación del CPU estilo Olly (selección múltiple,
+teclado, xrefs automáticos, Goto RVA, AI as C++). Cobertura de x64dbg: paridad funcional
+completa salvo decompilador nativo real y depuración simultánea de múltiples procesos.

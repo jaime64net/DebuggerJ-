@@ -162,6 +162,7 @@ private:
     void drawThreadsPanel();       // hilos del proceso depurado
     void drawNotesPanel();         // notas globales + por-binario (paridad x64dbg)
     void drawSystemPanel();        // privilegios, conexiones TCP y handles del proceso
+    void drawEntropyPanel();       // entropía por sección con barras (diálogo de entropía)
     std::string systemInfoJson();  // misma info para MCP
     void loadNotes();
     void saveNotesGlobal();
