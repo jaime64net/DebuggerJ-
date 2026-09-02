@@ -755,7 +755,23 @@ bool App::validateDump(const std::wstring& path, std::string& report) {
     if (dump.imports().empty()) { o << "[!!] Sin imports: la IAT no está reconstruida (usa Corregir IAT).\n"; ok = false; }
     else o << "[OK] " << dump.imports().size() << " imports presentes.\n";
 
-    o << (ok ? "\nRESULTADO: el dump parece válido.\n" : "\nRESULTADO: el dump tiene problemas; revisa OEP/IAT.\n");
+    // 4) coherencia de secciones: solapamientos y sizeOfImage
+    {
+        std::vector<std::pair<uint64_t,uint64_t>> ranges;
+        for (const auto& s : dump.sections()) ranges.push_back({s.virtualAddress, s.virtualAddress + (s.virtualSize ? s.virtualSize : 1)});
+        std::sort(ranges.begin(), ranges.end());
+        bool overlap = false;
+        for (size_t k = 1; k < ranges.size(); ++k) if (ranges[k].first < ranges[k-1].second) overlap = true;
+        if (overlap) { o << "[!!] Hay secciones que se solapan (dump/headers inconsistentes).\n"; ok = false; }
+        else o << "[OK] Secciones sin solapamiento.\n";
+        uint64_t maxEnd = ranges.empty() ? 0 : ranges.back().second;
+        if (dump.sizeOfImage() < maxEnd) { o << "[!!] sizeOfImage (0x" << hex64(dump.sizeOfImage()) << ") menor que el fin de la ultima seccion.\n"; ok = false; }
+        else o << "[OK] sizeOfImage coherente.\n";
+    }
+    // 5) TLS callbacks (informativo)
+    if (!dump.tlsCallbacks().empty()) o << "[i] " << dump.tlsCallbacks().size() << " TLS callback(s): revisa que apunten a codigo valido.\n";
+
+    o << (ok ? "\nRESULTADO: el dump parece VALIDO.\n" : "\nRESULTADO: el dump tiene PROBLEMAS; revisa OEP/IAT/headers.\n");
     report = o.str();
     return ok;
 }
@@ -1355,7 +1371,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("CFG (Window -> CFG): elige una funcion analizada y muestra sus bloques basicos con aristas (verde=condicional, naranja=incondicional/fallthrough). Clic derecho arrastra, rueda hace zoom.");
             ImGui::BulletText("Script (Window -> Script): mini-lenguaje que automatiza el debugger. Lineas: $v=expr | print expr | log txt | label: | goto label | if expr goto label | cmd key=val. Por MCP: run_script.");
             ImGui::BulletText("Informes: Archivo -> Exportar SARIF genera SARIF 2.1.0 con las detecciones (packer, entropia, W+X, TLS, pocos imports). Por MCP: report format=sarif.");
-            ImGui::BulletText("Unpacking: Plugins -> 'Validar dump' revisa un ejecutable volcado (entrypoint en seccion ejecutable, entropia de codigo, IAT reconstruida). Por MCP: validate_dump.");
+            ImGui::BulletText("Unpacking: al hacer Dump se ejecuta una validacion automatica (entrypoint en seccion ejecutable, entropia de codigo, IAT, solapamiento de secciones, sizeOfImage, TLS). Plugins -> 'Validar dump'/'Validar otro' o MCP validate_dump para revisar cualquier .exe volcado.");
             ImGui::BulletText("Seguir procesos hijos: activa Depurar -> Seguir procesos hijos antes de lanzar. Los hijos se detectan y listan. Depurar -> Conmutar a proceso hijo (o MCP switch_to_child) desadjunta el actual y adjunta el hijo en un paso. El seguimiento SIMULTANEO de varios procesos a la vez aun no esta (se depura uno a la vez por conmutacion).");
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Navegacion del CPU (estilo OllyDbg)");
@@ -2686,7 +2702,11 @@ void App::drawPluginsPanel() {
             std::wstring out = loadedPath_ + L"_dump.exe";
             uint64_t oep = debugger_.foundOEP() ? debugger_.foundOEP() : 0;
             std::string lg;
-            if (dumpProcess(debugger_, pe_, oep, out, lg)) { lastDumpPath_ = out; }
+            if (dumpProcess(debugger_, pe_, oep, out, lg)) {
+                lastDumpPath_ = out;
+                std::string rep; validateDump(out, rep);   // auto-validacion tras el dump
+                lg += "\n--- Validacion automatica ---\n" + rep;
+            }
             pluginStatus_ = lg; pushLog(lg);
         }
         ImGui::EndDisabled();
