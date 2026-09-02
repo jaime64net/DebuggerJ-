@@ -954,8 +954,8 @@ void App::render() {
 
     drawAddCustomPopup();
     drawStatusBar();
-    // Nota: el snap magnetico se reemplazo por el docking (anclar ventanas), que evita
-    // el solapamiento sin reposicionar cada frame.
+    handleContainerDrop();   // arrastrar una ventana del main y soltarla sobre el Contenedor
+    applyMagneticSnap();     // imantacion de ventanas (si esta activada)
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,6 +1160,7 @@ void App::drawWindowMenu() {
         }
         ImGui::EndMenu();
     }
+    ImGui::MenuItem("Snap magnetico", nullptr, &magneticSnap_);
     if (ImGui::MenuItem("VSync", nullptr, &vsyncOn_)) {}
 
     if (ImGui::BeginMenu("Show")) {
@@ -4462,6 +4463,8 @@ void App::renderContainer() {
     }
     for (auto nm : managedWindows())
         if (showInContainer(nm)) drawManagedPanel(nm);
+    handleMainDrop();   // arrastrar del Contenedor al main
+    applyMagneticSnap();
 }
 
 static std::string containerStatePath() {
@@ -4471,6 +4474,58 @@ static std::string containerStatePath() {
     std::wstring path=dir+L"\\container_state.txt";
     return std::string(path.begin(), path.end());
 }
+void App::setContainerScreenRect(int x, int y, int w, int h, bool valid) { contRectX_=x; contRectY_=y; contRectW_=w; contRectH_=h; contRectValid_=valid; }
+void App::setMainScreenRect(int x, int y, int w, int h) { mainRectX_=x; mainRectY_=y; mainRectW_=w; mainRectH_=h; }
+
+// Extrae el nombre gestionado de una ventana ImGui (quita el sufijo "###id").
+static std::string managedNameOf(ImGuiWindow* w) {
+    if (!w) return "";
+    std::string n = w->Name;
+    auto h = n.find("###");
+    if (h != std::string::npos) return n.substr(h + 3);
+    return n;
+}
+
+// (Contexto main) Si el usuario arrastra una ventana del main y la suelta sobre la ventana
+// Contenedor, ese panel se transfiere al Contenedor.
+void App::handleContainerDrop() {
+    ImGuiContext* g = ImGui::GetCurrentContext();
+    if (g && g->MovingWindow) {
+        std::string nm = managedNameOf(g->MovingWindow->RootWindow ? g->MovingWindow->RootWindow : g->MovingWindow);
+        // solo ventanas gestionadas del main
+        for (auto mnamed : managedWindows()) if (nm == mnamed) { draggingWin_ = nm; break; }
+        return;
+    }
+    if (draggingWin_.empty()) return;
+    std::string nm = draggingWin_; draggingWin_.clear();
+    if (!containerOpen_ || !contRectValid_) return;
+    POINT pt; GetCursorPos(&pt);
+    if (pt.x >= contRectX_ && pt.x < contRectX_ + contRectW_ && pt.y >= contRectY_ && pt.y < contRectY_ + contRectH_) {
+        winContainer_[nm] = true; containerDockInit_ = true; saveContainerState();
+        pushLog("Panel enviado al Contenedor: " + nm);
+    }
+}
+
+// (Contexto Contenedor) Si arrastra una ventana del Contenedor y la suelta sobre el main,
+// vuelve al main.
+void App::handleMainDrop() {
+    ImGuiContext* g = ImGui::GetCurrentContext();
+    if (g && g->MovingWindow) {
+        std::string nm = managedNameOf(g->MovingWindow->RootWindow ? g->MovingWindow->RootWindow : g->MovingWindow);
+        for (auto mnamed : managedWindows()) if (nm == mnamed) { draggingWin_ = nm; break; }
+        return;
+    }
+    if (draggingWin_.empty()) return;
+    std::string nm = draggingWin_; draggingWin_.clear();
+    POINT pt; GetCursorPos(&pt);
+    bool overMain = (pt.x >= mainRectX_ && pt.x < mainRectX_ + mainRectW_ && pt.y >= mainRectY_ && pt.y < mainRectY_ + mainRectH_);
+    bool overCont = (contRectValid_ && pt.x >= contRectX_ && pt.x < contRectX_ + contRectW_ && pt.y >= contRectY_ && pt.y < contRectY_ + contRectH_);
+    if (overMain && !overCont) {
+        winContainer_[nm] = false; dockNeedsInit_ = true; saveContainerState();
+        pushLog("Panel devuelto al main: " + nm);
+    }
+}
+
 void App::saveContainerState() {
     std::ofstream f(containerStatePath(), std::ios::trunc);
     if (!f) return;

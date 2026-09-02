@@ -39,6 +39,8 @@ public:
     void renderContainer(); // dibuja la ventana Contenedor nativa (segundo contexto/monitor)
     bool containerOpen() const { return containerOpen_; }
     void setContainerOpen(bool v) { containerOpen_ = v; saveContainerState(); }
+    void setContainerScreenRect(int x, int y, int w, int h, bool valid);  // desde main.cpp
+    void setMainScreenRect(int x, int y, int w, int h);                    // desde main.cpp
     int  vsyncInterval() const { return vsyncOn_ ? 1 : 0; }  // sync interval para Present
     void cliStartMcp(int port, bool bindAll); // arranca el MCP desde linea de comandos
     void cliSetNoAuth(bool on);               // --noauth: bypass del token (antes de cliStartMcp)
@@ -178,6 +180,12 @@ private:
     void  drawManagedPanel(const char* name);           // despacha a drawXPanel por nombre
     void  loadContainerState();
     void  saveContainerState();
+    // Arrastrar una ventana del main y soltarla sobre la ventana Contenedor (y viceversa).
+    void  handleContainerDrop();     // (contexto main) detecta soltar sobre el Contenedor
+    void  handleMainDrop();          // (contexto Contenedor) detecta soltar sobre el main
+    int   contRectX_=0, contRectY_=0, contRectW_=0, contRectH_=0; bool contRectValid_=false;
+    int   mainRectX_=0, mainRectY_=0, mainRectW_=0, mainRectH_=0;
+    std::string draggingWin_;        // ventana que se esta moviendo (para el drop)
     bool          beginManaged(const char* name);  // Begin con X (cierra la ventana)
     std::string systemInfoJson();  // misma info para MCP
     void loadNotes();

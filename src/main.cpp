@@ -207,6 +207,11 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         }
         if (done) break;
 
+        // Rects de ambas ventanas (coords de pantalla) para el drag & drop entre ellas.
+        { RECT rc; if (GetWindowRect(hwnd, &rc)) app.setMainScreenRect(rc.left, rc.top, rc.right-rc.left, rc.bottom-rc.top); }
+        { RECT rc; bool ok = g_contHwnd && app.containerOpen() && IsWindowVisible(g_contHwnd) && GetWindowRect(g_contHwnd, &rc);
+          app.setContainerScreenRect(ok?rc.left:0, ok?rc.top:0, ok?(rc.right-rc.left):0, ok?(rc.bottom-rc.top):0, ok); }
+
         // --- Ventana principal ---
         ImGui::SetCurrentContext(g_mainCtx);
         ImGui_ImplDX11_NewFrame();
