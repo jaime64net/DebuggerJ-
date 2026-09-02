@@ -954,7 +954,6 @@ void App::render() {
 
     drawAddCustomPopup();
     drawStatusBar();
-    handleContainerDrop();   // arrastrar una ventana del main y soltarla sobre el Contenedor
     applyMagneticSnap();     // imantacion de ventanas (si esta activada)
 }
 
@@ -4463,8 +4462,6 @@ void App::renderContainer() {
     }
     for (auto nm : managedWindows())
         if (showInContainer(nm)) drawManagedPanel(nm);
-    handleMainDrop();   // arrastrar del Contenedor al main
-    applyMagneticSnap();
 }
 
 static std::string containerStatePath() {
@@ -4490,19 +4487,26 @@ static std::string managedNameOf(ImGuiWindow* w) {
 // Contenedor, ese panel se transfiere al Contenedor.
 void App::handleContainerDrop() {
     ImGuiContext* g = ImGui::GetCurrentContext();
+    // Mientras se arrastra una ventana gestionada, recordar su nombre.
     if (g && g->MovingWindow) {
         std::string nm = managedNameOf(g->MovingWindow->RootWindow ? g->MovingWindow->RootWindow : g->MovingWindow);
-        // solo ventanas gestionadas del main
-        for (auto mnamed : managedWindows()) if (nm == mnamed) { draggingWin_ = nm; break; }
-        return;
+        for (auto mnamed : managedWindows()) if (nm == mnamed) {
+            if (draggingWin_ != nm) pushLog("[drag] arrastrando: " + nm);
+            draggingWin_ = nm; break;
+        }
     }
-    if (draggingWin_.empty()) return;
-    std::string nm = draggingWin_; draggingWin_.clear();
-    if (!containerOpen_ || !contRectValid_) return;
-    POINT pt; GetCursorPos(&pt);
-    if (pt.x >= contRectX_ && pt.x < contRectX_ + contRectW_ && pt.y >= contRectY_ && pt.y < contRectY_ + contRectH_) {
-        winContainer_[nm] = true; containerDockInit_ = true; saveContainerState();
-        pushLog("Panel enviado al Contenedor: " + nm);
+    // Al soltar el boton, si habia un arrastre y el cursor cae sobre el Contenedor, transferir.
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !draggingWin_.empty()) {
+        std::string nm = draggingWin_; draggingWin_.clear();
+        POINT pt; GetCursorPos(&pt);
+        bool inside = contRectValid_ && pt.x >= contRectX_ && pt.x < contRectX_ + contRectW_ && pt.y >= contRectY_ && pt.y < contRectY_ + contRectH_;
+        pushLog("[drop] " + nm + " cursor=(" + std::to_string(pt.x) + "," + std::to_string(pt.y) + ") contRect=(" +
+                std::to_string(contRectX_) + "," + std::to_string(contRectY_) + "," + std::to_string(contRectW_) + "," + std::to_string(contRectH_) +
+                ") open=" + (containerOpen_?"1":"0") + " valid=" + (contRectValid_?"1":"0") + " inside=" + (inside?"1":"0"));
+        if (containerOpen_ && inside) {
+            winContainer_[nm] = true; containerDockInit_ = true; saveContainerState();
+            pushLog("Panel enviado al Contenedor: " + nm);
+        }
     }
 }
 
