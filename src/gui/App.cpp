@@ -1696,16 +1696,19 @@ void App::drawAttachWindow() {
 // ---------------------------------------------------------------------------
 // Ventana CPU compuesta estilo OllyDbg: desensamblado + registros (arriba) y
 // volcado hex + pila (abajo), todo en una sola ventana con 4 sub-regiones.
-// Splitter arrastrable (patron oficial de ImGui): ajusta dos tamanos adyacentes.
-static bool CpuSplitter(const char* id, bool vertical, float thickness, float* a, float* b, float minA, float minB, float longAxis) {
-    ImGuiWindow* window = ImGui::GetCurrentWindow();
-    ImGuiID gid = window->GetID(id);
-    ImVec2 cur = window->DC.CursorPos;
-    ImRect bb;
-    bb.Min = ImVec2(cur.x + (vertical ? *a : 0.0f), cur.y + (vertical ? 0.0f : *a));
-    ImVec2 sz = ImGui::CalcItemSize(vertical ? ImVec2(thickness, longAxis) : ImVec2(longAxis, thickness), 0, 0);
-    bb.Max = ImVec2(bb.Min.x + sz.x, bb.Min.y + sz.y);
-    return ImGui::SplitterBehavior(bb, gid, vertical ? ImGuiAxis_X : ImGuiAxis_Y, a, b, minA, minB, 1.0f);
+// Separador arrastrable: un boton invisible fino entre dos regiones, dibujado como linea.
+// vertical=true -> ajusta anchos (arrastre horizontal); false -> ajusta alturas (vertical).
+static bool cpuDivider(const char* id, bool vertical, float thickness, float lengthAxis, float* delta) {
+    ImVec2 size = vertical ? ImVec2(thickness, lengthAxis) : ImVec2(lengthAxis, thickness);
+    ImGui::InvisibleButton(id, size);
+    bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemHovered() || active)
+        ImGui::SetMouseCursor(vertical ? ImGuiMouseCursor_ResizeEW : ImGuiMouseCursor_ResizeNS);
+    *delta = active ? (vertical ? ImGui::GetIO().MouseDelta.x : ImGui::GetIO().MouseDelta.y) : 0.0f;
+    ImVec2 rmin = ImGui::GetItemRectMin(), rmax = ImGui::GetItemRectMax();
+    ImU32 col = ImGui::GetColorU32((ImGui::IsItemHovered() || active) ? ImGuiCol_SeparatorActive : ImGuiCol_Separator);
+    ImGui::GetWindowDrawList()->AddRectFilled(rmin, rmax, col);
+    return active;
 }
 
 void App::drawCpuPanel() {
@@ -1716,44 +1719,50 @@ void App::drawCpuPanel() {
       if (was && !winVisible_["CPU"]) saveVisibility(); }
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float sp = 6.0f;   // grosor del separador
-    const float minS = 50.0f;
-    // Inicializar / reajustar tamanos (px) a partir de las proporciones por defecto.
-    if (cpuTopH_ <= 0) { cpuTopH_ = avail.y * 0.58f; cpuBotH_ = avail.y - cpuTopH_ - sp; }
-    if (cpuDisasmW_ <= 0) { cpuDisasmW_ = avail.x * 0.62f; cpuRegsW_ = avail.x - cpuDisasmW_ - sp; }
-    if (cpuDumpW_ <= 0) { cpuDumpW_ = avail.x * 0.62f; cpuStackW_ = avail.x - cpuDumpW_ - sp; }
-    // Mantener sumas = espacio disponible (por si la ventana cambio de tamano).
-    cpuBotH_ = avail.y - cpuTopH_ - sp; if (cpuBotH_ < minS) { cpuBotH_ = minS; cpuTopH_ = avail.y - cpuBotH_ - sp; }
-    cpuRegsW_ = avail.x - cpuDisasmW_ - sp; if (cpuRegsW_ < minS) { cpuRegsW_ = minS; cpuDisasmW_ = avail.x - cpuRegsW_ - sp; }
-    cpuStackW_ = avail.x - cpuDumpW_ - sp; if (cpuStackW_ < minS) { cpuStackW_ = minS; cpuDumpW_ = avail.x - cpuStackW_ - sp; }
+    const float sp = 6.0f;    // grosor del separador
+    const float minS = 40.0f;
+    auto clampf = [](float& v, float lo, float hi){ if (v<lo) v=lo; if (v>hi) v=hi; };
+    if (cpuTopH_    <= 0) cpuTopH_    = avail.y * 0.58f;
+    if (cpuDisasmW_ <= 0) cpuDisasmW_ = avail.x * 0.62f;
+    if (cpuDumpW_   <= 0) cpuDumpW_   = avail.x * 0.62f;
+    clampf(cpuTopH_,    minS, avail.y - minS - sp);
+    clampf(cpuDisasmW_, minS, avail.x - minS - sp);
+    clampf(cpuDumpW_,   minS, avail.x - minS - sp);
 
-    // ---- Fila superior: desensamblado | pila de registros ----
+    float d;
+    // ---- Fila superior: desensamblado | registros ----
     ImGui::BeginChild("cpu_top", ImVec2(0, cpuTopH_), false);
-    ImGui::BeginChild("cpu_disasm", ImVec2(cpuDisasmW_, 0), true);
-    drawCpuContent();
-    ImGui::EndChild();
-    ImGui::SameLine(0, 0);
-    CpuSplitter("##vsplit_top", true, sp, &cpuDisasmW_, &cpuRegsW_, minS, minS, cpuTopH_);
-    ImGui::SameLine(0, 0);
-    ImGui::BeginChild("cpu_regs", ImVec2(0, 0), true);
-    drawRegistersContent();
-    ImGui::EndChild();
+    {
+        float rowH = ImGui::GetContentRegionAvail().y;
+        ImGui::BeginChild("cpu_disasm", ImVec2(cpuDisasmW_, rowH), true);
+        drawCpuContent();
+        ImGui::EndChild();
+        ImGui::SameLine(0, 0);
+        cpuDivider("##vsplit_top", true, sp, rowH, &d); cpuDisasmW_ += d;
+        ImGui::SameLine(0, 0);
+        ImGui::BeginChild("cpu_regs", ImVec2(0, rowH), true);
+        drawRegistersContent();
+        ImGui::EndChild();
+    }
     ImGui::EndChild();
 
     // ---- Separador horizontal entre filas ----
-    CpuSplitter("##hsplit", false, sp, &cpuTopH_, &cpuBotH_, minS, minS, avail.x);
+    cpuDivider("##hsplit", false, sp, avail.x, &d); cpuTopH_ += d;
 
     // ---- Fila inferior: volcado hex | pila ----
     ImGui::BeginChild("cpu_bot", ImVec2(0, 0), false);
-    ImGui::BeginChild("cpu_dump", ImVec2(cpuDumpW_, 0), true);
-    drawHexDumpContent();
-    ImGui::EndChild();
-    ImGui::SameLine(0, 0);
-    CpuSplitter("##vsplit_bot", true, sp, &cpuDumpW_, &cpuStackW_, minS, minS, ImGui::GetContentRegionAvail().y);
-    ImGui::SameLine(0, 0);
-    ImGui::BeginChild("cpu_stack", ImVec2(0, 0), true);
-    drawStackContent();
-    ImGui::EndChild();
+    {
+        float rowH = ImGui::GetContentRegionAvail().y;
+        ImGui::BeginChild("cpu_dump", ImVec2(cpuDumpW_, rowH), true);
+        drawHexDumpContent();
+        ImGui::EndChild();
+        ImGui::SameLine(0, 0);
+        cpuDivider("##vsplit_bot", true, sp, rowH, &d); cpuDumpW_ += d;
+        ImGui::SameLine(0, 0);
+        ImGui::BeginChild("cpu_stack", ImVec2(0, rowH), true);
+        drawStackContent();
+        ImGui::EndChild();
+    }
     ImGui::EndChild();
 
     ImGui::End();
