@@ -446,6 +446,35 @@ void App::switchToChild(uint32_t pid) {
 
 // Run to cursor: pone un breakpoint temporal en 'va' y continua. Al pausar en esa
 // direccion (ver render()), el breakpoint se retira automaticamente.
+// Skip: avanza el puntero de instruccion a la siguiente instruccion SIN ejecutar la actual.
+void App::skipInstruction() {
+    if (dbgState_ != DbgState::Paused) { pushLog("Skip: el proceso debe estar pausado."); return; }
+    uint8_t buf[16] = {0};
+    size_t got = debugger_.readMemory(currentIp_, buf, sizeof(buf));
+    dis_.setMode(debugger_.is64());
+    auto v = dis_.disassemble(buf, got, currentIp_, 1);
+    uint32_t len = v.empty() ? 1 : v[0].length;
+    debugger_.setRegister(debugger_.is64() ? "rip" : "eip", currentIp_ + len);
+    pushLog("Skip: RIP avanzado a 0x" + hex64(currentIp_ + len));
+    refreshLiveDisassembly(currentIp_ + len);
+}
+// Undo: restaura los registros que habia antes del ultimo paso (no revierte memoria).
+void App::undoInstruction() {
+    if (dbgState_ != DbgState::Paused) return;
+    if (!haveRegsBefore_) { pushLog("Undo: no hay estado previo guardado."); return; }
+    Registers r = regsBeforeStep_;
+    auto set = [&](const char* n, uint64_t val){ debugger_.setRegister(n, val); };
+    if (r.is64) { set("rax",r.rax);set("rbx",r.rbx);set("rcx",r.rcx);set("rdx",r.rdx);set("rsi",r.rsi);set("rdi",r.rdi);
+                  set("rbp",r.rbp);set("rsp",r.rsp);set("rip",r.rip);set("r8",r.r8);set("r9",r.r9);set("r10",r.r10);
+                  set("r11",r.r11);set("r12",r.r12);set("r13",r.r13);set("r14",r.r14);set("r15",r.r15); }
+    else { set("eax",r.rax);set("ebx",r.rbx);set("ecx",r.rcx);set("edx",r.rdx);set("esi",r.rsi);set("edi",r.rdi);
+           set("ebp",r.rbp);set("esp",r.rsp);set("eip",r.rip); }
+    set("eflags", r.eflags);
+    haveRegsBefore_ = false;
+    pushLog("Undo: registros restaurados a 0x" + hex64(r.rip) + " (no revierte memoria).");
+    refreshLiveDisassembly(r.rip);
+}
+
 // Run until expression: arranca el bucle de single-step condicional.
 void App::startRunUntil(const std::string& expr, int mode, int maxSteps) {
     if (dbgState_ != DbgState::Paused) { pushLog("Run until: el proceso debe estar pausado."); return; }
@@ -851,6 +880,7 @@ void App::render() {
     if (s != dbgState_) {
         dbgState_ = s;
         if (s == DbgState::Paused) {
+            if (dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused) { regsBeforeStep_ = regs_; haveRegsBefore_ = true; }  // para Undo
             regs_ = debugger_.registers();
             currentIp_ = regs_.ip();
             curModule_ = moduleNameAt(currentIp_);
@@ -871,6 +901,15 @@ void App::render() {
     }
 
     drainMcpQueue();
+
+    // Animate (step animado): mientras esté activo y pausado, da un paso cada ~15 frames.
+    if (animateActive_) {
+        if (dbgState_ == DbgState::Paused) {
+            if (++animateFrame_ >= 15) { animateFrame_ = 0; if (animateMode_ == 1) debugger_.stepOver(); else debugger_.stepInto(); }
+        } else if (dbgState_ == DbgState::Exited || dbgState_ == DbgState::Idle) {
+            animateActive_ = false;
+        }
+    }
 
     // Conmutacion a proceso hijo: cuando el detach del actual termina (Idle), adjunta el hijo.
     if (pendingSwitchPid_ && debugger_.state() == DbgState::Idle) {
@@ -1253,6 +1292,12 @@ void App::drawMenuBar() {
             }
             if (ImGui::MenuItem("Detener", nullptr, false, dbgState_ != DbgState::Idle)) debugger_.stop();
             ImGui::Separator();
+            bool paused = (dbgState_ == DbgState::Paused);
+            if (ImGui::MenuItem("Saltar instruccion (skip)", nullptr, false, paused)) skipInstruction();
+            if (ImGui::MenuItem("Deshacer paso (undo)", nullptr, false, paused && haveRegsBefore_)) undoInstruction();
+            if (ImGui::MenuItem("Animar (step into)", nullptr, animateActive_, paused || animateActive_)) { animateMode_=0; animateActive_ = !animateActive_; }
+            if (ImGui::MenuItem("Animar (step over)", nullptr, animateActive_ && animateMode_==1, paused || animateActive_)) { animateMode_=1; animateActive_ = !animateActive_; }
+            ImGui::Separator();
             bool follow = debugger_.followChildren();
             if (ImGui::MenuItem("Seguir procesos hijos", nullptr, follow, dbgState_ == DbgState::Idle))
                 debugger_.setFollowChildren(!follow);
@@ -1391,6 +1436,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Operaciones de memoria (solo por MCP, requieren pausa): mem_alloc, mem_free, mem_fill, mem_copy, mem_save, page_protect.");
             ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
             ImGui::BulletText("Run until expression (MCP run_until {expr, over, max}): single-step hasta que una expresion sea cierta (p.ej. 'eax == 0' o 'dword(esp) > 0x400000'). Requiere pausado.");
+            ImGui::BulletText("Depurar -> Saltar/Deshacer/Animar (paridad x64dbg): Skip avanza RIP sin ejecutar; Undo restaura los registros del ultimo paso (no memoria); Animar da pasos periodicos. Por MCP: skip_instruction, undo_instruction, animate.");
             ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin. Packers muestra firmas y heuristicas.");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
             ImGui::Separator();
@@ -4329,6 +4375,7 @@ static int mcpRequiredAccess(const std::string& cmd) {
         cmd == "add_exc_bp" || cmd == "rm_exc_bp" || cmd == "set_event_breaks" ||
         cmd == "set_bookmark" || cmd == "del_bookmark" || cmd == "clear_analysis" ||
         cmd == "set_follow_children" || cmd == "switch_to_child" || cmd == "run_to" || cmd == "run_until" ||
+        cmd == "skip_instruction" || cmd == "undo_instruction" || cmd == "animate" ||
         cmd == "find_oep" || cmd == "run_trace") return 1;
     return 0;
 }
@@ -4825,6 +4872,14 @@ std::string App::handleMcpCommand(const std::string& line) {
         startRunUntil(a.value("expr", ""), mode, (int)a.value("max", 100000));
         res["mode"] = mode ? "over" : "into";
     }
+    else if (cmd == "skip_instruction") { if (!need_paused()) goto done; skipInstruction(); }
+    else if (cmd == "undo_instruction") { if (!need_paused()) goto done; undoInstruction(); }
+    else if (cmd == "animate") {
+        if (!need_paused() && a.value("on", true)) goto done;
+        animateMode_ = a.value("over", false) ? 1 : 0;
+        animateActive_ = a.value("on", true);
+        res["active"] = animateActive_;
+    }
     else if (cmd == "mem_alloc") {
         if (!need_paused()) goto done;
         size_t size = (size_t)a.value("size", 4096);
@@ -5136,6 +5191,9 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("notes_set",   "Guarda notas. scope: 'global' o 'debuggee' (por binario).", obj({{"scope", STR}, {"text", STR}}, {"text"}));
     add("run_to",      "Ejecuta hasta una direccion (breakpoint temporal + continuar). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));
     add("run_until",   "Single-step hasta que una expresion sea != 0 (o se agote max). over=true usa step over. Requiere pausado.", obj({{"expr", STR}, {"over", njson{{"type","boolean"}}}, {"max", INT}}, {"expr"}));
+    add("skip_instruction", "Avanza RIP/EIP a la siguiente instruccion SIN ejecutar la actual. Requiere pausado.", obj(EMPTY, {}));
+    add("undo_instruction", "Restaura los registros previos al ultimo paso (no revierte memoria). Requiere pausado.", obj(EMPTY, {}));
+    add("animate",     "Step animado: da un paso periodicamente. on=true/false; over=true para step over.", obj({{"on", njson{{"type","boolean"}}}, {"over", njson{{"type","boolean"}}}}, {}));
     add("thread_ctrl", "Controla un hilo. action: suspend|resume|kill|priority|name; value=prioridad/exitcode; name=nombre.", obj({{"tid", INT}, {"action", STR}, {"value", INT}, {"name", STR}}, {"tid","action"}));
     add("mem_alloc",   "Reserva memoria en el proceso (VirtualAllocEx). size, protect (hex, def 0x40=RWX). Requiere pausado.", obj({{"size", INT}, {"protect", HEX}}, {}));
     add("mem_free",    "Libera memoria reservada (VirtualFreeEx). Requiere pausado.", obj({{"addr", HEX}}, {"addr"}));

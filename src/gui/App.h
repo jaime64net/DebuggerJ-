@@ -65,6 +65,14 @@ private:
     int           runUntilMax_ = 100000;
     void          startRunUntil(const std::string& expr, int mode, int maxSteps);
     void          tickRunUntil();            // llamado al pausar; hace el siguiente paso o para
+    // Animate (step animado), skip y undo (paridad x64dbg)
+    bool          animateActive_ = false;
+    int           animateMode_ = 0;          // 0 = into, 1 = over
+    int           animateFrame_ = 0;
+    void          skipInstruction();         // avanza RIP/EIP sin ejecutar la instruccion
+    void          undoInstruction();         // restaura los registros previos al ultimo paso
+    Registers     regsBeforeStep_;
+    bool          haveRegsBefore_ = false;
     bool saveSession(const std::wstring& path, std::string& error);
     bool loadSession(const std::wstring& path, std::string& error);
     std::string buildAnalysisReport();
