@@ -911,13 +911,6 @@ void App::render() {
 
     drainMcpQueue();
 
-    // DockSpace del main: permite anclar (dock) las ventanas dentro de la ventana
-    // principal. PassthruCentralNode deja el centro transparente para el fondo.
-    // Nodo central OPACO (sin PassthruCentralNode): el central transparente parpadea como
-    // recuadros con multi-viewport al dejar ver el fondo.
-    ImGuiID mainDock = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
-    if (dockNeedsInit_) { dockNeedsInit_ = false; buildDefaultDock(mainDock); }
-
     // Animate (step animado): mientras esté activo y pausado, da un paso cada ~15 frames.
     if (animateActive_) {
         if (dbgState_ == DbgState::Paused) {
@@ -941,7 +934,28 @@ void App::render() {
     }
 
     drawMenuBar();
-    drawToolbar();
+    drawToolbar();   // barra fija arriba (setea toolbarHeight_)
+
+    // DockSpace del main, DEBAJO de la toolbar (para no taparla): host window que ocupa el
+    // area de trabajo menos la altura de la toolbar. Aqui se anclan las ventanas del main.
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    float top = vp->WorkPos.y + toolbarHeight_;
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, top));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, vp->WorkSize.y - toolbarHeight_));
+    ImGui::SetNextWindowViewport(vp->ID);
+    ImGuiWindowFlags hostFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoDocking;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##DockHostMain", nullptr, hostFlags);
+    ImGui::PopStyleVar(3);
+    ImGuiID mainDock = ImGui::GetID("MainDockSpace");
+    ImGui::DockSpace(mainDock, ImVec2(0, 0), ImGuiDockNodeFlags_None);
+    ImGui::End();
+    if (dockNeedsInit_) { dockNeedsInit_ = false; buildDefaultDock(mainDock); }
+
     // Paneles gestionados: se dibujan en el main salvo los que el usuario envió al Contenedor.
     for (auto nm : managedWindows())
         if (showInMain(nm)) drawManagedPanel(nm);
@@ -1435,9 +1449,9 @@ void App::drawToolbar() {
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::Begin("##toolbar", nullptr, flags);
 
-    // PLAY: lanzar si no hay sesion; continuar si esta pausado.
+    // Botones compactos (SmallButton). PLAY: lanzar si no hay sesion; continuar si esta pausado.
     ImGui::BeginDisabled(active && !paused);
-    if (ImGui::Button(active ? "> Play" : "> Play (lanzar)", ImVec2(active ? 90 : 130, 30))) {
+    if (ImGui::SmallButton(active ? "Play" : "Play (lanzar)")) {
         if (!active) startDebugSession();
         else if (paused) debugger_.go();
     }
@@ -1446,29 +1460,29 @@ void App::drawToolbar() {
 
     ImGui::SameLine();
     ImGui::BeginDisabled(dbgState_ != DbgState::Running);
-    if (ImGui::Button("|| Pause", ImVec2(90, 30))) debugger_.pause();
+    if (ImGui::SmallButton("Pause")) debugger_.pause();
     ImGui::EndDisabled();
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!active);
-    if (ImGui::Button("[] Stop", ImVec2(80, 30))) debugger_.stop();
+    if (ImGui::SmallButton("Stop")) debugger_.stop();
     ImGui::EndDisabled();
 
     ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
 
     ImGui::BeginDisabled(!paused);
-    if (ImGui::Button("-> Step Into", ImVec2(110, 30))) debugger_.stepInto();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, entrando a los call (F7)");
+    if (ImGui::SmallButton("Into")) debugger_.stepInto();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Step Into: un paso, entrando a los call (F7)");
     ImGui::SameLine();
-    if (ImGui::Button(">> Step Over", ImVec2(110, 30))) debugger_.stepOver();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, saltando los call (F8)");
+    if (ImGui::SmallButton("Over")) debugger_.stepOver();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Step Over: un paso, saltando los call (F8)");
     ImGui::SameLine();
-    if (ImGui::Button("<- Step to Ret", ImVec2(120, 30))) debugger_.stepToRet();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ejecuta hasta el 'ret' de la funcion actual (Ctrl+F9)");
+    if (ImGui::SmallButton("Ret")) debugger_.stepToRet();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Step to Ret: ejecuta hasta el 'ret' de la funcion (Ctrl+F9)");
     ImGui::EndDisabled();
 
     ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
-    ImGui::SetNextItemWidth(260);
+    ImGui::SetNextItemWidth(240);
     ImGui::InputTextWithHint("##args", "argumentos de linea de comandos", launchArgs_, sizeof(launchArgs_));
 
     // Atajos de teclado
