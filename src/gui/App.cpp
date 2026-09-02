@@ -1442,9 +1442,9 @@ void App::drawToolbar() {
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::Begin("##toolbar", nullptr, flags);
 
-    // Botones compactos (SmallButton). PLAY: lanzar si no hay sesion; continuar si esta pausado.
+    // PLAY: lanzar si no hay sesion; continuar si esta pausado.
     ImGui::BeginDisabled(active && !paused);
-    if (ImGui::SmallButton(active ? "Play" : "Play (lanzar)")) {
+    if (ImGui::Button(active ? "> Play" : "> Play (lanzar)", ImVec2(active ? 90 : 130, 30))) {
         if (!active) startDebugSession();
         else if (paused) debugger_.go();
     }
@@ -1453,29 +1453,29 @@ void App::drawToolbar() {
 
     ImGui::SameLine();
     ImGui::BeginDisabled(dbgState_ != DbgState::Running);
-    if (ImGui::SmallButton("Pause")) debugger_.pause();
+    if (ImGui::Button("|| Pause", ImVec2(90, 30))) debugger_.pause();
     ImGui::EndDisabled();
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!active);
-    if (ImGui::SmallButton("Stop")) debugger_.stop();
+    if (ImGui::Button("[] Stop", ImVec2(80, 30))) debugger_.stop();
     ImGui::EndDisabled();
 
     ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
 
     ImGui::BeginDisabled(!paused);
-    if (ImGui::SmallButton("Into")) debugger_.stepInto();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Step Into: un paso, entrando a los call (F7)");
+    if (ImGui::Button("-> Step Into", ImVec2(110, 30))) debugger_.stepInto();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, entrando a los call (F7)");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Over")) debugger_.stepOver();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Step Over: un paso, saltando los call (F8)");
+    if (ImGui::Button(">> Step Over", ImVec2(110, 30))) debugger_.stepOver();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Un paso, saltando los call (F8)");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Ret")) debugger_.stepToRet();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Step to Ret: ejecuta hasta el 'ret' de la funcion (Ctrl+F9)");
+    if (ImGui::Button("<- Step to Ret", ImVec2(120, 30))) debugger_.stepToRet();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ejecuta hasta el 'ret' de la funcion actual (Ctrl+F9)");
     ImGui::EndDisabled();
 
     ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
-    ImGui::SetNextItemWidth(240);
+    ImGui::SetNextItemWidth(260);
     ImGui::InputTextWithHint("##args", "argumentos de linea de comandos", launchArgs_, sizeof(launchArgs_));
 
     // Atajos de teclado
