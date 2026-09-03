@@ -129,7 +129,7 @@ const TOOLS = [
   ["modules",     "Lista los modulos cargados.", S()],
   ["sections",    "Lista las secciones del PE (con entropia).", S()],
   ["imports",     "Lista los imports del PE.", S()],
-  ["packers",     "Escanea packers/protectores.", S()],
+  ["packers",     "Detector de packers/protectores estilo PEiD. Devuelve [{name, source, confidence 0..100}] combinando firma de bytes en el entrypoint (set embebido + signatures/userdb.txt, ?? comodin), nombres de seccion conocidos (UPX/.aspack/.vmp/.themida/.enigma/.MPRESS) y heuristicas (entropia global >7.2, pocos imports + alta entropia, codigo escribible = self-modifying). Estatico, no requiere ejecutar.", S()],
   ["search_hex",  "Busca un patron hex (ej '48 8B ?? C3') en el archivo.", S({ pattern: { type: "string" } }, ["pattern"])],
   ["find_oep",    "Busca el OEP (traza saltando calls). Requiere pausado.", S()],
   ["get_oep",     "Devuelve el OEP encontrado.", S()],

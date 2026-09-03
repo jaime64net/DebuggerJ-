@@ -1524,7 +1524,14 @@ void App::drawHelpWindow() {
             ImGui::BulletText("CPU -> clic derecho -> 'Ejecutar hasta aqui' (run to cursor): continua hasta la linea, con un breakpoint temporal que se retira solo. Por MCP: run_to.");
             ImGui::BulletText("Run until expression (MCP run_until {expr, over, max}): single-step hasta que una expresion sea cierta (p.ej. 'eax == 0' o 'dword(esp) > 0x400000'). Requiere pausado.");
             ImGui::BulletText("Depurar -> Saltar/Deshacer/Animar (paridad x64dbg): Skip avanza RIP sin ejecutar; Undo restaura los registros del ultimo paso (no memoria); Animar da pasos periodicos. Por MCP: skip_instruction, undo_instruction, animate.");
-            ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin. Packers muestra firmas y heuristicas.");
+            ImGui::BulletText("Strings y Busqueda: busca texto o hex con ?? como comodin.");
+            ImGui::BulletText("Packers / Proteccion (detector estilo PEiD): identifica el empacador/protector del PE combinando 3 fuentes -> "
+                              "(1) FIRMA EP: bytes del entrypoint contra un set embebido (UPX, ASPack, FSG, PECompact, MEW, Petite, tElock, "
+                              "Themida/WinLicense, Enigma, MPRESS) mas signatures/userdb.txt (formato PEiD: [Nombre] / signature = 60 BE ?? ?? / ep_only, con ?? = comodin); "
+                              "(2) NOMBRE DE SECCION conocido (UPX0/.aspack/.vmp/.themida/.enigma/.MPRESS/.pec...); "
+                              "(3) HEURISTICA: entropia global >7.2 (probable cifrado/empaquetado), pocos imports + seccion de alta entropia, "
+                              "seccion de codigo escribible (self-modifying / unpacker). Cada deteccion trae Origen y Confianza (0-100%); el panel muestra la entropia global y un boton Re-escanear. "
+                              "Para ampliar la base pega tu userdb.txt de PEiD en signatures/ (se carga al abrir el archivo). Por MCP: dbg_packers.");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Novedades (inspiradas en x64dbg)");
@@ -5591,7 +5598,7 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("sections",    "Lista las secciones del PE (con entropia).", obj(EMPTY, {}));
     add("imports",     "Lista los imports del PE.", obj(EMPTY, {}));
     add("exports",     "Lista los exports del PE.", obj(EMPTY, {}));
-    add("packers",     "Escanea packers/protectores.", obj(EMPTY, {}));
+    add("packers",     "Detector de packers/protectores estilo PEiD. Devuelve una lista de {name, source, confidence(0..100)} combinando 3 fuentes: firma de bytes en el entrypoint (set embebido + signatures/userdb.txt estilo PEiD, ?? = comodin), nombres de seccion conocidos (UPX/.aspack/.vmp/.themida/.enigma/.MPRESS...) y heuristicas (entropia global >7.2, pocos imports + seccion de alta entropia, seccion de codigo escribible = self-modifying). Trabaja sobre el PE estatico; no requiere ejecutar. Ej: UPX/ASPack/Themida/VMProtect/MPRESS/PECompact.", obj(EMPTY, {}));
     add("search_hex",  "Busca un patron hex (ej '48 8B ?? C3') en el archivo.", obj({{"pattern", STR}}, {"pattern"}));
     add("find_oep",    "Busca el OEP (traza saltando calls). Requiere pausado.", obj(EMPTY, {}));
     add("get_oep",     "Devuelve el OEP encontrado.", obj(EMPTY, {}));
