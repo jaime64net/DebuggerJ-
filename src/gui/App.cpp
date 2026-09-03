@@ -982,7 +982,7 @@ std::vector<const char*> App::managedWindows() {
         "CPU",
         "Breakpoints", "Memoria", "Strings & Busqueda", "Modulos & Simbolos",
         "Call stack", "Executable modules", "Referencias", "Analysis", "Run trace",
-        "Packers / Proteccion", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
+        "Packers / Proteccion", "PEiD", "Excepciones", "Plugins", "MCP Log", "Log", "IA", "Code",
         "Command", "Watch", "Struct", "CFG", "Compare", "Script", "Threads", "Notes", "System", "Entropy"
     };
 }
@@ -1532,6 +1532,11 @@ void App::drawHelpWindow() {
                               "(3) HEURISTICA: entropia global >7.2 (probable cifrado/empaquetado), pocos imports + seccion de alta entropia, "
                               "seccion de codigo escribible (self-modifying / unpacker). Cada deteccion trae Origen y Confianza (0-100%); el panel muestra la entropia global y un boton Re-escanear. "
                               "Para ampliar la base pega tu userdb.txt de PEiD en signatures/ (se carga al abrir el archivo). Por MCP: dbg_packers.");
+            ImGui::BulletText("PEiD (Window -> PEiD): analisis con Detect It Easy (DIE), el sucesor de codigo abierto de PEiD (GPLv3). "
+                              "Boton 'Analizar' -> ejecuta la consola 'diec' sobre el binario e identifica compilador, linker, packer, protector, "
+                              "instalador, .NET y librerias con la enorme base de firmas de DIE (mas rica que la deteccion nativa de Packers). "
+                              "diec.exe NO se distribuye con el debugger: descargalo de github.com/horsicq/Detect-It-Easy y copia diec.exe a "
+                              "'<carpeta del exe>\\die\\', ponlo en el PATH, o indica su ruta en el campo del panel. Por MCP: dbg_peid (opcional die_path).");
             ImGui::BulletText("Run trace registra ejecucion instruccion a instruccion; Call stack y Referencias ayudan a reconstruir el flujo. El boton 'Resumir con IA' envia una muestra de la traza al agente para que explique el flujo (bucles de descifrado, APIs tocadas).");
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Novedades (inspiradas en x64dbg)");
@@ -2797,6 +2802,84 @@ void App::drawPackerPanel() {
             }
             ImGui::EndTable();
         }
+    }
+    ImGui::End();
+}
+
+// --- PEiD (Detect It Easy) ---------------------------------------------------
+// Ejecuta la consola diec sobre el binario cargado y guarda las detecciones.
+void App::runPeidScan() {
+    peidScanned_ = true;
+    peidResult_ = DieResult{};
+    if (!fileLoaded_) { peidResult_.error = "No hay archivo cargado."; return; }
+
+    std::wstring override_;
+    if (diePathBuf_[0]) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, diePathBuf_, -1, nullptr, 0);
+        if (n > 0) { override_.resize(n - 1); MultiByteToWideChar(CP_UTF8, 0, diePathBuf_, -1, override_.data(), n); }
+    }
+    std::wstring exe = DieClient::locate(override_);
+    if (exe.empty()) {
+        peidResult_.error = "No se encontro diec.exe. Coloca Detect It Easy (GPLv3) en '" +
+                            exeSiblingDir() + "\\die\\diec.exe', ponlo en el PATH, o indica su ruta.";
+        pushLog("PEiD: diec.exe no encontrado.");
+        return;
+    }
+    peidResult_ = DieClient::analyze(exe, loadedPath_);
+    pushLog(std::string("PEiD: diec -> ") + (peidResult_.ok ?
+            (std::to_string(peidResult_.detects.size()) + " detecciones.") :
+            ("error: " + peidResult_.error)));
+}
+
+void App::drawPeidPanel() {
+    beginManaged("PEiD");
+    ImGui::TextDisabled("Detect It Easy (DIE) - identifica compilador / linker / packer / protector.");
+    ImGui::SetNextItemWidth(340);
+    ImGui::InputTextWithHint("##diepath", "ruta a diec.exe (vacio = auto: <exe>\\die\\ o PATH)",
+                             diePathBuf_, sizeof(diePathBuf_));
+    ImGui::SameLine();
+    if (!fileLoaded_) ImGui::BeginDisabled();
+    if (ImGui::Button("Analizar")) runPeidScan();
+    if (!fileLoaded_) ImGui::EndDisabled();
+
+    if (!fileLoaded_) { ImGui::TextDisabled("Abre un archivo para analizar."); ImGui::End(); return; }
+    ImGui::Separator();
+
+    if (!peidScanned_) {
+        ImGui::TextDisabled("Pulsa Analizar para ejecutar DIE sobre el binario cargado.");
+        ImGui::End(); return;
+    }
+    if (!peidResult_.ok) {
+        ImGui::TextColored(ImVec4(1,0.5f,0.5f,1), "DIE no disponible o error.");
+        ImGui::TextWrapped("%s", peidResult_.error.c_str());
+        ImGui::TextDisabled("Descarga: github.com/horsicq/Detect-It-Easy (GPLv3). Copia diec.exe a '%s\\die\\'.",
+                            exeSiblingDir().c_str());
+        ImGui::End(); return;
+    }
+
+    ImGui::Text("diec: %s", peidResult_.dieExe.c_str());
+    if (!peidResult_.filetype.empty()) { ImGui::SameLine(); ImGui::TextDisabled("| tipo: %s", peidResult_.filetype.c_str()); }
+
+    if (peidResult_.detects.empty()) {
+        ImGui::TextColored(ImVec4(0.6f,1,0.6f,1), "DIE no reporto detecciones.");
+    } else if (ImGui::BeginTable("die", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                                          ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(0, 260))) {
+        ImGui::TableSetupColumn("Tipo",    ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Nombre",  ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Detalle", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (auto& d : peidResult_.detects) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            bool prot = (d.type == "Packer" || d.type == "Protector");
+            ImVec4 c = prot ? ImVec4(1,0.55f,0.4f,1) : ImVec4(0.7f,0.85f,1,1);
+            ImGui::TextColored(c, "%s", d.type.c_str());
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(d.name.c_str());
+            ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", d.version.c_str());
+            ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", d.options.empty() ? d.string.c_str() : d.options.c_str());
+        }
+        ImGui::EndTable();
     }
     ImGui::End();
 }
@@ -4514,7 +4597,7 @@ void App::buildDefaultDock(unsigned int dockspaceId) {
     for (const char* w : { "Log", "MCP Log", "Run trace", "Analysis", "Referencias" })
         ImGui::DockBuilderDockWindow(w, down);
     for (const char* w : { "Breakpoints", "Memoria", "Modulos & Simbolos", "Strings & Busqueda",
-                           "Call stack", "Executable modules", "Packers / Proteccion", "Excepciones",
+                           "Call stack", "Executable modules", "Packers / Proteccion", "PEiD", "Excepciones",
                            "Plugins", "IA", "Code", "Command", "Watch", "Struct", "CFG", "Compare",
                            "Script", "Threads", "Notes", "System", "Entropy" })
         ImGui::DockBuilderDockWindow(w, right);
@@ -4539,6 +4622,7 @@ void App::drawManagedPanel(const char* name) {
     else if (n=="Strings & Busqueda") drawStringsPanel();
     else if (n=="Modulos & Simbolos") drawModulesPanel();
     else if (n=="Packers / Proteccion") drawPackerPanel();
+    else if (n=="PEiD") drawPeidPanel();
     else if (n=="Excepciones") drawExceptionsPanel();
     else if (n=="Call stack") drawCallStackPanel();
     else if (n=="Threads") drawThreadsPanel();
@@ -5203,6 +5287,19 @@ std::string App::handleMcpCommand(const std::string& line) {
     else if (cmd == "sections") { for (auto& s : pe_.sections()) res["sections"].push_back({{"name",s.name},{"rva",s.virtualAddress},{"vsize",s.virtualSize},{"entropy",s.entropy},{"exec",s.executable()},{"write",s.writable()}}); }
     else if (cmd == "imports") { for (auto& im : pe_.imports()) res["imports"].push_back({{"dll",im.dll},{"name",im.name},{"ordinal",im.ordinal}}); }
     else if (cmd == "packers") { runPackerScan(); for (auto& m : packerMatches_) res["packers"].push_back({{"name",m.name},{"source",m.source},{"confidence",m.confidence}}); }
+    else if (cmd == "peid") {
+        if (a.contains("die_path") && a["die_path"].is_string()) {
+            std::string p = a["die_path"].get<std::string>();
+            std::snprintf(diePathBuf_, sizeof(diePathBuf_), "%s", p.c_str());
+        }
+        runPeidScan();
+        res["ok"] = peidResult_.ok;
+        res["diec"] = peidResult_.dieExe;
+        res["filetype"] = peidResult_.filetype;
+        if (!peidResult_.ok) res["error"] = peidResult_.error;
+        for (auto& d : peidResult_.detects)
+            res["detects"].push_back({{"type",d.type},{"name",d.name},{"version",d.version},{"options",d.options},{"string",d.string}});
+    }
     else if (cmd == "search_hex") {
         std::string perr; const uint8_t* data=nullptr; size_t len=0; uint64_t base=0;
         if (fileLoaded_) { data=pe_.raw().data(); len=pe_.raw().size(); base=pe_.imageBase(); }
@@ -5599,6 +5696,7 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("imports",     "Lista los imports del PE.", obj(EMPTY, {}));
     add("exports",     "Lista los exports del PE.", obj(EMPTY, {}));
     add("packers",     "Detector de packers/protectores estilo PEiD. Devuelve una lista de {name, source, confidence(0..100)} combinando 3 fuentes: firma de bytes en el entrypoint (set embebido + signatures/userdb.txt estilo PEiD, ?? = comodin), nombres de seccion conocidos (UPX/.aspack/.vmp/.themida/.enigma/.MPRESS...) y heuristicas (entropia global >7.2, pocos imports + seccion de alta entropia, seccion de codigo escribible = self-modifying). Trabaja sobre el PE estatico; no requiere ejecutar. Ej: UPX/ASPack/Themida/VMProtect/MPRESS/PECompact.", obj(EMPTY, {}));
+    add("peid",        "Analisis PEiD con Detect It Easy (DIE). Ejecuta la consola 'diec' sobre el binario cargado y devuelve {ok, diec, filetype, detects:[{type,name,version,options,string}]} identificando compilador/linker/packer/protector/instalador/.NET con la base de firmas de DIE. Complementa dbg_packers. Opcional die_path=ruta a diec.exe (si no, busca <exe>\\die\\diec.exe o el PATH). DIE es GPLv3 y NO se distribuye con el debugger.", obj({{"die_path", STR}}, {}));
     add("search_hex",  "Busca un patron hex (ej '48 8B ?? C3') en el archivo.", obj({{"pattern", STR}}, {"pattern"}));
     add("find_oep",    "Busca el OEP (traza saltando calls). Requiere pausado.", obj(EMPTY, {}));
     add("get_oep",     "Devuelve el OEP encontrado.", obj(EMPTY, {}));
@@ -5995,7 +6093,7 @@ void App::sendCodeRequest() {
             auto tools = aiToolDefs();
             const std::vector<std::string> allowed = {
                 "dbg_status", "dbg_plugin_list", "dbg_plugin_sdk", "dbg_get_regs", "dbg_read_mem", "dbg_disasm", "dbg_stack",
-                "dbg_modules", "dbg_sections", "dbg_imports", "dbg_exports", "dbg_packers",
+                "dbg_modules", "dbg_sections", "dbg_imports", "dbg_exports", "dbg_packers", "dbg_peid",
                 "dbg_search_hex", "dbg_get_oep", "dbg_symbol", "dbg_source", "dbg_call_stack", "dbg_tls",
                 "dbg_seh", "dbg_mem_map", "dbg_list_annotations", "dbg_find_refs", "dbg_get_trace",
                 "dbg_list_functions", "dbg_list_xrefs", "dbg_list_loops", "dbg_list_bookmarks"

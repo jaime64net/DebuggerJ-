@@ -130,6 +130,7 @@ const TOOLS = [
   ["sections",    "Lista las secciones del PE (con entropia).", S()],
   ["imports",     "Lista los imports del PE.", S()],
   ["packers",     "Detector de packers/protectores estilo PEiD. Devuelve [{name, source, confidence 0..100}] combinando firma de bytes en el entrypoint (set embebido + signatures/userdb.txt, ?? comodin), nombres de seccion conocidos (UPX/.aspack/.vmp/.themida/.enigma/.MPRESS) y heuristicas (entropia global >7.2, pocos imports + alta entropia, codigo escribible = self-modifying). Estatico, no requiere ejecutar.", S()],
+  ["peid",        "Analisis PEiD con Detect It Easy (DIE). Ejecuta 'diec' sobre el binario cargado y devuelve {ok, diec, filetype, detects:[{type,name,version,options,string}]} (compilador/linker/packer/protector/instalador/.NET). Complementa dbg_packers. Opcional die_path=ruta a diec.exe (default: <exe>\\die\\diec.exe o PATH). DIE es GPLv3 y no se distribuye con el debugger.", S({ die_path: { type: "string" } })],
   ["search_hex",  "Busca un patron hex (ej '48 8B ?? C3') en el archivo.", S({ pattern: { type: "string" } }, ["pattern"])],
   ["find_oep",    "Busca el OEP (traza saltando calls). Requiere pausado.", S()],
   ["get_oep",     "Devuelve el OEP encontrado.", S()],

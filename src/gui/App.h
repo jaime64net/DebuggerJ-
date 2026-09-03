@@ -12,6 +12,7 @@
 #include "core/Disassembler.h"
 #include "core/Debugger.h"
 #include "core/PackerDetect.h"
+#include "core/DieClient.h"
 #include "core/StringScan.h"
 #include "core/Unpack.h"
 #include "core/ExprEval.h"
@@ -317,6 +318,13 @@ private:
     PackerDetect  packer_;
     std::vector<PackerMatch> packerMatches_;
     bool          packerLoaded_ = false;
+
+    // --- PEiD (Detect It Easy) ---
+    void          runPeidScan();       // ejecuta diec sobre el binario cargado
+    void          drawPeidPanel();     // ventana "PEiD"
+    DieResult     peidResult_;
+    bool          peidScanned_ = false;
+    char          diePathBuf_[512] = {0}; // ruta override a diec.exe (vacio = auto)
 
     // --- Strings / hex ---
     std::vector<FoundString> strings_;
