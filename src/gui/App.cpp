@@ -886,17 +886,25 @@ void App::exportReportDialog() {
 // Render principal
 // ---------------------------------------------------------------------------
 void App::render() {
-    // Sincronizar estado del debugger (polling: evita tocar ImGui desde otro hilo)
+    // Sincronizar estado del debugger (polling: evita tocar ImGui desde otro hilo).
+    // Ademas de la transicion de estado, detectamos que el RIP cambio estando
+    // pausados: al trazar por MCP (dbg_step_*) el proceso va Paused->Paused muy
+    // rapido y el poller no siempre ve el flanco Running->Paused; sin esto la
+    // ventana CPU no seguiria al agente. La sync por-RIP es ligera (el mapa de
+    // memoria pesado solo se refresca en una transicion de estado real).
     DbgState s = debugger_.state();
-    if (s != dbgState_) {
-        dbgState_ = s;
-        if (s == DbgState::Paused) {
-            if (dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused) { regsBeforeStep_ = regs_; haveRegsBefore_ = true; }  // para Undo
-            regs_ = debugger_.registers();
+    const bool stateChanged = (s != dbgState_);
+    dbgState_ = s;
+    if (s == DbgState::Paused) {
+        Registers live = debugger_.registers();
+        const bool ipChanged = (live.ip() != 0 && live.ip() != currentIp_);
+        if (stateChanged || ipChanged) {
+            regsBeforeStep_ = regs_; haveRegsBefore_ = true;   // para Undo
+            regs_ = live;
             currentIp_ = regs_.ip();
             curModule_ = moduleNameAt(currentIp_);
             refreshLiveDisassembly(currentIp_);
-            memMap_ = debugger_.memoryMap();
+            if (stateChanged) memMap_ = debugger_.memoryMap();
             if (debugger_.foundOEP()) pluginOEP_ = debugger_.foundOEP();
             refreshWatches();
             // Run to cursor: si pausamos en un BP temporal, retirarlo.
@@ -904,7 +912,7 @@ void App::render() {
             if (runUntilActive_) tickRunUntil();   // Obj E: run until expression
             runBreakpointAction(currentIp_);   // M3: accion al golpear un BP
             // Re-aplicar anti-anti-debug si esta activado (el malware puede re-chequear)
-            if (antiReapply_ && antiActive_) {
+            if (stateChanged && antiReapply_ && antiActive_) {
                 std::string lg;
                 applyAntiAntiDebug(debugger_, debugger_.is64(), antiOpt_, lg);
             }
@@ -1600,6 +1608,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Menu contextual -> 'Analyze / AI as C++': manda las lineas seleccionadas a la IA y muestra el pseudocodigo C++ en la ventana Code.");
             ImGui::BulletText("Archivo -> Guardar/Cargar sesion conserva el objetivo, argumentos, anotaciones y breakpoints; las direcciones de la imagen principal se guardan como RVA. Los memory breakpoints no se guardan: dependen de paginas validas de la ejecucion actual.");
             ImGui::BulletText("Archivo -> Exportar informe Markdown genera un resumen reproducible de PE, secciones, detecciones, estado y breakpoints. Por MCP, report devuelve el texto y export_report lo guarda en una ruta indicada.");
+            ImGui::BulletText("Protecciones y sospecha de inyeccion: una seccion protegida, un OEP restaurado o un hijo .bin no prueban malware. Documenta hashes, firmas, ruta, padre/hijo, modulos y regiones MEM_PRIVATE ejecutables. Consulta docs/FORENSIC_PROTECTION_MODEL.md.");
             ImGui::TextDisabled("Las anotaciones se guardan en la cache de analisis. Consulta MCP y Plugins para automatizacion y extensiones.");
             ImGui::EndTabItem();
         }
@@ -3111,7 +3120,8 @@ void App::drawPeidPanel() {
         for (auto& d : peidResult_.detects) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            bool prot = (d.type == "Packer" || d.type == "Protector");
+            std::string tl = d.type; std::transform(tl.begin(), tl.end(), tl.begin(), ::tolower);
+            bool prot = (tl == "packer" || tl == "protector" || tl == "sfx" || tl == "installer");
             ImVec4 c = prot ? ImVec4(1,0.55f,0.4f,1) : ImVec4(0.7f,0.85f,1,1);
             ImGui::TextColored(c, "%s", d.type.c_str());
             ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(d.name.c_str());
