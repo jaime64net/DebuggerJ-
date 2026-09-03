@@ -75,6 +75,22 @@ size_t PeFile::readAtRva(uint32_t rva, uint8_t* out, size_t len) const {
     return n;
 }
 
+size_t PeFile::writeAtRva(uint32_t rva, const uint8_t* in, size_t len) {
+    uint32_t off = 0;
+    if (!rvaToOffset(rva, off)) return 0;
+    size_t avail = raw_.size() > off ? raw_.size() - off : 0;
+    size_t n = len < avail ? len : avail;
+    std::memcpy(raw_.data() + off, in, n);
+    return n;
+}
+
+bool PeFile::writeRawToFile(const std::wstring& path) const {
+    std::ofstream f(path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    if (!raw_.empty()) f.write(reinterpret_cast<const char*>(raw_.data()), (std::streamsize)raw_.size());
+    return (bool)f;
+}
+
 template <typename T>
 static const T* at(const std::vector<uint8_t>& b, size_t off) {
     if (off + sizeof(T) > b.size()) return nullptr;

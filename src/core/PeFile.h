@@ -59,6 +59,12 @@ public:
     bool rvaToOffset(uint32_t rva, uint32_t& offset) const;
     // Copia hasta 'len' bytes a partir de una RVA. Devuelve cuantos copio.
     size_t readAtRva(uint32_t rva, uint8_t* out, size_t len) const;
+    // Escribe hasta 'len' bytes a partir de una RVA en la imagen en memoria (raw_).
+    // Devuelve cuantos escribio. Sirve para parches estaticos que se reflejan en el
+    // desensamblado y se pueden volcar a un .exe con writeRawToFile().
+    size_t writeAtRva(uint32_t rva, const uint8_t* in, size_t len);
+    // Vuelca la imagen en memoria (con los parches aplicados) a un archivo.
+    bool   writeRawToFile(const std::wstring& path) const;
 
     // Entropia global del archivo (heuristica de empaquetado).
     double overallEntropy() const { return overallEntropy_; }

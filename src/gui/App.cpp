@@ -195,6 +195,8 @@ void App::openFile(const std::wstring& path) {
     liveView_ = false;
     packerLoaded_ = false;
     packerMatches_.clear();
+    patches_.clear();
+    peidScanned_ = false; peidResult_ = DieResult{};
     comments_.clear(); labels_.clear(); refs_.clear(); bookmarks_.clear();
     analyzedFunctions_.clear(); analysisXrefs_.clear(); analysisLoops_.clear();
     analysisCacheLoaded_ = false;
@@ -967,6 +969,7 @@ void App::render() {
     if (showSkillBrowser_)               drawSkillBrowser();
     if (showSkillManage_)                drawSkillManage();
     if (showHelp_)                       drawHelpWindow();
+    drawPatchWindow();
     if (showAttach_)                     drawAttachWindow();
 
     drawAddCustomPopup();
@@ -1513,6 +1516,15 @@ void App::drawHelpWindow() {
             ImGui::BulletText("F5 lanza o continua; F8 entra en calls (step into); F10 los salta (step over); F11 ejecuta hasta ret; Pause detiene una sesion activa.");
             ImGui::BulletText("Depurar -> Adjuntar a PID permite analizar un proceso existente. 'Desadjuntar' lo deja ejecutando sin DebuggerJ++; Detener finaliza la sesion. Requiere permisos suficientes y se recomienda usarlo solo en la VM de analisis.");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
+            ImGui::BulletText("Editar instrucciones y parches (estilo x64dbg): DOBLE CLIC en una instruccion de la CPU la ensambla/edita in situ "
+                              "(precargada; si la nueva es mas corta se rellena con NOP). Clic derecho -> 'Patch bytes (hex)', 'NOP instruccion', "
+                              "'Fill with NOPs (seleccion)', o el submenu 'Binary' con Binary copy (copia los bytes de la seleccion como hex) y "
+                              "Binary paste (pega hex sobre la direccion). Funciona en un proceso pausado (parcha memoria) y sobre un archivo "
+                              "estatico recien abierto (parcha la imagen). Seguir un salto: clic derecho -> 'Jump To'.");
+            ImGui::BulletText("Write to exe file: clic derecho -> 'Write to exe file...' abre la ventana 'Patches' con TODOS los cambios "
+                              "(direccion, offset en el archivo, byte original vs nuevo), permite revertir uno o todos, y 'Write to exe file...' "
+                              "guarda una copia del ejecutable con los bytes modificados aplicados por offset. Por MCP: dbg_patch_list, "
+                              "dbg_patch_revert, dbg_write_patched (ademas de dbg_assemble/dbg_patch/dbg_nop que ahora registran cada cambio).");
             ImGui::TextUnformatted("Paneles de analisis");
             ImGui::BulletText("Modulos & Simbolos: doble clic en una DLL o archivo para ver su desensamblado; consulta TLS, SEH, imports y exports.");
             ImGui::BulletText("Call stack usa StackWalk64/DbgHelp. Si Windows puede localizar un PDB, muestra simbolos y archivo:linea; de otro modo conserva las direcciones disponibles.");
@@ -1609,7 +1621,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Estado: get_regs, read_mem, search_hex, packers, tls, seh, run_trace y get_trace.");
             ImGui::BulletText("Expresiones: eval evalua una expresion (hex por defecto; byte/dword/ptr(a), registros, mod.base/fromname, dis.len, [mem]). Solo lectura.");
             ImGui::BulletText("Simbolos: symsrv configura la ruta del symbol server (requiere nivel Modificacion). Ej path 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols'.");
-            ImGui::BulletText("Modificacion: set_reg, write_mem, assemble, patch, nop, dump, anti-debug, sesiones y plugins. Requieren el nivel Modificacion.");
+            ImGui::BulletText("Modificacion: set_reg, write_mem, assemble, patch, nop, patch_revert, write_patched, dump, anti-debug, sesiones y plugins. Requieren el nivel Modificacion. patch_list es de solo lectura.");
             ImGui::BulletText("Plugins: plugin_list, plugin_reload y plugin_run; las acciones DLL se publican como tools dinamicas dbg_plugin_<plugin>_<accion>.");
             ImGui::TextDisabled("Los nombres reales enviados por MCP llevan el prefijo dbg_. El log MCP muestra solicitudes y respuestas; no comparte el token.");
             ImGui::EndTabItem();
@@ -1851,7 +1863,13 @@ void App::drawCpuContent() {
                         ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
                     if (ImGui::GetIO().KeyShift && selAnchor_ >= 0) selectedInsn_ = i;   // extiende rango
                     else { selectedInsn_ = i; selAnchor_ = i; }                          // nueva seleccion
-                    if (ImGui::IsMouseDoubleClicked(0) && in.hasBranchTarget) gotoAddress(in.branchTarget);
+                    // Doble clic = editar la instruccion (ensamblar en su direccion), estilo x64dbg.
+                    // (Seguir el salto sigue disponible con clic derecho -> "Jump To".)
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        asmAddr_ = in.address; asmFillLen_ = (int)in.length; asmError_.clear();
+                        std::snprintf(asmBuf_, sizeof(asmBuf_), "%s", in.text.c_str());
+                        openAsmText_ = true;
+                    }
                 }
                 // Menu contextual (clic derecho sobre el renglon)
                 if (ImGui::BeginPopupContextItem("cpuctx")) {
@@ -1936,18 +1954,34 @@ void App::drawCpuContent() {
                         if (ImGui::MenuItem("Binary string...")) { searchBinBuf_[0] = '\0'; openSearchBin_ = true; }
                         ImGui::EndMenu();
                     }
-                    if (ImGui::MenuItem("Ensamblar (texto)...", nullptr, false, dbgState_==DbgState::Paused)) {
-                        asmAddr_ = in.address; asmBuf_[0] = '\0'; asmError_.clear(); openAsmText_ = true;
+                    ImGui::Separator();
+                    // --- Edicion de bytes / parches (estilo x64dbg) ---
+                    if (ImGui::MenuItem("Ensamblar / editar instruccion...", "Doble clic", false, patchTargetActive())) {
+                        asmAddr_ = in.address; asmFillLen_ = (int)in.length; asmError_.clear();
+                        std::snprintf(asmBuf_, sizeof(asmBuf_), "%s", in.text.c_str()); openAsmText_ = true;
                     }
-                    if (ImGui::MenuItem("Patch bytes (hex)...", nullptr, false, dbgState_==DbgState::Paused)) {
-                        asmAddr_ = in.address; asmBuf_[0] = '\0'; asmError_.clear(); openAsm_ = true;
+                    if (ImGui::MenuItem("Patch bytes (hex)...", nullptr, false, patchTargetActive())) {
+                        asmAddr_ = in.address; asmFillLen_ = (int)in.length; asmBuf_[0] = '\0'; asmError_.clear(); openAsm_ = true;
                     }
-                    if (ImGui::MenuItem("NOP instruccion", nullptr, false, dbgState_==DbgState::Paused)) {
+                    if (ImGui::MenuItem("NOP instruccion", nullptr, false, patchTargetActive())) {
                         std::vector<uint8_t> nops(in.length ? in.length : 1, 0x90);
-                        debugger_.writeMemory(in.address, nops.data(), nops.size());
-                        refreshLiveDisassembly(currentIp_);
+                        applyPatchBytes(in.address, nops);
                         pushLog("NOP x" + std::to_string(nops.size()) + " en 0x" + hex64(in.address));
                     }
+                    if (ImGui::MenuItem("Fill with NOPs (seleccion)", nullptr, false, patchTargetActive()))
+                        fillSelectionWithNops();
+                    if (ImGui::BeginMenu("Binary")) {
+                        if (ImGui::MenuItem("Binary copy")) {
+                            std::string h = selectionBytesHex();
+                            if (!h.empty()) { ImGui::SetClipboardText(h.c_str()); pushLog("Binary copy: " + h); }
+                        }
+                        if (ImGui::MenuItem("Binary paste", nullptr, false, patchTargetActive()))
+                            binaryPasteAt(in.address);
+                        ImGui::EndMenu();
+                    }
+                    if (ImGui::MenuItem("Write to exe file..."))
+                        showPatchWin_ = true;
+                    ImGui::Separator();
                     if (ImGui::MenuItem("Copiar direccion"))
                         ImGui::SetClipboardText(("0x" + hex64(in.address)).c_str());
                     if (in.isJump && in.hasBranchTarget && ImGui::MenuItem("Jump To"))
@@ -2140,19 +2174,22 @@ void App::drawCpuContent() {
     // Popup ensamblador (Keystone, texto -> bytes)
     if (openAsmText_) { ImGui::OpenPopup("asmtext"); openAsmText_ = false; }
     if (ImGui::BeginPopup("asmtext")) {
-        ImGui::Text("Ensamblar en 0x%s (%s):", hex64(asmAddr_).c_str(), debugger_.is64() ? "x64" : "x86");
+        ImGui::Text("Ensamblar en 0x%s (%s):", hex64(asmAddr_).c_str(), curArch64() ? "x64" : "x86");
         ImGui::SetNextItemWidth(340);
         bool ok = ImGui::InputTextWithHint("##asmt", "ej: mov eax, 1  |  jmp 0x401000  |  nop",
                      asmBuf_, sizeof(asmBuf_), ImGuiInputTextFlags_EnterReturnsTrue);
         if (!asmError_.empty()) ImGui::TextColored(ImVec4(1,0.5f,0.5f,1), "%s", asmError_.c_str());
         if ((ImGui::Button("Ensamblar y escribir") || ok) && asmBuf_[0]) {
             ks_engine* ks = nullptr;
-            if (ks_open(KS_ARCH_X86, debugger_.is64() ? KS_MODE_64 : KS_MODE_32, &ks) == KS_ERR_OK) {
+            if (ks_open(KS_ARCH_X86, curArch64() ? KS_MODE_64 : KS_MODE_32, &ks) == KS_ERR_OK) {
                 unsigned char* enc = nullptr; size_t sz = 0, cnt = 0;
-                if (ks_asm(ks, asmBuf_, asmAddr_, &enc, &sz, &cnt) == 0 && sz > 0 && dbgState_ == DbgState::Paused) {
-                    debugger_.writeMemory(asmAddr_, enc, sz);
+                if (ks_asm(ks, asmBuf_, asmAddr_, &enc, &sz, &cnt) == 0 && sz > 0) {
+                    std::vector<uint8_t> b(enc, enc + sz);
                     ks_free(enc);
-                    refreshLiveDisassembly(currentIp_);
+                    // Si la nueva instruccion es mas corta que la original, rellena con NOP
+                    // para no dejar bytes colgantes (estilo x64dbg).
+                    if (asmFillLen_ > (int)b.size()) b.resize(asmFillLen_, 0x90);
+                    applyPatchBytes(asmAddr_, b);
                     pushLog("Ensamblado " + std::to_string(sz) + " byte(s) en 0x" + hex64(asmAddr_));
                     ImGui::CloseCurrentPopup();
                 } else {
@@ -2184,17 +2221,219 @@ void App::drawCpuContent() {
                     bytes.push_back((uint8_t)strtoul(s.substr(i, 2).c_str(), nullptr, 16)); i += 2;
                 } else i++;
             }
-            if (!bytes.empty() && dbgState_ == DbgState::Paused) {
-                debugger_.writeMemory(asmAddr_, bytes.data(), bytes.size());
-                refreshLiveDisassembly(currentIp_);
+            if (!bytes.empty() && patchTargetActive()) {
+                applyPatchBytes(asmAddr_, bytes);
                 pushLog("Patch " + std::to_string(bytes.size()) + " byte(s) en 0x" + hex64(asmAddr_));
                 ImGui::CloseCurrentPopup();
-            } else asmError_ = "sin bytes validos o proceso no pausado";
+            } else asmError_ = "sin bytes validos, o sin destino (pausa el proceso o carga un archivo)";
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancelar")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+}
+
+// --- Parches: registro unificado + escritura (memoria en vivo o imagen estatica) ---
+// Todos los cambios de bytes (ensamblar, patch hex, NOP, binary paste) pasan por
+// applyPatchBytes, que registra {original, actual} por VA y su offset en el archivo,
+// para poder volcarlos luego con "Write to exe file". Estilo x64dbg (Patches).
+bool App::curArch64() const {
+    return (dbgState_ == DbgState::Paused) ? debugger_.is64() : pe_.is64Bit();
+}
+
+bool App::patchTargetActive() const {
+    return dbgState_ == DbgState::Paused || fileLoaded_;
+}
+
+uint64_t App::patchModuleBase() const {
+    if (dbgState_ == DbgState::Paused && debugger_.imageBase()) return debugger_.imageBase();
+    return pe_.imageBase();
+}
+
+void App::applyPatchBytes(uint64_t va, const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) return;
+    const bool live = (dbgState_ == DbgState::Paused);
+    if (!live && !fileLoaded_) { pushLog("Patch: no hay proceso pausado ni archivo cargado."); return; }
+
+    // Bytes actuales, para registrar el original la primera vez que se toca la VA.
+    std::vector<uint8_t> cur(bytes.size(), 0);
+    if (live) debugger_.readMemory(va, cur.data(), cur.size());
+    else if (va >= pe_.imageBase()) pe_.readAtRva((uint32_t)(va - pe_.imageBase()), cur.data(), cur.size());
+
+    const uint64_t modBase = patchModuleBase();
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        const uint64_t a = va + i;
+        auto it = patches_.find(a);
+        if (it == patches_.end()) {
+            PatchByte pb;
+            pb.original = cur[i];
+            pb.current  = bytes[i];
+            uint32_t off = 0;
+            pb.inFile = (a >= modBase) && pe_.rvaToOffset((uint32_t)(a - modBase), off);
+            pb.fileOffset = pb.inFile ? off : 0;
+            patches_[a] = pb;
+        } else {
+            it->second.current = bytes[i];
+        }
+        auto jt = patches_.find(a);   // si vuelve al valor original, deja de ser un parche
+        if (jt != patches_.end() && jt->second.current == jt->second.original) patches_.erase(jt);
+    }
+
+    if (live) { debugger_.writeMemory(va, bytes.data(), bytes.size()); refreshLiveDisassembly(currentIp_); }
+    else { pe_.writeAtRva((uint32_t)(va - pe_.imageBase()), bytes.data(), bytes.size()); refreshDisassembly(); }
+}
+
+// Bytes (hex) de la seleccion actual de la CPU, para "Binary copy".
+std::string App::selectionBytesHex() const {
+    if (selectedInsn_ < 0 || selectedInsn_ >= (int)insns_.size()) return {};
+    int lo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
+    int hi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
+    std::string out;
+    for (int i = lo; i <= hi && i < (int)insns_.size(); ++i) {
+        if (insns_[i].bytes.empty()) continue;
+        if (!out.empty()) out += ' ';
+        out += insns_[i].bytes;   // ya viene como "55 8B EC"
+    }
+    return out;
+}
+
+void App::binaryPasteAt(uint64_t va) {
+    const char* clip = ImGui::GetClipboardText();
+    if (!clip) { pushLog("Binary paste: portapapeles vacio."); return; }
+    std::string s = clip; std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < s.size();) {
+        if (!isxdigit((unsigned char)s[i])) { i++; continue; }
+        if (i + 1 < s.size() && isxdigit((unsigned char)s[i+1])) {
+            bytes.push_back((uint8_t)strtoul(s.substr(i, 2).c_str(), nullptr, 16)); i += 2;
+        } else i++;
+    }
+    if (bytes.empty()) { pushLog("Binary paste: sin bytes hex validos en el portapapeles."); return; }
+    applyPatchBytes(va, bytes);
+    pushLog("Binary paste: " + std::to_string(bytes.size()) + " byte(s) en 0x" + hex64(va));
+}
+
+// Aplica los parches sobre una copia del archivo original en disco y la guarda.
+bool App::writePatchedExe(const std::wstring& path, int& applied, int& skipped, std::string& err) {
+    applied = skipped = 0;
+    if (patches_.empty()) { err = "no hay parches que guardar"; return false; }
+    if (loadedPath_.empty()) { err = "no hay archivo original en disco"; return false; }
+    std::ifstream in(loadedPath_.c_str(), std::ios::binary);
+    if (!in) { err = "no se pudo abrir el archivo original"; return false; }
+    in.seekg(0, std::ios::end); std::streamoff sz = in.tellg(); in.seekg(0);
+    std::vector<uint8_t> data((size_t)(sz > 0 ? sz : 0));
+    if (sz > 0) in.read(reinterpret_cast<char*>(data.data()), sz);
+    for (auto& kv : patches_) {
+        const PatchByte& pb = kv.second;
+        if (pb.inFile && pb.fileOffset < data.size()) { data[pb.fileOffset] = pb.current; applied++; }
+        else skipped++;
+    }
+    std::ofstream out(path.c_str(), std::ios::binary | std::ios::trunc);
+    if (!out) { err = "no se pudo crear el archivo destino"; return false; }
+    if (!data.empty()) out.write(reinterpret_cast<const char*>(data.data()), (std::streamsize)data.size());
+    return (bool)out;
+}
+
+void App::savePatchedExeDialog() {
+    if (patches_.empty()) { pushLog("No hay parches que guardar."); return; }
+    std::wstring def = loadedPath_.empty() ? L"patched.exe" : loadedPath_;
+    auto dot = def.find_last_of(L'.');
+    if (dot != std::wstring::npos) def = def.substr(0, dot) + L"_patched" + def.substr(dot);
+    else def += L"_patched.exe";
+
+    wchar_t path[MAX_PATH] = {};
+    wcsncpy_s(path, def.c_str(), _TRUNCATE);
+    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Ejecutable\0*.exe;*.dll\0Todos\0*.*\0"; ofn.lpstrDefExt = L"exe";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    int applied = 0, skipped = 0; std::string err;
+    if (writePatchedExe(path, applied, skipped, err)) {
+        pushLog("Write to exe: " + std::to_string(applied) + " parche(s) aplicados" +
+                (skipped ? (", " + std::to_string(skipped) + " fuera del archivo omitidos") : "") +
+                " -> " + std::string(path, path + wcslen(path)));
+    } else {
+        pushLog("Write to exe: " + err);
+    }
+}
+
+// Revierte un byte parcheado (o todos si va==0) en memoria/imagen y actualiza vista.
+void App::revertPatch(uint64_t va, bool all) {
+    auto restore = [&](uint64_t a, uint8_t o) {
+        if (dbgState_ == DbgState::Paused) debugger_.writeMemory(a, &o, 1);
+        else if (a >= pe_.imageBase()) pe_.writeAtRva((uint32_t)(a - pe_.imageBase()), &o, 1);
+    };
+    if (all) {
+        for (auto& kv : patches_) restore(kv.first, kv.second.original);
+        patches_.clear();
+    } else {
+        auto it = patches_.find(va);
+        if (it == patches_.end()) return;
+        restore(va, it->second.original);
+        patches_.erase(it);
+    }
+    if (dbgState_ == DbgState::Paused) refreshLiveDisassembly(currentIp_); else refreshDisassembly();
+}
+
+// Rellena con NOP (0x90) todo el rango de bytes de la seleccion actual de la CPU.
+void App::fillSelectionWithNops() {
+    if (selectedInsn_ < 0 || selectedInsn_ >= (int)insns_.size()) return;
+    int lo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
+    int hi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
+    if (hi >= (int)insns_.size()) hi = (int)insns_.size() - 1;
+    uint64_t start = insns_[lo].address;
+    uint64_t end   = insns_[hi].address + (insns_[hi].length ? insns_[hi].length : 1);
+    size_t n = (end > start) ? (size_t)(end - start) : 1;
+    if (n == 0 || n > 4096) { pushLog("Fill with NOPs: rango invalido."); return; }
+    std::vector<uint8_t> nops(n, 0x90);
+    applyPatchBytes(start, nops);
+    pushLog("Fill with NOPs: " + std::to_string(n) + " byte(s) desde 0x" + hex64(start));
+}
+
+void App::drawPatchWindow() {
+    if (!showPatchWin_) return;
+    ImGui::SetNextWindowSize(ImVec2(580, 360), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Patches", &showPatchWin_)) { ImGui::End(); return; }
+
+    ImGui::Text("%zu byte(s) parcheados", patches_.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Write to exe file...")) savePatchedExeDialog();
+    ImGui::SameLine();
+    if (ImGui::Button("Revertir todo")) revertPatch(0, true);
+    ImGui::Separator();
+
+    if (patches_.empty()) {
+        ImGui::TextDisabled("Sin cambios. Doble clic en una instruccion para editarla, o Binary paste en la CPU.");
+        ImGui::End(); return;
+    }
+
+    if (ImGui::BeginTable("patches", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                                        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Direccion",      ImGuiTableColumnFlags_WidthFixed, 150);
+        ImGui::TableSetupColumn("Offset archivo", ImGuiTableColumnFlags_WidthFixed, 110);
+        ImGui::TableSetupColumn("Orig",           ImGuiTableColumnFlags_WidthFixed, 46);
+        ImGui::TableSetupColumn("Nuevo",          ImGuiTableColumnFlags_WidthFixed, 52);
+        ImGui::TableSetupColumn("",               ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        uint64_t revertVa = 0; bool doRevert = false;
+        for (auto& kv : patches_) {
+            const uint64_t a = kv.first; const PatchByte& pb = kv.second;
+            ImGui::TableNextRow(); ImGui::PushID((int)(a ^ (a >> 32)));
+            ImGui::TableSetColumnIndex(0);
+            if (ImGui::Selectable(("0x" + hex64(a)).c_str(), false, ImGuiSelectableFlags_SpanAllColumns))
+                gotoAddress(a);
+            ImGui::TableSetColumnIndex(1);
+            if (pb.inFile) ImGui::Text("0x%X", pb.fileOffset); else ImGui::TextDisabled("(fuera)");
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%02X", pb.original);
+            ImGui::TableSetColumnIndex(3); ImGui::TextColored(ImVec4(1,0.8f,0.4f,1), "%02X", pb.current);
+            ImGui::TableSetColumnIndex(4);
+            if (ImGui::SmallButton("Revertir")) { revertVa = a; doRevert = true; }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (doRevert) revertPatch(revertVa, false);
+    }
+    ImGui::End();
 }
 
 void App::applyRegEdit(const char* name, uint64_t value) {
@@ -4873,6 +5112,7 @@ static std::string hexBytes(const uint8_t* p, size_t n) {
 static int mcpRequiredAccess(const std::string& cmd) {
     if (cmd == "save_session" || cmd == "load_session" || cmd == "export_report" || cmd == "write_mem" || cmd == "set_reg" || cmd == "assemble" || cmd == "patch" ||
         cmd == "nop" || cmd == "dump" || cmd == "fix_iat" || cmd == "antidebug" ||
+        cmd == "patch_revert" || cmd == "write_patched" ||
         cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script" || cmd == "thread_ctrl" || cmd == "notes_set" ||
         cmd == "mem_alloc" || cmd == "mem_free" || cmd == "mem_fill" || cmd == "mem_copy" || cmd == "mem_save" || cmd == "page_protect") return 2;
     if (cmd == "attach" || cmd == "detach" || cmd == "launch" || cmd == "restart" || cmd == "go" || cmd == "pause" ||
@@ -5323,11 +5563,12 @@ std::string App::handleMcpCommand(const std::string& line) {
     else if (cmd == "assemble") {
         uint64_t addr = jU64(a["addr"]); std::string text = a.value("text", "");
         ks_engine* ks = nullptr;
-        if (ks_open(KS_ARCH_X86, debugger_.is64() ? KS_MODE_64 : KS_MODE_32, &ks) == KS_ERR_OK) {
+        if (ks_open(KS_ARCH_X86, curArch64() ? KS_MODE_64 : KS_MODE_32, &ks) == KS_ERR_OK) {
             unsigned char* enc = nullptr; size_t sz = 0, cnt = 0;
             if (ks_asm(ks, text.c_str(), addr, &enc, &sz, &cnt) == 0 && sz > 0) {
-                res["bytes"] = sz; res["written"] = debugger_.writeMemory(addr, enc, sz);
-                ks_free(enc); if (dbgState_==DbgState::Paused) refreshLiveDisassembly(currentIp_);
+                std::vector<uint8_t> b(enc, enc + sz); ks_free(enc);
+                applyPatchBytes(addr, b);              // registra el parche (write-to-exe)
+                res["bytes"] = sz; res["written"] = (int)sz;
             } else { res["ok"]=false; res["error"]=ks_strerror(ks_errno(ks)); if(enc) ks_free(enc); }
             ks_close(ks);
         } else { res["ok"]=false; res["error"]="ks_open"; }
@@ -5335,10 +5576,33 @@ std::string App::handleMcpCommand(const std::string& line) {
     else if (cmd == "patch") {
         uint64_t addr = jU64(a["addr"]); std::string hx = a.value("hex", ""); std::vector<uint8_t> b;
         for (size_t i = 0; i < hx.size();) { if (hx[i]==' '){i++;continue;} if(i+1<hx.size()){ b.push_back((uint8_t)strtoul(hx.substr(i,2).c_str(),nullptr,16)); i+=2;} else break; }
-        res["written"] = debugger_.writeMemory(addr, b.data(), b.size());
-        if (dbgState_==DbgState::Paused) refreshLiveDisassembly(currentIp_);
+        applyPatchBytes(addr, b); res["written"] = (int)b.size();
     }
-    else if (cmd == "nop") { uint64_t addr=jU64(a["addr"]); int n=(int)a.value("count",1); std::vector<uint8_t> nn(n>0?n:1,0x90); res["written"]=debugger_.writeMemory(addr,nn.data(),nn.size()); if(dbgState_==DbgState::Paused) refreshLiveDisassembly(currentIp_); }
+    else if (cmd == "nop") { uint64_t addr=jU64(a["addr"]); int n=(int)a.value("count",1); std::vector<uint8_t> nn(n>0?n:1,0x90); applyPatchBytes(addr, nn); res["written"]=(int)nn.size(); }
+    else if (cmd == "patch_list") {
+        for (auto& kv : patches_) {
+            const PatchByte& pb = kv.second;
+            res["patches"].push_back({{"va",kv.first},{"file_offset",pb.fileOffset},{"in_file",pb.inFile},
+                                       {"original",pb.original},{"current",pb.current}});
+        }
+        res["count"] = (int)patches_.size();
+    }
+    else if (cmd == "patch_revert") {
+        if (a.contains("addr")) { uint64_t addr=jU64(a["addr"]); bool had = patches_.count(addr)>0; revertPatch(addr, false); res["ok"]=had; }
+        else { revertPatch(0, true); res["ok"]=true; }
+        res["count"] = (int)patches_.size();
+    }
+    else if (cmd == "write_patched") {
+        std::wstring p;
+        std::string ps = a.value("path", "");
+        if (!ps.empty()) { int n=MultiByteToWideChar(CP_UTF8,0,ps.c_str(),-1,nullptr,0); if(n>0){p.resize(n-1); MultiByteToWideChar(CP_UTF8,0,ps.c_str(),-1,p.data(),n);} }
+        else p = loadedPath_.empty() ? L"patched.exe" : (loadedPath_ + L"_patched.exe");
+        int applied=0, skipped=0; std::string err;
+        res["ok"] = writePatchedExe(p, applied, skipped, err);
+        res["applied"]=applied; res["skipped"]=skipped;
+        res["path"] = std::string(p.begin(), p.end());
+        if (!res["ok"]) res["error"] = err;
+    }
     else if (cmd == "symbol") { const uint64_t address = jU64(a["addr"]); res["symbol"] = debugger_.symbolAt(address); res["source"] = debugger_.sourceAt(address); }
     else if (cmd == "source") { res["source"] = debugger_.sourceAt(jU64(a["addr"])); }
     else if (cmd == "call_stack") {
@@ -5704,9 +5968,12 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("resolve_iat", "Resuelve la IAT contra los exports cargados.", obj(EMPTY, {}));
     add("fix_iat",     "Reconstruye la IAT en el dump (experimental).", obj(EMPTY, {}));
     add("antidebug",   "Aplica anti-anti-debug (parcha el PEB).", obj(EMPTY, {}));
-    add("assemble",    "Ensambla texto x86/x64 (Keystone) y lo escribe en memoria.", obj({{"addr", HEX}, {"text", STR}}, {"addr","text"}));
-    add("patch",       "Escribe bytes hex en una direccion.", obj({{"addr", HEX}, {"hex", STR}}, {"addr","hex"}));
-    add("nop",         "Rellena con NOP (0x90) en una direccion.", obj({{"addr", HEX}, {"count", INT}}, {"addr"}));
+    add("assemble",    "Ensambla texto x86/x64 (Keystone) y escribe en memoria o en la imagen estatica. Registra el parche para 'write to exe'.", obj({{"addr", HEX}, {"text", STR}}, {"addr","text"}));
+    add("patch",       "Escribe bytes hex en una direccion (memoria o imagen estatica). Registra el parche.", obj({{"addr", HEX}, {"hex", STR}}, {"addr","hex"}));
+    add("nop",         "Rellena con NOP (0x90) en una direccion. Registra el parche para 'write to exe'.", obj({{"addr", HEX}, {"count", INT}}, {"addr"}));
+    add("patch_list",  "Lista los bytes parcheados (patches acumulados) con {va, file_offset, in_file, original, current}. Estilo x64dbg Patches.", obj(EMPTY, {}));
+    add("patch_revert","Revierte el parche en 'addr' (o TODOS si se omite addr), restaurando el byte original en memoria/imagen.", obj({{"addr", HEX}}, {}));
+    add("write_patched","Escribe un .exe parcheado a disco: toma el archivo original y aplica los parches por offset. path opcional (default <archivo>_patched.exe). Devuelve {ok, applied, skipped, path}.", obj({{"path", STR}}, {}));
     add("symbol",      "Resuelve simbolo y, si existe PDB, fuente/linea de una direccion.", obj({{"addr", HEX}}, {"addr"}));
     add("source",      "Devuelve archivo:linea para una direccion si DbgHelp encontro PDB.", obj({{"addr", HEX}}, {"addr"}));
     add("call_stack",  "Camina la pila de llamadas (frames + simbolos).", obj(EMPTY, {}));
@@ -6096,7 +6363,7 @@ void App::sendCodeRequest() {
                 "dbg_modules", "dbg_sections", "dbg_imports", "dbg_exports", "dbg_packers", "dbg_peid",
                 "dbg_search_hex", "dbg_get_oep", "dbg_symbol", "dbg_source", "dbg_call_stack", "dbg_tls",
                 "dbg_seh", "dbg_mem_map", "dbg_list_annotations", "dbg_find_refs", "dbg_get_trace",
-                "dbg_list_functions", "dbg_list_xrefs", "dbg_list_loops", "dbg_list_bookmarks"
+                "dbg_list_functions", "dbg_list_xrefs", "dbg_list_loops", "dbg_list_bookmarks", "dbg_patch_list"
             };
             tools.erase(std::remove_if(tools.begin(), tools.end(), [&](const ToolDef& t) {
                 return std::find(allowed.begin(), allowed.end(), t.name) == allowed.end();

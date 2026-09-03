@@ -319,6 +319,22 @@ private:
     std::vector<PackerMatch> packerMatches_;
     bool          packerLoaded_ = false;
 
+    // --- Parches (patch registry + write-to-exe estilo x64dbg) ---
+    struct PatchByte { uint8_t original = 0; uint8_t current = 0; uint32_t fileOffset = 0; bool inFile = false; };
+    std::map<uint64_t, PatchByte> patches_;   // VA -> byte parcheado (original vs actual)
+    bool          showPatchWin_ = false;
+    uint64_t      patchModuleBase() const;                                  // base para mapear VA->offset de archivo
+    void          applyPatchBytes(uint64_t va, const std::vector<uint8_t>& bytes); // registra + escribe (memoria o imagen)
+    bool          patchTargetActive() const;                                // hay proceso pausado o archivo estatico donde parchear
+    void          drawPatchWindow();                                        // ventana "Patches" (todos los cambios)
+    void          savePatchedExeDialog();                                   // "Write to exe file": guarda el .exe parcheado
+    bool          writePatchedExe(const std::wstring& path, int& applied, int& skipped, std::string& err);
+    void          revertPatch(uint64_t va, bool all);                       // revierte un byte (o todos)
+    void          fillSelectionWithNops();                                  // "Fill with NOPs" sobre la seleccion
+    std::string   selectionBytesHex() const;                               // hex de la seleccion CPU (binary copy)
+    void          binaryPasteAt(uint64_t va);                              // pega hex del portapapeles (binary paste)
+    bool          curArch64() const;                                        // 64/32 bits segun el estado
+
     // --- PEiD (Detect It Easy) ---
     void          runPeidScan();       // ejecuta diec sobre el binario cargado
     void          drawPeidPanel();     // ventana "PEiD"
@@ -424,6 +440,7 @@ private:
     // --- Ensamblador / patch ---
     char          asmBuf_[128] = {0};
     uint64_t      asmAddr_ = 0;
+    int           asmFillLen_ = 0;       // longitud original (rellena con NOP si la nueva es mas corta)
     bool          openAsm_ = false;      // patch por bytes
     bool          openAsmText_ = false;  // ensamblar texto (Keystone)
     std::string   asmError_;
