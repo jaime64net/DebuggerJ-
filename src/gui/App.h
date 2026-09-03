@@ -335,6 +335,27 @@ private:
     void          binaryPasteAt(uint64_t va);                              // pega hex del portapapeles (binary paste)
     bool          curArch64() const;                                        // 64/32 bits segun el estado
 
+    // --- Artifacts (browser de scripts Python de investigacion) ---
+    struct Artifact {
+        std::string name; char group = 'A'; std::string desc, usage;
+        bool capstone = false, reusable = true, runnable = true;
+    };
+    std::vector<Artifact> artifacts_;
+    bool          showArtifacts_ = false;
+    bool          artifactsLoaded_ = false;
+    int           artifactSel_ = -1;
+    std::string   artifactSource_;
+    std::string   artifactOutput_;
+    char          artifactArgs_[256] = {0};
+    char          artifactPy_[256] = {0};
+    char          artifactFilter_[128] = {0};
+    std::string   artifactsDir() const;
+    void          loadArtifacts();
+    void          selectArtifact(int i);
+    void          drawArtifactsWindow();
+    std::string   runArtifact(const std::string& name, const std::string& args, std::string& outErr);
+    const Artifact* findArtifact(const std::string& name) const;
+
     // --- PEiD (Detect It Easy) ---
     void          runPeidScan();       // ejecuta diec sobre el binario cargado
     void          drawPeidPanel();     // ventana "PEiD"

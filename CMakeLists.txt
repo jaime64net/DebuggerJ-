@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(DebuggerJpp LANGUAGES CXX)
+project(DebuggerJpp LANGUAGES CXX RC)
 
 # DebuggerJ++  -  Debugger / disassembler para analisis de malware (x86 / x64)
 # Solo compila en Windows con MSVC: usa la Windows Debug API, DbgHelp, D3D11 y WinHTTP.
@@ -66,7 +66,10 @@ file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_SOURCE_DIR}/src/*.cpp
     ${CMAKE_SOURCE_DIR}/src/*.h)
 
-add_executable(DebuggerJpp WIN32 ${APP_SOURCES})
+# Recurso de icono (.rc -> icono del exe/ventana). Aseguramos que rc.exe encuentre
+# el .ico anadiendo assets/ como include de recursos.
+set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} /I \"${CMAKE_SOURCE_DIR}/assets\"")
+add_executable(DebuggerJpp WIN32 ${APP_SOURCES} ${CMAKE_SOURCE_DIR}/assets/DebuggerJ++.rc)
 target_include_directories(DebuggerJpp PRIVATE ${CMAKE_SOURCE_DIR}/src ${KEYSTONE_DIR}/include)
 target_link_libraries(DebuggerJpp PRIVATE
     imgui
@@ -112,3 +115,11 @@ add_custom_command(TARGET DebuggerJpp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${KEYSTONE_DIR}/keystone.dll
         $<TARGET_FILE_DIR:DebuggerJpp>/keystone.dll)
+
+# Artifacts: scripts Python de investigacion + index.md (browser Tools -> Artifacts)
+if(EXISTS ${CMAKE_SOURCE_DIR}/artefacts)
+    add_custom_command(TARGET DebuggerJpp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/artefacts
+            $<TARGET_FILE_DIR:DebuggerJpp>/artefacts)
+endif()

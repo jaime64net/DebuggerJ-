@@ -131,7 +131,7 @@ const TOOLS = [
   ["imports",     "Lista los imports del PE.", S()],
   ["packers",     "Detector de packers/protectores estilo PEiD. Devuelve [{name, source, confidence 0..100}] combinando firma de bytes en el entrypoint (set embebido + signatures/userdb.txt, ?? comodin), nombres de seccion conocidos (UPX/.aspack/.vmp/.themida/.enigma/.MPRESS) y heuristicas (entropia global >7.2, pocos imports + alta entropia, codigo escribible = self-modifying). Estatico, no requiere ejecutar.", S()],
   ["peid",        "Analisis PEiD con Detect It Easy (DIE). Ejecuta 'diec' sobre el binario cargado y devuelve {ok, diec, filetype, detects:[{type,name,version,options,string}]} (compilador/linker/packer/protector/instalador/.NET). Complementa dbg_packers. Opcional die_path=ruta a diec.exe (default: <exe>\\die\\diec.exe o PATH). DIE es GPLv3 y no se distribuye con el debugger.", S({ die_path: { type: "string" } })],
-  ["search_hex",  "Busca un patron hex (ej '48 8B ?? C3') en el archivo.", S({ pattern: { type: "string" } }, ["pattern"])],
+  ["search_hex",  "Busca hex en el archivo. Devuelve matches con file_offset y, si esta mapeado, RVA/VA; start_offset y max_hits permiten paginar.", S({ pattern: { type: "string" }, start_offset: HEX, max_hits: { type: "integer", minimum: 1, maximum: 100000 } }, ["pattern"])],
   ["find_oep",    "Busca el OEP (traza saltando calls). Requiere pausado.", S()],
   ["get_oep",     "Devuelve el OEP encontrado.", S()],
   ["dump",        "Vuelca el proceso a disco (memory-aligned).", S({ path: { type: "string" } })],
@@ -158,6 +158,9 @@ const TOOLS = [
   ["run_trace",   "Inicia run-trace (registra cada instruccion). Requiere pausado.", S()],
   ["get_trace",   "Devuelve el log del run-trace.", S()],
   ["rm_exc_bp",   "Quita un breakpoint de excepcion por id.", S({ id: { type: "integer" } }, ["id"])],
+  ["artifacts_list","Lista los scripts Python de investigacion (artefacts/py) parseados de index.md: [{name,group,capstone,reusable,runnable,desc,usage}]. group opcional (A/B/C) filtra.", S({ group: { type: "string" } })],
+  ["artifact_get","Devuelve el codigo fuente y metadatos de un script de artifacts. {ok,name,group,desc,usage,source}.", S({ name: { type: "string" } }, ["name"])],
+  ["artifact_run","Ejecuta un script de artifacts (best-effort) y captura stdout/stderr. args opcional; python opcional (interprete, def 'py'). Grupo C no ejecutable; grupo B EJECUTA el binario objetivo. Requiere nivel Modificacion.", S({ name: { type: "string" }, args: { type: "string" }, python: { type: "string" } }, ["name"])],
 ];
 
 const toolDefs = TOOLS.map(([cmd, desc, schema]) => ({

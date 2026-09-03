@@ -977,6 +977,7 @@ void App::render() {
     if (showSkillBrowser_)               drawSkillBrowser();
     if (showSkillManage_)                drawSkillManage();
     if (showHelp_)                       drawHelpWindow();
+    if (showArtifacts_)                  drawArtifactsWindow();
     drawPatchWindow();
     if (showAttach_)                     drawAttachWindow();
 
@@ -1389,6 +1390,7 @@ void App::drawMenuBar() {
                 showOptions_ = true;
                 optLoadDraft(aiConfig_.selected());
             }
+            if (ImGui::MenuItem("Artifacts...")) { showArtifacts_ = true; if (!artifactsLoaded_) loadArtifacts(); }
             ImGui::Separator();
             if (ImGui::MenuItem("Reiniciar como administrador")) {
                 wchar_t exe[MAX_PATH] = {0}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -1520,6 +1522,8 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Memory breakpoints: con el proceso pausado, elige acceso, escritura o ejecucion y un rango. Usan PAGE_GUARD como OllyDbg: Windows protege paginas completas (normalmente 4 KiB), asi que puede haber accesos vecinos. No se permiten sobre la pagina de pila actual ni sobre una pagina que ya use PAGE_GUARD.");
             ImGui::BulletText("Condiciones y acciones: un BP software acepta registros, hit/hits, &, | y comparadores; por ejemplo rax == 0, ecx & 1 != 0 o hit >= 5. Con 'solo log' registra la coincidencia y continua. Numeros en decimal o con prefijo 0x.");
             ImGui::BulletText("Excepciones incluye breakpoints de eventos: crear/terminar hilo y cargar/descargar DLL. Son utiles para observar carga dinamica e inyeccion.");
+            ImGui::BulletText("Un INT3 ajeno a DebuggerJ++ se pausa en primera oportunidad y, al pulsar Play, se entrega al SEH/VEH del programa con DBG_EXCEPTION_NOT_HANDLED. Esto conserva aplicaciones y protecciones que usan excepciones deliberadas. Si vuelve en segunda oportunidad, el proceso no lo manejo.");
+            ImGui::BulletText("La cadena SEH x86 de procesos WOW64 se obtiene desde el TEB32 indicado por FS, no desde el TEB64 del host; Window -> Excepciones y MCP seh muestran pares record/handler.");
             ImGui::BulletText("Los breakpoints de la imagen principal se relocalizan automaticamente cuando ASLR cambia la base al lanzar o adjuntarse.");
             ImGui::BulletText("F5 lanza o continua; F8 entra en calls (step into); F10 los salta (step over); F11 ejecuta hasta ret; Pause detiene una sesion activa.");
             ImGui::BulletText("Depurar -> Adjuntar a PID permite analizar un proceso existente. 'Desadjuntar' lo deja ejecutando sin DebuggerJ++; Detener finaliza la sesion. Requiere permisos suficientes y se recomienda usarlo solo en la VM de analisis.");
@@ -1533,6 +1537,10 @@ void App::drawHelpWindow() {
                               "(direccion, offset en el archivo, byte original vs nuevo), permite revertir uno o todos, y 'Write to exe file...' "
                               "guarda una copia del ejecutable con los bytes modificados aplicados por offset. Por MCP: dbg_patch_list, "
                               "dbg_patch_revert, dbg_write_patched (ademas de dbg_assemble/dbg_patch/dbg_nop que ahora registran cada cambio).");
+            ImGui::BulletText("Artifacts (Tools -> Artifacts): browser de los scripts Python de investigacion (artefacts/py), parseado de index.md. "
+                              "Agrupa A (analisis estatico read-only), B (drivers dinamicos que EJECUTAN el binario via MCP) y C (mantenimiento, no ejecutable); "
+                              "muestra 'que hace' + 'uso' + codigo fuente de cada uno, con tag [cap] para los que requieren capstone. Boton Ejecutar (best-effort) con "
+                              "campo de argumentos e interprete Python configurable. Por MCP: dbg_artifacts_list, dbg_artifact_get, dbg_artifact_run.");
             ImGui::TextUnformatted("Paneles de analisis");
             ImGui::BulletText("Modulos & Simbolos: doble clic en una DLL o archivo para ver su desensamblado; consulta TLS, SEH, imports y exports.");
             ImGui::BulletText("Call stack usa StackWalk64/DbgHelp. Si Windows puede localizar un PDB, muestra simbolos y archivo:linea; de otro modo conserva las direcciones disponibles.");
@@ -1628,6 +1636,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Control: set_bp (break_on_hit, condition y log_only), set_hwbp, set_membp, breakpoints de excepcion y set_event_breaks requieren Control de sesion. set_membp requiere pausa; type=0 acceso, 1 escritura, 8 ejecucion.");
             ImGui::BulletText("Analisis: disasm, analyze_code, list_functions/xrefs/loops, bookmarks, modules, sections, imports, exports, symbol/source, stack, call_stack, mem_map y find_refs.");
             ImGui::BulletText("Estado: get_regs, read_mem, search_hex, packers, tls, seh, run_trace y get_trace.");
+            ImGui::BulletText("search_hex devuelve matches con file_offset y, para bytes mapeados, rva/va correctos. start_offset y max_hits permiten paginar sin confundir offset crudo con direccion virtual.");
             ImGui::BulletText("Expresiones: eval evalua una expresion (hex por defecto; byte/dword/ptr(a), registros, mod.base/fromname, dis.len, [mem]). Solo lectura.");
             ImGui::BulletText("Simbolos: symsrv configura la ruta del symbol server (requiere nivel Modificacion). Ej path 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols'.");
             ImGui::BulletText("Modificacion: set_reg, write_mem, assemble, patch, nop, patch_revert, write_patched, dump, anti-debug, sesiones y plugins. Requieren el nivel Modificacion. patch_list es de solo lectura.");
@@ -2442,6 +2451,240 @@ void App::drawPatchWindow() {
         ImGui::EndTable();
         if (doRevert) revertPatch(revertVa, false);
     }
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts: browser de los scripts Python de investigacion (artefacts/py).
+// Parsea index.md (tablas por grupo A/B/C), muestra contexto y fuente, y ejecuta
+// el script (best-effort) capturando la salida. Tambien expuesto por MCP.
+// ---------------------------------------------------------------------------
+static std::wstring artWiden(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, 0); MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
+    return w;
+}
+static bool artFileExists(const std::string& p) {
+    DWORD a = GetFileAttributesW(artWiden(p).c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+// Ejecuta un proceso capturando stdout+stderr sin bloquear (lee mientras corre,
+// para no deadlockear con salidas grandes de los disassemblers). cwd opcional.
+static bool artRunCapture(const std::wstring& cmdline, const std::wstring& cwd, DWORD timeoutMs, std::string& out) {
+    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return false;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = nullptr;
+    PROCESS_INFORMATION pi{};
+    std::wstring mut = cmdline;
+    BOOL ok = CreateProcessW(nullptr, mut.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                             nullptr, cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    CloseHandle(wr);
+    if (!ok) { CloseHandle(rd); return false; }
+    const DWORD start = GetTickCount(); bool timed = false; char buf[4096];
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;
+        if (avail > 0) {
+            DWORD n = 0, want = avail < sizeof(buf) ? avail : (DWORD)sizeof(buf);
+            if (ReadFile(rd, buf, want, &n, nullptr) && n) { out.append(buf, n); continue; }
+        }
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+            DWORD a2 = 0; if (PeekNamedPipe(rd, nullptr, 0, nullptr, &a2, nullptr) && a2 > 0) continue;
+            break;
+        }
+        if (GetTickCount() - start > timeoutMs) { TerminateProcess(pi.hProcess, 1); timed = true; break; }
+        Sleep(5);
+    }
+    CloseHandle(rd); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    if (timed) out += "\n[artifact: timeout, proceso terminado]";
+    return true;
+}
+
+std::string App::artifactsDir() const {
+    // Tras el build, CMake copia artefacts/ junto al exe. Fallback al repo (un
+    // nivel arriba de build-ninja) por si se ejecuta sin recompilar.
+    const std::string base = exeSiblingDir();
+    std::string cands[] = { base + "\\artefacts\\py", base + "\\..\\artefacts\\py" };
+    for (auto& c : cands) if (artFileExists(c + "\\index.md")) return c;
+    return cands[0];
+}
+
+const App::Artifact* App::findArtifact(const std::string& name) const {
+    for (auto& a : artifacts_) if (a.name == name) return &a;
+    return nullptr;
+}
+
+void App::loadArtifacts() {
+    artifacts_.clear();
+    artifactsLoaded_ = true;
+    if (!artifactPy_[0]) std::snprintf(artifactPy_, sizeof(artifactPy_), "py");
+    std::ifstream f(artifactsDir() + "\\index.md");
+    if (!f) return;
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t\r\n"); size_t b = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string line; char group = '?';
+    while (std::getline(f, line)) {
+        if (line.rfind("## Grupo A", 0) == 0) { group = 'A'; continue; }
+        if (line.rfind("## Grupo B", 0) == 0) { group = 'B'; continue; }
+        if (line.rfind("## Grupo C", 0) == 0) { group = 'C'; continue; }
+        if (line.empty() || line[0] != '|') continue;
+        std::vector<std::string> cells; std::string cur;
+        for (char c : line) { if (c == '|') { cells.push_back(trim(cur)); cur.clear(); } else cur += c; }
+        cells.push_back(trim(cur));
+        std::string first = cells.size() > 1 ? cells[1] : "";
+        std::string desc  = cells.size() > 2 ? cells[2] : "";
+        std::string usage = cells.size() > 3 ? cells[3] : "";
+        std::vector<std::string> names;
+        for (size_t p = 0; (p = first.find('`', p)) != std::string::npos; ) {
+            size_t q = first.find('`', p + 1); if (q == std::string::npos) break;
+            std::string tok = first.substr(p + 1, q - p - 1);
+            if (tok.size() > 3 && tok.substr(tok.size() - 3) == ".py") names.push_back(tok);
+            p = q + 1;
+        }
+        if (names.empty()) continue;
+        bool cap = (usage.find("[capstone]") != std::string::npos) || (desc.find("[capstone]") != std::string::npos);
+        for (auto& nm : names) {
+            Artifact a; a.name = nm; a.group = group; a.desc = desc; a.usage = usage;
+            a.capstone = cap; a.reusable = (group != 'C'); a.runnable = (group != 'C');
+            artifacts_.push_back(std::move(a));
+        }
+    }
+    std::sort(artifacts_.begin(), artifacts_.end(), [](const Artifact& x, const Artifact& y) {
+        if (x.group != y.group) return x.group < y.group; return x.name < y.name;
+    });
+}
+
+void App::selectArtifact(int i) {
+    artifactSel_ = i; artifactSource_.clear(); artifactOutput_.clear();
+    if (i < 0 || i >= (int)artifacts_.size()) return;
+    std::ifstream f(artifactsDir() + "\\" + artifacts_[i].name, std::ios::binary);
+    if (!f) { artifactSource_ = "(no se pudo leer el archivo)"; return; }
+    f.seekg(0, std::ios::end); std::streamoff sz = f.tellg(); f.seekg(0);
+    if (sz > 0) { artifactSource_.resize((size_t)sz); f.read(&artifactSource_[0], sz); }
+}
+
+std::string App::runArtifact(const std::string& name, const std::string& args, std::string& outErr) {
+    const Artifact* a = findArtifact(name);
+    if (!a) { outErr = "artifact no encontrado"; return {}; }
+    if (!a->runnable) { outErr = "este artifact no es ejecutable (grupo C / mantenimiento)"; return {}; }
+    std::string dir = artifactsDir();
+    std::string script = dir + "\\" + name;
+    if (!artFileExists(script)) { outErr = "el archivo no existe: " + script; return {}; }
+    std::string py = artifactPy_[0] ? std::string(artifactPy_) : "py";
+    std::string cmd = py + " \"" + script + "\"" + (args.empty() ? "" : (" " + args));
+    std::string out;
+    if (!artRunCapture(artWiden(cmd), artWiden(dir), 60000, out)) {
+        outErr = "no se pudo lanzar el interprete '" + py + "' (ajusta la ruta de Python)";
+        return {};
+    }
+    return out;
+}
+
+void App::drawArtifactsWindow() {
+    if (!showArtifacts_) return;
+    if (!artifactsLoaded_) loadArtifacts();
+    ImGui::SetNextWindowSize(ImVec2(900, 560), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Artifacts", &showArtifacts_)) { ImGui::End(); return; }
+
+    ImGui::TextDisabled("Scripts Python de la investigacion (artefacts/py). Contexto en index.md.");
+    ImGui::SetNextItemWidth(160);
+    ImGui::InputTextWithHint("##py", "Python (py, python, wsl python3...)", artifactPy_, sizeof(artifactPy_));
+    ImGui::SameLine();
+    if (ImGui::Button("Recargar")) { loadArtifacts(); artifactSel_ = -1; artifactSource_.clear(); artifactOutput_.clear(); }
+    ImGui::SameLine(); ImGui::TextDisabled("(%zu scripts)", artifacts_.size());
+
+    if (artifacts_.empty()) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1,0.6f,0.4f,1), "No se encontro index.md en '%s'.", artifactsDir().c_str());
+        ImGui::TextDisabled("Reconstruye para que CMake copie artefacts/ junto al exe.");
+        ImGui::End(); return;
+    }
+
+    ImGui::SetNextItemWidth(220);
+    ImGui::InputTextWithHint("##filt", "filtrar...", artifactFilter_, sizeof(artifactFilter_));
+    ImGui::Separator();
+
+    // Panel izquierdo: lista agrupada.
+    ImGui::BeginChild("artlist", ImVec2(300, 0), true);
+    std::string filt = artifactFilter_; std::transform(filt.begin(), filt.end(), filt.begin(), ::tolower);
+    char curGroup = 0;
+    for (int i = 0; i < (int)artifacts_.size(); ++i) {
+        const Artifact& a = artifacts_[i];
+        if (!filt.empty()) {
+            std::string hay = a.name + " " + a.desc; std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+            if (hay.find(filt) == std::string::npos) continue;
+        }
+        if (a.group != curGroup) {
+            curGroup = a.group;
+            const char* gt = a.group=='A' ? "A - Analisis estatico (read-only)"
+                           : a.group=='B' ? "B - Drivers dinamicos (MCP)"
+                           : a.group=='C' ? "C - Mantenimiento (no ejecutable)" : "Sin grupo";
+            ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "%s", gt);
+        }
+        ImGui::PushID(i);
+        std::string label = a.name;
+        if (ImGui::Selectable(label.c_str(), artifactSel_ == i)) selectArtifact(i);
+        if (a.capstone) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.8f,0.7f,0.3f,1), "[cap]"); }
+        if (!a.runnable) { ImGui::SameLine(); ImGui::TextDisabled("[no-run]"); }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    // Panel derecho: detalle + ejecucion + fuente.
+    ImGui::BeginChild("artdetail", ImVec2(0, 0), true);
+    if (artifactSel_ < 0 || artifactSel_ >= (int)artifacts_.size()) {
+        ImGui::TextDisabled("Selecciona un script a la izquierda.");
+    } else {
+        const Artifact& a = artifacts_[artifactSel_];
+        ImGui::Text("%s", a.name.c_str());
+        ImGui::SameLine(); ImGui::TextDisabled("(grupo %c%s%s)", a.group,
+            a.capstone ? ", capstone" : "", a.reusable ? "" : ", no reutilizable");
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.7f,0.85f,1,1), "Que hace:");
+        ImGui::TextWrapped("%s", a.desc.c_str());
+        if (!a.usage.empty()) {
+            ImGui::TextColored(ImVec4(0.7f,0.85f,1,1), "Uso:");
+            ImGui::TextWrapped("%s", a.usage.c_str());
+        }
+        if (a.group == 'B')
+            ImGui::TextColored(ImVec4(1,0.6f,0.4f,1), "Nota: driver dinamico - EJECUTA el binario bajo el debugger (requiere MCP + entorno aislado).");
+        ImGui::Separator();
+
+        ImGui::SetNextItemWidth(-90);
+        ImGui::InputTextWithHint("##args", "argumentos (ver 'Uso')", artifactArgs_, sizeof(artifactArgs_));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!a.runnable);
+        if (ImGui::Button("Ejecutar", ImVec2(80, 0))) {
+            std::string err;
+            std::string name = a.name; std::string args = artifactArgs_;
+            artifactOutput_ = "$ " + std::string(artifactPy_) + " " + name + " " + args + "\n";
+            std::string out = runArtifact(name, args, err);
+            artifactOutput_ += err.empty() ? out : ("[error] " + err);
+            pushLog("Artifact ejecutado: " + name);
+        }
+        ImGui::EndDisabled();
+        if (!a.runnable) { ImGui::SameLine(); ImGui::TextDisabled("(grupo C: no ejecutable)"); }
+
+        if (!artifactOutput_.empty()) {
+            ImGui::Separator(); ImGui::TextColored(ImVec4(0.6f,1,0.6f,1), "Salida:");
+            ImGui::BeginChild("artout", ImVec2(0, 160), true, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(artifactOutput_.c_str());
+            ImGui::EndChild();
+        }
+        if (ImGui::CollapsingHeader("Codigo fuente")) {
+            ImGui::BeginChild("artsrc", ImVec2(0, 220), true, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(artifactSource_.empty() ? "(vacio)" : artifactSource_.c_str());
+            ImGui::EndChild();
+        }
+    }
+    ImGui::EndChild();
     ImGui::End();
 }
 
@@ -5122,7 +5365,7 @@ static std::string hexBytes(const uint8_t* p, size_t n) {
 static int mcpRequiredAccess(const std::string& cmd) {
     if (cmd == "save_session" || cmd == "load_session" || cmd == "export_report" || cmd == "write_mem" || cmd == "set_reg" || cmd == "assemble" || cmd == "patch" ||
         cmd == "nop" || cmd == "dump" || cmd == "fix_iat" || cmd == "antidebug" ||
-        cmd == "patch_revert" || cmd == "write_patched" ||
+        cmd == "patch_revert" || cmd == "write_patched" || cmd == "artifact_run" ||
         cmd == "plugin_run" || cmd == "plugin_reload" || cmd == "symsrv" || cmd == "run_script" || cmd == "thread_ctrl" || cmd == "notes_set" ||
         cmd == "mem_alloc" || cmd == "mem_free" || cmd == "mem_fill" || cmd == "mem_copy" || cmd == "mem_save" || cmd == "page_protect") return 2;
     if (cmd == "attach" || cmd == "detach" || cmd == "launch" || cmd == "restart" || cmd == "go" || cmd == "pause" ||
@@ -5551,9 +5794,33 @@ std::string App::handleMcpCommand(const std::string& line) {
             res["detects"].push_back({{"type",d.type},{"name",d.name},{"version",d.version},{"options",d.options},{"string",d.string}});
     }
     else if (cmd == "search_hex") {
-        std::string perr; const uint8_t* data=nullptr; size_t len=0; uint64_t base=0;
-        if (fileLoaded_) { data=pe_.raw().data(); len=pe_.raw().size(); base=pe_.imageBase(); }
-        if (data) { auto hits = searchHex(data,len,base,a.value("pattern",""),perr); if(!perr.empty()){res["ok"]=false;res["error"]=perr;} for(auto h:hits) res["hits"].push_back(h); }
+        std::string perr;
+        if (!fileLoaded_) { res["ok"] = false; res["error"] = "abre un archivo primero"; }
+        else {
+            const auto& raw = pe_.raw();
+            uint64_t start64 = jU64(a.value("start_offset", njson(0)));
+            size_t start = start64 < raw.size() ? static_cast<size_t>(start64) : raw.size();
+            size_t maxHits = static_cast<size_t>(std::max(1, std::min(100000, a.value("max_hits", 1000))));
+            auto offsets = searchHex(raw.data() + start, raw.size() - start, start,
+                                     a.value("pattern", ""), perr, maxHits);
+            if (!perr.empty()) { res["ok"] = false; res["error"] = perr; }
+            for (uint64_t off64 : offsets) {
+                njson match = {{"file_offset", off64}};
+                uint32_t rva = 0;
+                if (off64 <= UINT32_MAX && pe_.offsetToRva(static_cast<uint32_t>(off64), rva)) {
+                    const uint64_t va = pe_.imageBase() + rva;
+                    match["rva"] = rva;
+                    match["va"] = va;
+                    res["hits"].push_back(va); // compatibilidad: hits contiene VAs navegables
+                } else {
+                    match["mapped"] = false;  // overlay: existe en archivo pero no tiene VA
+                }
+                res["matches"].push_back(std::move(match));
+            }
+            res["start_offset"] = start;
+            res["truncated"] = offsets.size() >= maxHits;
+            if (!offsets.empty() && offsets.size() >= maxHits) res["next_offset"] = offsets.back() + 1;
+        }
     }
     else if (cmd == "find_oep") {
         if (!need_paused()) goto done;
@@ -5612,6 +5879,43 @@ std::string App::handleMcpCommand(const std::string& line) {
         res["applied"]=applied; res["skipped"]=skipped;
         res["path"] = std::string(p.begin(), p.end());
         if (!res["ok"]) res["error"] = err;
+    }
+    else if (cmd == "artifacts_list") {
+        if (!artifactsLoaded_) loadArtifacts();
+        std::string grp = a.value("group", "");
+        for (auto& art : artifacts_) {
+            if (!grp.empty() && !(grp.size()==1 && grp[0]==art.group)) continue;
+            res["artifacts"].push_back({{"name",art.name},{"group",std::string(1,art.group)},
+                {"capstone",art.capstone},{"reusable",art.reusable},{"runnable",art.runnable},
+                {"desc",art.desc},{"usage",art.usage}});
+        }
+        res["count"] = (int)res.value("artifacts", njson::array()).size();
+        res["dir"] = artifactsDir();
+    }
+    else if (cmd == "artifact_get") {
+        if (!artifactsLoaded_) loadArtifacts();
+        std::string name = a.value("name", "");
+        const Artifact* art = findArtifact(name);
+        if (!art) { res["ok"]=false; res["error"]="artifact no encontrado"; }
+        else {
+            std::ifstream f(artifactsDir() + "\\" + name, std::ios::binary);
+            if (!f) { res["ok"]=false; res["error"]="no se pudo leer"; }
+            else { std::string s; f.seekg(0,std::ios::end); std::streamoff sz=f.tellg(); f.seekg(0);
+                   if(sz>0){s.resize((size_t)sz); f.read(&s[0],sz);} res["ok"]=true; res["name"]=name;
+                   res["group"]=std::string(1,art->group); res["desc"]=art->desc; res["usage"]=art->usage; res["source"]=s; }
+        }
+    }
+    else if (cmd == "artifact_run") {
+        if (!artifactsLoaded_) loadArtifacts();
+        std::string name = a.value("name", "");
+        std::string args = a.value("args", "");
+        if (a.contains("python") && a["python"].is_string()) {
+            std::string py = a["python"].get<std::string>();
+            std::snprintf(artifactPy_, sizeof(artifactPy_), "%s", py.c_str());
+        }
+        std::string err; std::string out = runArtifact(name, args, err);
+        res["ok"] = err.empty(); if (!err.empty()) res["error"] = err;
+        res["name"] = name; res["output"] = out;
     }
     else if (cmd == "symbol") { const uint64_t address = jU64(a["addr"]); res["symbol"] = debugger_.symbolAt(address); res["source"] = debugger_.sourceAt(address); }
     else if (cmd == "source") { res["source"] = debugger_.sourceAt(jU64(a["addr"])); }
@@ -5971,7 +6275,7 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("exports",     "Lista los exports del PE.", obj(EMPTY, {}));
     add("packers",     "Detector de packers/protectores estilo PEiD. Devuelve una lista de {name, source, confidence(0..100)} combinando 3 fuentes: firma de bytes en el entrypoint (set embebido + signatures/userdb.txt estilo PEiD, ?? = comodin), nombres de seccion conocidos (UPX/.aspack/.vmp/.themida/.enigma/.MPRESS...) y heuristicas (entropia global >7.2, pocos imports + seccion de alta entropia, seccion de codigo escribible = self-modifying). Trabaja sobre el PE estatico; no requiere ejecutar. Ej: UPX/ASPack/Themida/VMProtect/MPRESS/PECompact.", obj(EMPTY, {}));
     add("peid",        "Analisis PEiD con Detect It Easy (DIE). Ejecuta la consola 'diec' sobre el binario cargado y devuelve {ok, diec, filetype, detects:[{type,name,version,options,string}]} identificando compilador/linker/packer/protector/instalador/.NET con la base de firmas de DIE. Complementa dbg_packers. Opcional die_path=ruta a diec.exe (si no, busca <exe>\\die\\diec.exe o el PATH). DIE es GPLv3 y NO se distribuye con el debugger.", obj({{"die_path", STR}}, {}));
-    add("search_hex",  "Busca un patron hex (ej '48 8B ?? C3') en el archivo.", obj({{"pattern", STR}}, {"pattern"}));
+    add("search_hex",  "Busca hex en el archivo; devuelve matches con file_offset/RVA/VA y permite paginar.", obj({{"pattern", STR}, {"start_offset", HEX}, {"max_hits", INT}}, {"pattern"}));
     add("find_oep",    "Busca el OEP (traza saltando calls). Requiere pausado.", obj(EMPTY, {}));
     add("get_oep",     "Devuelve el OEP encontrado.", obj(EMPTY, {}));
     add("dump",        "Vuelca el proceso a disco (memory-aligned).", obj({{"path", STR}}, {}));
@@ -5984,6 +6288,9 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("patch_list",  "Lista los bytes parcheados (patches acumulados) con {va, file_offset, in_file, original, current}. Estilo x64dbg Patches.", obj(EMPTY, {}));
     add("patch_revert","Revierte el parche en 'addr' (o TODOS si se omite addr), restaurando el byte original en memoria/imagen.", obj({{"addr", HEX}}, {}));
     add("write_patched","Escribe un .exe parcheado a disco: toma el archivo original y aplica los parches por offset. path opcional (default <archivo>_patched.exe). Devuelve {ok, applied, skipped, path}.", obj({{"path", STR}}, {}));
+    add("artifacts_list","Lista los scripts Python de investigacion (artefacts/py) parseados de index.md: [{name,group,capstone,reusable,runnable,desc,usage}]. group opcional (A/B/C) filtra.", obj({{"group", STR}}, {}));
+    add("artifact_get", "Devuelve el codigo fuente y metadatos de un script de artifacts. {ok,name,group,desc,usage,source}.", obj({{"name", STR}}, {"name"}));
+    add("artifact_run", "Ejecuta un script de artifacts (best-effort) y captura stdout/stderr. args opcional; python opcional (interprete, def 'py'). Grupo C no ejecutable; grupo B EJECUTA el binario objetivo. Requiere nivel Modificacion.", obj({{"name", STR}, {"args", STR}, {"python", STR}}, {"name"}));
     add("symbol",      "Resuelve simbolo y, si existe PDB, fuente/linea de una direccion.", obj({{"addr", HEX}}, {"addr"}));
     add("source",      "Devuelve archivo:linea para una direccion si DbgHelp encontro PDB.", obj({{"addr", HEX}}, {"addr"}));
     add("call_stack",  "Camina la pila de llamadas (frames + simbolos).", obj(EMPTY, {}));
