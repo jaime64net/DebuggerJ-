@@ -1,0 +1,3 @@
+// Recurso Win32 de DebuggerJ++: icono de la aplicacion (ventana + Explorer).
+// El id 101 (el menor) hace que Explorer use este icono para el .exe.
+101 ICON "DebuggerJ++.ico"

@@ -136,6 +136,9 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 #endif
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, hInst, nullptr, nullptr, nullptr, nullptr,
                        L"DebuggerJpp", nullptr };
+    // Icono de la aplicacion (recurso 101 de assets/DebuggerJ++.rc): ventana + Alt-Tab + taskbar.
+    wc.hIcon = wc.hIconSm = LoadIconW(hInst, MAKEINTRESOURCEW(101));
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"DebuggerJ++  -  analisis de malware (x86/x64)",
                               WS_OVERLAPPEDWINDOW, 60, 40, 1500, 950,
