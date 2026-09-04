@@ -33,6 +33,7 @@ static std::string favFilePath();   // definida mas abajo; usada en el menu Favo
 static std::string hex64(uint64_t v)  { char b[24]; std::snprintf(b, sizeof(b), "%016llX", (unsigned long long)v); return b; }
 static std::string hex32(uint32_t v)  { char b[16]; std::snprintf(b, sizeof(b), "%08X", v); return b; }
 static std::string vaStr(uint64_t v, bool is64) { char b[24]; std::snprintf(b, sizeof(b), is64 ? "%016llX" : "%08llX", (unsigned long long)v); return b; }
+static bool extractBracketVA(const std::string& text, uint64_t& va);   // fwd (definido mas abajo)
 static std::string exeSiblingDir() {
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -909,6 +910,7 @@ void App::render() {
             currentIp_ = regs_.ip();
             curModule_ = moduleNameAt(currentIp_);
             refreshLiveDisassembly(currentIp_);
+            if (dumpFollowRip_) followInDump(currentIp_);   // el volcado sigue lo que trazas (estilo Olly)
             if (stateChanged) memMap_ = debugger_.memoryMap();
             if (debugger_.foundOEP()) pluginOEP_ = debugger_.foundOEP();
             refreshWatches();
@@ -1565,6 +1567,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Cache de breakpoints por binario (estilo .udd): los breakpoints software (con condicion, hits, solo-log y accion M3), hardware, de excepcion y la mascara de eventos se guardan solos en cache/<hash>.bp.json al cambiar, y se RESTAURAN Y ACTIVAN al abrir el .exe o al adjuntarse a un proceso (relocalizados a la base runtime). Guardar/Cargar sesion sigue existiendo para instantaneas manuales.");
             ImGui::BulletText("Stop (toolbar o Depurar -> Detener) termina el proceso y RECARGA el archivo abierto en vista estatica: CPU, strings, packers, memoria y registros vuelven a los valores del archivo (como recien abierto). Los comentarios/etiquetas persisten en disco.");
             ImGui::BulletText("Archivo -> Cerrar actual (Ctrl+W) cierra el archivo y la sesion activa dejando la app vacia, sin salir. Archivo -> Salir cierra DebuggerJ++.");
+            ImGui::BulletText("Registros: ademas de generales y flags, el panel muestra segmentos (CS/DS/ES/FS/GS/SS), LastErr (con el texto del error de Windows) y la FPU x87 (ST0-ST7, con su valor). CPU -> clic derecho -> 'Follow in dump' sigue en el volcado esta instruccion, su operando de memoria o el destino del salto; la casilla 'Follow RIP' del volcado lo hace seguir automaticamente lo que trazas (como OllyDbg).");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
             ImGui::BulletText("Editar instrucciones y parches (estilo x64dbg): DOBLE CLIC en una instruccion de la CPU la ensambla/edita in situ "
                               "(precargada; si la nueva es mas corta se rellena con NOP). Clic derecho -> 'Patch bytes (hex)', 'NOP instruccion', "
@@ -2524,6 +2527,14 @@ void App::drawCpuContent() {
                         ImGui::SetClipboardText(("0x" + hex64(in.address)).c_str());
                     if (in.isJump && in.hasBranchTarget && ImGui::MenuItem("Jump To"))
                         gotoAddress(in.branchTarget);
+                    ImGui::Separator();
+                    // Follow in dump: sigue en el volcado la direccion referida por la instruccion.
+                    {
+                        uint64_t memVA = 0; bool haveMem = extractBracketVAPublic(in.text, memVA);
+                        if (ImGui::MenuItem("Follow in dump (esta instruccion)")) followInDump(in.address);
+                        if (haveMem && ImGui::MenuItem("Follow in dump (operando de memoria)")) followInDump(memVA);
+                        if (in.hasBranchTarget && ImGui::MenuItem("Follow in dump (destino del salto)")) followInDump(in.branchTarget);
+                    }
                     ImGui::EndPopup();
                 }
                 if (i == pendingScroll_) { ImGui::SetScrollHereY(0.35f); pendingScroll_ = -1; }
@@ -3283,6 +3294,39 @@ void App::drawRegistersContent() {
         if (i % 5 != 4 && i != 8) ImGui::SameLine();
     }
 
+    // Registros de segmento (CS DS ES FS GS SS)
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.75f,0.75f,0.85f,1), "Segmentos");
+    ImGui::Text("CS %04X  DS %04X  ES %04X", regs_.cs, regs_.ds, regs_.es);
+    ImGui::Text("FS %04X  GS %04X  SS %04X", regs_.fs, regs_.gs, regs_.ss);
+
+    // LastError (TEB) con nombre de sistema
+    ImGui::Separator();
+    {
+        char msg[256] = {0};
+        DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+                                 regs_.lastError, 0, msg, sizeof(msg) - 1, nullptr);
+        for (DWORD k = 0; k < n; ++k) if (msg[k] == '\r' || msg[k] == '\n') { msg[k] = 0; break; }
+        ImGui::TextColored(regs_.lastError ? ImVec4(1,0.7f,0.5f,1) : ImVec4(0.6f,0.85f,0.6f,1),
+                           "LastErr %08X  %s", regs_.lastError, msg[0] ? msg : (regs_.lastError ? "" : "ERROR_SUCCESS"));
+    }
+
+    // FPU x87 (ST0..ST7). El valor 80-bit se convierte a double para lectura.
+    if (regs_.hasFpu) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.75f,0.75f,0.85f,1), "FPU x87  (status %04X  control %04X)", regs_.fpuStatus, regs_.fpuControl);
+        for (int i = 0; i < 8; ++i) {
+            const uint8_t* b = regs_.st[i];
+            uint64_t mant; std::memcpy(&mant, b, 8);
+            uint16_t se; std::memcpy(&se, b + 8, 2);
+            int exp = se & 0x7FFF; int sign = (se >> 15) & 1;
+            double val = 0.0; bool empty = (exp == 0 && mant == 0);
+            if (!empty) { long double ld = std::ldexp((long double)mant, exp - 16383 - 63); val = (double)(sign ? -ld : ld); }
+            ImGui::Text("ST%d %04X%016llX", i, se, (unsigned long long)mant);
+            ImGui::SameLine(); ImGui::TextDisabled(empty ? "empty" : "= %.6g", val);
+        }
+    }
+
     // Popup de edicion de registro
     if (openRegEdit_) { ImGui::OpenPopup("edit_reg"); openRegEdit_ = false; }
     if (ImGui::BeginPopup("edit_reg")) {
@@ -3498,9 +3542,30 @@ void App::drawMemoryPanel() {
 }
 
 // ---------------------------------------------------------------------------
+// extractBracketVA es static (arriba); esta version publica la reutiliza desde otros metodos.
+bool App::extractBracketVAPublic(const std::string& text, uint64_t& va) { return extractBracketVA(text, va); }
+
+// Follow in dump: carga en el volcado hex la memoria alrededor de 'va'.
+void App::followInDump(uint64_t va) {
+    dumpBase_ = va;
+    std::snprintf(dumpGotoBuf_, sizeof(dumpGotoBuf_), "%llX", (unsigned long long)va);
+    dumpBuf_.assign(0x200, 0);
+    size_t got = 0;
+    if (dbgState_ == DbgState::Paused || dbgState_ == DbgState::Running)
+        got = debugger_.readMemory(va, dumpBuf_.data(), dumpBuf_.size());
+    if (got == 0 && fileLoaded_ && va >= pe_.imageBase()) {
+        dumpBuf_.assign(0x200, 0);
+        got = pe_.readAtRva((uint32_t)(va - pe_.imageBase()), dumpBuf_.data(), dumpBuf_.size());
+    }
+    dumpBuf_.resize(got);
+}
+
 // Volcado Hex dedicado (Address | Hex dump | ASCII)  -- estilo pane de OllyDbg
 // ---------------------------------------------------------------------------
 void App::drawHexDumpContent() {
+    ImGui::Checkbox("Follow RIP", &dumpFollowRip_);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("El volcado sigue automaticamente el RIP/EIP mientras trazas");
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(160);
     ImGui::InputTextWithHint("##dgoto", "ir a VA hex", dumpGotoBuf_, sizeof(dumpGotoBuf_));
     ImGui::SameLine();
@@ -3580,10 +3645,21 @@ void App::drawStackContent() {
                 }
             }
             ImGui::TableSetColumnIndex(2);
-            // Anotar si el valor cae dentro de un modulo cargado (posible retorno)
+            // Anotaciones estilo Olly: si la DIRECCION del slot es la de un registro
+            // puntero, y si el VALOR coincide con un registro o cae en un modulo.
+            std::string info;
+            auto tagAddr = [&](const char* n, uint64_t rv){ if (addr == rv) { if(!info.empty()) info+=" "; info += n; } };
+            if (regs_.is64) { tagAddr("<RSP", regs_.rsp); tagAddr("<RBP", regs_.rbp); }
+            else            { tagAddr("<ESP", regs_.rsp); tagAddr("<EBP", regs_.rbp); }
+            auto tagVal = [&](const char* n, uint64_t rv){ if (val && val == rv) { if(!info.empty()) info+=" "; info += n; } };
+            if (regs_.is64) { tagVal("=RAX",regs_.rax);tagVal("=RBX",regs_.rbx);tagVal("=RCX",regs_.rcx);tagVal("=RDX",regs_.rdx);
+                              tagVal("=RSI",regs_.rsi);tagVal("=RDI",regs_.rdi);tagVal("=RBP",regs_.rbp);tagVal("=RIP",regs_.rip); }
+            else            { tagVal("=EAX",regs_.rax);tagVal("=EBX",regs_.rbx);tagVal("=ECX",regs_.rcx);tagVal("=EDX",regs_.rdx);
+                              tagVal("=ESI",regs_.rsi);tagVal("=EDI",regs_.rdi);tagVal("=EBP",regs_.rbp);tagVal("=EIP",regs_.rip); }
             const char* modn = "";
             for (auto& m : mods) if (val >= m.base && val < m.base + 0x2000000ull) { modn = m.name.c_str(); break; }
-            if (modn[0]) ImGui::TextDisabled("-> %s", modn);
+            if (modn[0]) { if(!info.empty()) info+="  "; info += "-> "; info += modn; }
+            if (!info.empty()) ImGui::TextDisabled("%s", info.c_str());
             ImGui::PopID();
         }
         ImGui::EndTable();

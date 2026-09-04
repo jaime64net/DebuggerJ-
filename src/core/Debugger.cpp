@@ -725,12 +725,28 @@ Registers Debugger::registers() {
         r.r12=c.R12; r.r13=c.R13; r.r14=c.R14; r.r15=c.R15; r.eflags=(uint32_t)c.EFlags;
         r.cs=(uint16_t)c.SegCs; r.ds=(uint16_t)c.SegDs; r.es=(uint16_t)c.SegEs;
         r.fs=(uint16_t)c.SegFs; r.gs=(uint16_t)c.SegGs; r.ss=(uint16_t)c.SegSs;
+        r.hasFpu = true; r.fpuStatus=c.FltSave.StatusWord; r.fpuControl=c.FltSave.ControlWord; r.fpuTag=c.FltSave.TagWord;
+        for (int i=0;i<8;++i) memcpy(r.st[i], &c.FltSave.FloatRegisters[i], 10);
     } else {
         WOW64_CONTEXT c{}; if (!getCtx32((HANDLE)hThread_, c)) return r;
         r.rax=c.Eax; r.rbx=c.Ebx; r.rcx=c.Ecx; r.rdx=c.Edx; r.rsi=c.Esi; r.rdi=c.Edi;
         r.rbp=c.Ebp; r.rsp=c.Esp; r.rip=c.Eip; r.eflags=c.EFlags;
         r.cs=(uint16_t)c.SegCs; r.ds=(uint16_t)c.SegDs; r.es=(uint16_t)c.SegEs;
         r.fs=(uint16_t)c.SegFs; r.gs=(uint16_t)c.SegGs; r.ss=(uint16_t)c.SegSs;
+        r.hasFpu = true; r.fpuStatus=(uint16_t)c.FloatSave.StatusWord; r.fpuControl=(uint16_t)c.FloatSave.ControlWord; r.fpuTag=(uint16_t)c.FloatSave.TagWord;
+        for (int i=0;i<8;++i) memcpy(r.st[i], &c.FloatSave.RegisterArea[i*10], 10);
+    }
+    // TEB->LastErrorValue (x64 offset 0x68, x86/WOW64 0x34). Se lee del TEB del hilo actual.
+    {
+        typedef LONG(NTAPI * Fn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        static auto f = (Fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+        struct TBI { LONG ExitStatus; PVOID TebBaseAddress; struct { HANDLE p,t; } Cid; ULONG_PTR Aff; LONG Prio, BasePrio; } tbi{};
+        if (f && f((HANDLE)hThread_, 0, &tbi, sizeof(tbi), nullptr) == 0 && tbi.TebBaseAddress) {
+            // En WOW64, NtQueryInformationThread devuelve el TEB64; el TEB32 (donde el
+            // codigo de 32 bits guarda LastError en 0x34) esta en TEB64 + 0x2000.
+            const uint64_t teb = (uint64_t)tbi.TebBaseAddress + (is64_ ? 0 : 0x2000);
+            readMemory(teb + (is64_ ? 0x68 : 0x34), &r.lastError, 4);
+        }
     }
     return r;
 }

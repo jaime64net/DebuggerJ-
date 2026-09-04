@@ -422,6 +422,9 @@ private:
     std::vector<MemRegion> memMap_;
 
     // --- Volcado Hex dedicado ---
+    bool          dumpFollowRip_ = true;   // el volcado sigue el RIP mientras trazas (Olly)
+    void          followInDump(uint64_t va);
+    bool          extractBracketVAPublic(const std::string& text, uint64_t& va);
     char          dumpGotoBuf_[32] = {0};
     uint64_t      dumpBase_ = 0;
     std::vector<uint8_t> dumpBuf_;

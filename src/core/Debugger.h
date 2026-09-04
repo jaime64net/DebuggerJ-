@@ -31,6 +31,10 @@ struct Registers {
     uint64_t r8=0, r9=0, r10=0, r11=0, r12=0, r13=0, r14=0, r15=0;
     uint32_t eflags=0;
     uint16_t cs=0, ds=0, es=0, fs=0, gs=0, ss=0;
+    uint32_t lastError=0;          // TEB->LastErrorValue
+    bool     hasFpu=false;
+    uint16_t fpuStatus=0, fpuControl=0, fpuTag=0;
+    uint8_t  st[8][10]={};         // ST0..ST7 (80-bit x87), bytes crudos
     uint64_t ip() const { return rip; }
 };
 
