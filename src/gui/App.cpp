@@ -153,6 +153,8 @@ App::~App() {
       for (auto* r : mcpQueue_) { r->resp.set_value("{\"ok\":false,\"error\":\"cerrando\"}"); delete r; }
       mcpQueue_.clear(); }
     if (aiThread_.joinable()) aiThread_.join();
+    respawnActive_.store(false);
+    if (respawnThread_.joinable()) respawnThread_.join();
     debugger_.detachAndStop();
 }
 
@@ -923,6 +925,7 @@ void App::render() {
     // Stop pedido por el usuario: cuando el motor reporta Exited (o ya volvio a Idle)
     // recargamos el archivo para que todas las ventanas muestren los valores estaticos.
     if (reloadAfterStop_ && (s == DbgState::Exited || s == DbgState::Idle)) { reloadAfterStop_ = false; finishStopReload(); }
+    tickWaitForRespawn();
 
     drainMcpQueue();
 
@@ -1332,6 +1335,12 @@ void App::drawMenuBar() {
             ImGui::Separator();
             if (ImGui::MenuItem("Attach a proceso...", nullptr, false, dbgState_ == DbgState::Idle)) openAttachDialog();
             {
+                const bool respawnBusy = respawnActive_.load() || respawnKillPending_ || respawnFoundPid_.load() != 0;
+                const bool sessionLive = dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused || dbgState_ == DbgState::Launching;
+                if (!respawnBusy) { if (ImGui::MenuItem("Wait for respawn", nullptr, false, sessionLive)) startWaitForRespawn(); }
+                else if (ImGui::MenuItem(("Cancelar Wait for respawn (" + respawnName_ + ")").c_str())) cancelWaitForRespawn();
+            }
+            {
                 bool canDetach = dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused || dbgState_ == DbgState::Launching;
                 if (ImGui::MenuItem("Detach (sin terminar)", nullptr, false, canDetach)) {
                     std::string error;
@@ -1367,6 +1376,12 @@ void App::drawMenuBar() {
         if (ImGui::BeginMenu("Depurar")) {
             if (ImGui::MenuItem("Lanzar bajo debug", "F9", false, fileLoaded_)) startDebugSession();
             if (ImGui::MenuItem("Adjuntar a proceso...", nullptr, false, dbgState_ == DbgState::Idle)) openAttachDialog();
+            {
+                const bool respawnBusy = respawnActive_.load() || respawnKillPending_ || respawnFoundPid_.load() != 0;
+                const bool sessionLive = dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused || dbgState_ == DbgState::Launching;
+                if (!respawnBusy) { if (ImGui::MenuItem("Wait for respawn", nullptr, false, sessionLive)) startWaitForRespawn(); }
+                else if (ImGui::MenuItem(("Cancelar Wait for respawn (" + respawnName_ + ")").c_str())) cancelWaitForRespawn();
+            }
             if (ImGui::MenuItem("Desadjuntar (sin terminar)", nullptr, false, dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused || dbgState_ == DbgState::Launching)) {
                 std::string error;
                 if (!debugger_.detach(error)) pushLog("Desadjuntar: " + error);
@@ -1536,6 +1551,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Los breakpoints de la imagen principal se relocalizan automaticamente cuando ASLR cambia la base al lanzar o adjuntarse.");
             ImGui::BulletText("F5 lanza o continua; F8 entra en calls (step into); F10 los salta (step over); F11 ejecuta hasta ret; Pause detiene una sesion activa.");
             ImGui::BulletText("Depurar -> Adjuntar a proceso abre una LISTA de procesos (PID, nombre, x86/x64, titulo de ventana y ruta) con filtro; doble clic o 'Adjuntar' se conecta (queda un campo de PID manual como respaldo). 'Desadjuntar' deja el proceso ejecutando sin DebuggerJ++. Requiere permisos suficientes y se recomienda usarlo solo en la VM de analisis.");
+            ImGui::BulletText("Wait for respawn (Archivo/Depurar, bajo Attach): con un proceso adjuntado o lanzado, lo termina, libera la sesion y deja un guard que vigila la tabla de procesos cada 30 ms; en cuanto reaparece un proceso con el mismo ejecutable (mismo nombre y, si se puede leer, misma ruta; nuevo PID) lo adjunta y queda pausado en el breakpoint del loader. Se ve en la barra de estado y se cancela desde el mismo menu. Tambien por MCP wait_respawn / cancel_wait_respawn.");
             ImGui::BulletText("Stop (toolbar o Depurar -> Detener) termina el proceso y RECARGA el archivo abierto en vista estatica: CPU, strings, packers, memoria y registros vuelven a los valores del archivo (como recien abierto). Los comentarios/etiquetas persisten en disco.");
             ImGui::BulletText("Archivo -> Cerrar actual (Ctrl+W) cierra el archivo y la sesion activa dejando la app vacia, sin salir. Archivo -> Salir cierra DebuggerJ++.");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
@@ -1868,6 +1884,7 @@ void App::resetLiveState() {
 }
 
 void App::closeCurrent() {
+    if (respawnActive_.load() || respawnKillPending_ || respawnFoundPid_.load()) cancelWaitForRespawn();
     if (debugger_.state() != DbgState::Idle) debugger_.detachAndStop();
     reloadAfterStop_ = false; pendingSwitchPid_ = 0;
     dbgState_ = DbgState::Idle;
@@ -1894,6 +1911,116 @@ void App::stopSession() {
     reloadAfterStop_ = true;
     debugger_.stop();
     pushLog("Stop: terminando el proceso...");
+}
+
+// ---------------------------------------------------------------------------
+// Wait for respawn
+// Termina el proceso depurado (y libera la sesion) y deja un guard vigilando
+// la tabla de procesos; en cuanto aparece un proceso con el mismo ejecutable
+// (nuevo PID) se adjunta y queda pausado en el breakpoint del loader. Util para
+// malware/servicios que se relanzan (watchdog, tarea programada, dropper).
+// ---------------------------------------------------------------------------
+void App::startWaitForRespawn() {
+    DbgState s = debugger_.state();
+    if (s == DbgState::Idle || s == DbgState::Exited) { pushLog("Wait for respawn: no hay un proceso activo."); return; }
+    if (respawnActive_.load() || respawnKillPending_) { pushLog("Wait for respawn: ya esta activo."); return; }
+    respawnOldPid_ = debugger_.pid();
+    respawnPath_.clear();
+    if (HANDLE h = (HANDLE)debugger_.processHandle()) {
+        wchar_t path[MAX_PATH] = {0}; DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(h, 0, path, &n)) respawnPath_ = path;
+    }
+    if (respawnPath_.empty()) respawnPath_ = loadedPath_;
+    if (respawnPath_.empty()) { pushLog("Wait for respawn: no se pudo determinar el ejecutable del proceso."); return; }
+    auto pos = respawnPath_.find_last_of(L"\\/");
+    respawnName_ = wToUtf8(pos == std::wstring::npos ? respawnPath_ : respawnPath_.substr(pos + 1));
+    std::transform(respawnName_.begin(), respawnName_.end(), respawnName_.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+
+    respawnFoundPid_.store(0);
+    respawnKillPending_ = true;
+    respawnPauseFrames_ = 0;
+    reloadAfterStop_ = false;
+    pushLog("Wait for respawn: terminando PID " + std::to_string(respawnOldPid_) + " (" + respawnName_ + ") y vigilando su reaparicion...");
+    debugger_.stop();
+    // El guard arranca ya (excluye el PID viejo); el attach se hace cuando la sesion vuelva a Idle.
+    if (respawnThread_.joinable()) respawnThread_.join();
+    respawnActive_.store(true);
+    respawnThread_ = std::thread([this]{ respawnWatcher(); });
+}
+
+void App::cancelWaitForRespawn() {
+    respawnActive_.store(false);
+    if (respawnThread_.joinable()) respawnThread_.join();
+    respawnFoundPid_.store(0);
+    respawnKillPending_ = false;
+    respawnPauseFrames_ = 0;
+    pushLog("Wait for respawn cancelado.");
+}
+
+void App::respawnWatcher() {
+    const std::wstring wantPath = respawnPath_;
+    const std::string wantName = respawnName_;
+    const uint32_t oldPid = respawnOldPid_;
+    while (respawnActive_.load()) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+            uint32_t found = 0;
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (pe.th32ProcessID == 0 || pe.th32ProcessID == oldPid) continue;
+                    std::string nm = wToUtf8(pe.szExeFile);
+                    std::transform(nm.begin(), nm.end(), nm.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+                    if (nm != wantName) continue;
+                    // Si podemos leer la ruta y NO coincide, es otro binario con el mismo nombre: se ignora.
+                    bool pathOk = true;
+                    if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID)) {
+                        wchar_t path[MAX_PATH] = {0}; DWORD n = MAX_PATH;
+                        if (QueryFullProcessImageNameW(h, 0, path, &n) && !wantPath.empty() && _wcsicmp(path, wantPath.c_str()) != 0) pathOk = false;
+                        CloseHandle(h);
+                    }
+                    if (pathOk) { found = pe.th32ProcessID; break; }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+            if (found) { respawnFoundPid_.store(found); respawnActive_.store(false); return; }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+}
+
+void App::tickWaitForRespawn() {
+    // 1) El proceso viejo termino: liberar la sesion (join del motor) y volver a la vista estatica.
+    if (respawnKillPending_) {
+        DbgState s = debugger_.state();
+        if (s == DbgState::Exited || s == DbgState::Idle) {
+            debugger_.detachAndStop();
+            dbgState_ = DbgState::Idle;
+            resetLiveState();
+            if (fileLoaded_) refreshDisassembly();
+            respawnKillPending_ = false;
+            pushLog("Wait for respawn: proceso terminado; esperando a " + respawnName_ + "...");
+        }
+        return;
+    }
+    // 2) El guard vio el nuevo proceso: adjuntar en cuanto la sesion este libre.
+    uint32_t pid = respawnFoundPid_.load();
+    if (pid && debugger_.state() == DbgState::Idle) {
+        respawnFoundPid_.store(0);
+        if (respawnThread_.joinable()) respawnThread_.join();
+        pushLog("Wait for respawn: " + respawnName_ + " reaparecio con PID " + std::to_string(pid) + "; adjuntando...");
+        attachToProcess(pid);
+        respawnPauseFrames_ = 1;   // vigilar que quede pausado
+        return;
+    }
+    // 3) Tras adjuntar, el loader dispara un breakpoint y el motor pausa solo. Si por lo que sea
+    //    sigue corriendo mas de ~1 s, forzamos la pausa para entregarlo detenido.
+    if (respawnPauseFrames_ > 0) {
+        DbgState s = debugger_.state();
+        if (s == DbgState::Paused) { respawnPauseFrames_ = 0; pushLog("Wait for respawn: proceso adjuntado y detenido en el debugger."); }
+        else if (s == DbgState::Idle || s == DbgState::Exited) { respawnPauseFrames_ = 0; pushLog("Wait for respawn: el attach no prospero (el proceso salio o fue rechazado)."); }
+        else if (s == DbgState::Running && ++respawnPauseFrames_ > 60) { debugger_.pause(); respawnPauseFrames_ = 1; }
+    }
 }
 
 void App::finishStopReload() {
@@ -5152,6 +5279,9 @@ void App::drawStatusBar() {
     if (mcp_.running()) {
         ImGui::SameLine(); ImGui::TextColored(ImVec4(0.6f,0.8f,1,1), "| MCP:%d (%d)", mcp_.port(), mcp_.clients());
     }
+    if (respawnActive_.load() || respawnKillPending_) {
+        ImGui::SameLine(); ImGui::TextColored(ImVec4(1,0.85f,0.3f,1), "| Esperando respawn de %s...", respawnName_.c_str());
+    }
 
     // Derecha: caja de estado coloreada
     const char* st = "Terminated"; ImVec4 bg(0.4f,0.4f,0.4f,1);
@@ -5711,6 +5841,7 @@ static int mcpRequiredAccess(const std::string& cmd) {
         cmd == "add_exc_bp" || cmd == "rm_exc_bp" || cmd == "set_event_breaks" ||
         cmd == "set_bookmark" || cmd == "del_bookmark" || cmd == "clear_analysis" ||
         cmd == "set_follow_children" || cmd == "switch_to_child" || cmd == "run_to" || cmd == "run_until" ||
+        cmd == "wait_respawn" || cmd == "cancel_wait_respawn" ||
         cmd == "skip_instruction" || cmd == "undo_instruction" || cmd == "animate" ||
         cmd == "find_oep" || cmd == "run_trace") return 1;
     return 0;
@@ -6363,6 +6494,12 @@ std::string App::handleMcpCommand(const std::string& line) {
         res["follow"] = debugger_.followChildren();
         for (uint32_t p : debugger_.childPids()) res["children"].push_back(p);
     }
+    else if (cmd == "wait_respawn") {
+        DbgState st = debugger_.state();
+        if (st == DbgState::Idle || st == DbgState::Exited) { res["ok"] = false; res["error"] = "no hay un proceso activo"; }
+        else { startWaitForRespawn(); res["waiting_for"] = respawnName_; res["old_pid"] = respawnOldPid_; }
+    }
+    else if (cmd == "cancel_wait_respawn") { cancelWaitForRespawn(); }
     else if (cmd == "switch_to_child") {
         uint32_t pid = static_cast<uint32_t>(a.value("pid", 0));
         if (!pid) { res["ok"] = false; res["error"] = "pid requerido"; }
@@ -6567,6 +6704,8 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("export_report", "Exporta el informe Markdown a path.", obj({{"path", STR}}, {"path"}));
     add("attach",      "Se adjunta a un proceso existente por PID; intenta abrir tambien su PE estatico.", obj({{"pid", INT}}, {"pid"}));
     add("detach",      "Desadjunta un proceso conectado por Attach sin terminarlo.", obj(EMPTY, {}));
+    add("wait_respawn", "Termina el proceso actual y deja un guard que, cuando vuelva a existir un proceso con el mismo ejecutable, lo adjunta y lo deja pausado en el loader. status refleja el progreso.", obj(EMPTY, {}));
+    add("cancel_wait_respawn", "Cancela el guard de wait_respawn.", obj(EMPTY, {}));
     add("launch",      "Lanza el archivo abierto bajo depuracion.", obj(EMPTY, {}));
     add("restart",     "Detiene la sesion actual y reinicia el ejecutable abierto bajo depuracion.", obj(EMPTY, {}));
     add("go",          "Continua la ejecucion (Play).", obj(EMPTY, {}));

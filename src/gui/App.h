@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 #include "core/PeFile.h"
@@ -301,6 +302,19 @@ private:
     void          finishStopReload();     // completa el Stop cuando el motor ya salio (render)
     void          resetLiveState();       // limpia registros/memoria/IP de la sesion viva
     bool          reloadAfterStop_ = false;
+    // --- Wait for respawn: termina/desadjunta el target y espera a que vuelva a existir para adjuntarlo pausado ---
+    std::wstring  respawnPath_;                 // ruta completa esperada (si se pudo obtener)
+    std::string   respawnName_;                 // nombre del exe (minusculas)
+    uint32_t      respawnOldPid_ = 0;           // PID que se termino (se excluye del guard)
+    std::atomic<bool>     respawnActive_{false};   // el hilo guard esta vigilando
+    std::atomic<uint32_t> respawnFoundPid_{0};     // PID detectado por el guard (lo consume render)
+    std::thread   respawnThread_;
+    bool          respawnKillPending_ = false;  // esperando a que el proceso actual termine
+    int           respawnPauseFrames_ = 0;      // tras adjuntar: frames en Running antes de forzar pausa (0 = no vigilar)
+    void          startWaitForRespawn();
+    void          cancelWaitForRespawn();
+    void          respawnWatcher();             // cuerpo del hilo guard
+    void          tickWaitForRespawn();         // en render(): kill -> guard -> attach -> pausa
     int           selectedInsn_ = -1;
     int           selAnchor_ = -1;     // ancla para seleccion multiple (rango [anchor..sel])
     int           pendingScroll_ = -1; // indice de instruccion al que hay que desplazar

@@ -83,6 +83,8 @@ const TOOLS = [
   ["export_report", "Exporta un informe Markdown a path.", S({ path: { type: "string" } }, ["path"])],
   ["attach",      "Se adjunta a un proceso existente por PID.", S({ pid: { type: "integer", minimum: 1 } }, ["pid"])],
   ["detach",      "Desadjunta un proceso conectado por Attach sin terminarlo.", S()],
+  ["wait_respawn", "Termina el proceso actual y deja un guard que, al reaparecer un proceso con el mismo ejecutable, lo adjunta y lo deja pausado en el loader.", S()],
+  ["cancel_wait_respawn", "Cancela el guard de wait_respawn.", S()],
   ["eval",        "Evalua una expresion (hex por defecto; byte/dword/ptr(a), reg, mod.base/fromname, dis.len, [mem], variables globales).", S({ expr: { type: "string" } }, ["expr"])],
   ["var_set",     "Define una variable global (usable en expresiones). value es una expresion.", S({ name: { type: "string" }, value: { type: "string" } }, ["name", "value"])],
   ["var_get",     "Lee una variable global.", S({ name: { type: "string" } }, ["name"])],
