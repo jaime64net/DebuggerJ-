@@ -2,6 +2,7 @@
 #include <deque>
 #include <future>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <mutex>
 #include <string>
@@ -433,6 +434,33 @@ private:
     char          dumpGotoBuf_[32] = {0};
     uint64_t      dumpBase_ = 0;
     std::vector<uint8_t> dumpBuf_;
+
+    // --- CPU estilo x64dbg: simbolizacion, columna de comentarios automatica y flow ---
+    struct ModRange { uint64_t base = 0, size = 0; std::string name, path; bool system = false; };
+    std::vector<ModRange> modRanges_;          // modulos cargados (base/tamano) para resolver "mod.DIR"
+    uint64_t      cpuGen_ = 0;                 // cambia en cada pausa: invalida las caches de abajo
+    uint64_t      cpuGenRegs_ = 0; size_t cpuGenMods_ = (size_t)-1; int cpuGenState_ = -1;
+    std::unordered_map<uint64_t, std::string> symCache_;   // VA -> simbolo DbgHelp (o "")
+    std::unordered_map<uint64_t, std::string> infoCache_;  // VA de instruccion -> texto de la columna Comentario
+    uint64_t      infoCacheGen_ = (uint64_t)-1;
+    void          cpuTouchGeneration();
+    void          refreshModRanges();
+    const ModRange* modRangeAt(uint64_t va) const;
+    std::string   modShortName(const ModRange* m) const;   // "gdi32full" (sin extension)
+    std::string   symCached(uint64_t va);
+    std::string   fmtSymX64(uint64_t va);      // "mod.nombre+OFF" o ""
+    std::string   fmtAddrX64(uint64_t va);     // "<mod.nombre>" | "mod.HEX" | "0xHEX"
+    std::string   buildInfoText(const Instruction& in);
+    bool          regValueByName(const std::string& name, uint64_t& out) const;
+    bool          effectiveAddress(const std::string& expr, uint64_t& ea) const;
+    std::string   stringAtVA(uint64_t va, size_t maxLen = 40);
+    void          drawInstructionColored(const Instruction& in, bool isCur);
+    int           callStackThreadSel_ = -1;    // -1 = todos los hilos
+    struct SecInfo { std::string name; uint32_t va = 0, vsize = 0, raw = 0; };
+    std::map<uint64_t, std::vector<SecInfo>> secCache_;   // base de modulo -> secciones (leidas de memoria)
+    const std::vector<SecInfo>& sectionsOfModule(const ModRange* m);
+    std::string   cpuLocationLine(uint64_t va);   // ".text:VA mod.dll:$RVA #offset" (x64dbg)
+    void          drawCpuInfoBox();                // cuadro bajo el desensamblado: valores de operandos + ubicacion
 
     // --- Anotaciones (comentarios/etiquetas) ---
     std::map<uint64_t, std::string> comments_;

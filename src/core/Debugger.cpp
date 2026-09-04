@@ -286,8 +286,26 @@ static BOOL CALLBACK debuggerReadMemory64(HANDLE process, DWORD64 address, PVOID
 }
 
 std::vector<Debugger::StackFrame> Debugger::walkStack(size_t maxFrames) {
+    if (state_.load() != DbgState::Paused || !hProcess_ || !hThread_ || !maxFrames) return {};
+    return walkStackHandle(hThread_, maxFrames);
+}
+
+// Call stack de cualquier hilo del proceso detenido. Mientras el debuggee esta
+// parado en un evento de depuracion TODOS sus hilos estan suspendidos, asi que
+// el contexto de otro hilo es estable y StackWalk64 puede recorrerlo.
+std::vector<Debugger::StackFrame> Debugger::walkStackOf(uint32_t tid, size_t maxFrames) {
+    if (state_.load() != DbgState::Paused || !hProcess_ || !maxFrames) return {};
+    if (!tid || tid == curTid_) return walkStack(maxFrames);
+    HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) return {};
+    auto out = walkStackHandle(h, maxFrames);
+    CloseHandle(h);
+    return out;
+}
+
+std::vector<Debugger::StackFrame> Debugger::walkStackHandle(void* hThread, size_t maxFrames) {
     std::vector<StackFrame> out;
-    if (state_.load() != DbgState::Paused || !hProcess_ || !hThread_ || !maxFrames) return out;
+    if (!hThread || !maxFrames) return out;
 
     STACKFRAME64 frame{};
     DWORD machine = 0;
@@ -296,13 +314,13 @@ std::vector<Debugger::StackFrame> Debugger::walkStack(size_t maxFrames) {
     void* context = nullptr;
     if (is64_) {
         c64.ContextFlags = CONTEXT_ALL;
-        if (!GetThreadContext((HANDLE)hThread_, &c64)) return out;
+        if (!GetThreadContext((HANDLE)hThread, &c64)) return out;
         machine = IMAGE_FILE_MACHINE_AMD64;
         frame.AddrPC.Offset = c64.Rip; frame.AddrFrame.Offset = c64.Rbp; frame.AddrStack.Offset = c64.Rsp;
         context = &c64;
     } else {
         c32.ContextFlags = WOW64_CONTEXT_ALL;
-        if (!Wow64GetThreadContext((HANDLE)hThread_, &c32)) return out;
+        if (!Wow64GetThreadContext((HANDLE)hThread, &c32)) return out;
         machine = IMAGE_FILE_MACHINE_I386;
         frame.AddrPC.Offset = c32.Eip; frame.AddrFrame.Offset = c32.Ebp; frame.AddrStack.Offset = c32.Esp;
         context = &c32;
@@ -324,7 +342,7 @@ std::vector<Debugger::StackFrame> Debugger::walkStack(size_t maxFrames) {
     append(frame);
     for (size_t i = 1; i < maxFrames; ++i) {
         const DWORD64 previous = frame.AddrPC.Offset;
-        if (!StackWalk64(machine, hProcess_, (HANDLE)hThread_, &frame, context, debuggerReadMemory64,
+        if (!StackWalk64(machine, hProcess_, (HANDLE)hThread, &frame, context, debuggerReadMemory64,
                          SymFunctionTableAccess64, SymGetModuleBase64, nullptr) ||
             !frame.AddrPC.Offset || frame.AddrPC.Offset == previous)
             break;

@@ -252,10 +252,13 @@ public:
         std::string source;
     };
     std::vector<StackFrame> walkStack(size_t maxFrames = 64);
+    // Call stack de OTRO hilo del proceso detenido (tid). Con tid del hilo actual usa walkStack.
+    std::vector<StackFrame> walkStackOf(uint32_t tid, size_t maxFrames = 64);
     std::vector<std::pair<uint64_t, uint64_t>> sehChain(); // x86: (record, handler)
 
 private:
     void debugLoop();
+    std::vector<StackFrame> walkStackHandle(void* hThread, size_t maxFrames);
     void handleEvent(void* dbgEvent /*DEBUG_EVENT*/, uint32_t& continueStatus);
     void installBreakpoint(Breakpoint& bp);
     void uninstallBreakpoint(Breakpoint& bp);

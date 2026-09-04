@@ -1599,7 +1599,10 @@ void App::drawHelpWindow() {
             ImGui::Separator();
             ImGui::TextUnformatted("Flujo recomendado");
             ImGui::BulletText("Archivo -> Abrir: analiza el PE estatico, secciones, imports, exports, strings y packers. La cache evita repetir esos escaneos.");
-            ImGui::BulletText("CPU: navega con doble clic en calls, jumps, referencias y modulos. Las guias Flow a la izquierda de las direcciones muestran cada jmp/jz/jnz/etc. que cae dentro de la vista; punto = origen, flecha = destino, naranja = hacia abajo y azul = hacia arriba. Clic derecho sobre el jump -> Jump To abre su destino. El mismo menu permite agregar bookmarks.");
+            ImGui::BulletText("CPU (estilo x64dbg): la columna Flow dibuja cada salto de la vista como una linea vertical (punteada = condicional, solida = jmp) con un conector en el origen y una flecha en el destino; los saltos que envuelven a otros van mas a la izquierda; el salto de la linea seleccionada se pinta amarillo y el de la instruccion actual verde (saltara) o rojo (no salta). Una linea solida pegada a la direccion marca el procedimiento (desde la primera instruccion util hasta el ret). Junto a los bytes, 'v'/'^' indica si el salto va hacia abajo o arriba.");
+            ImGui::BulletText("CPU colores: mnemonico azul; jmp/jcc/call/ret rojos; int3/nop grises; registros lila; inmediatos rojos; fs:/gs: con fondo rojo. El destino de call/jmp se muestra como 'modulo.DIRECCION' o '<modulo.simbolo>' cuando cae exacto en un simbolo (DbgHelp/etiquetas).");
+            ImGui::BulletText("CPU columna Comentario: para TODO el modulo, sin Analyze: comentario propio (verde) o analisis automatico (azul): 'dll.API' en call/jmp por IAT, 'reg:simbolo' o 'reg:\"texto\"' segun el valor actual de cada registro usado, '[mem]:simbolo' para el puntero leido en el operando de memoria e inmediatos que caen en un modulo. Se recalcula en cada pausa.");
+            ImGui::BulletText("Call stack (x64dbg): lista de hilos a la izquierda (Main Thread = primero; '*' = hilo actual; 'Todos los hilos' muestra cada pila separada) y tabla Address (donde vive la direccion de retorno), To (a donde regresa), From (instruccion del frame), Size, Party (System = modulo bajo Windows, User = resto) y Comment (modulo.simbolo+off). Doble clic o menu contextual para seguir From/To en la CPU.");
             ImGui::BulletText("Analyze this: analiza linealmente hasta un ret, guarda una funcion candidata, xrefs call/jump y loops por saltos hacia atras. Consulta Window -> Analysis para navegar esos resultados; se guardan en cache. No sustituye un CFG/decompilador completo.");
             ImGui::BulletText("Panel Breakpoints: 'Remove all' quita todos los software; 'Remove all (sw+hw+exc)' tambien hardware y de excepcion. La cache .bp.json del binario se actualiza sola.");
             ImGui::BulletText("Breakpoints: clic en la columna BP de CPU para software; usa el panel Breakpoints para hardware, excepciones y memoria. 'Parar en N' ignora los N-1 primeros hits.");
@@ -1774,6 +1777,7 @@ void App::drawHelpWindow() {
             ImGui::TextColored(ImVec4(0.6f,0.85f,1,1), "Mejoras inspiradas en x64dbg (ver docs/X64DBG_DEV_ANALISIS.md)");
             ImGui::BulletText("HECHO: motor de expresiones (eval/watch/struct), command bar hibrida + comandos de texto, Watch, Struct viewer + inferencia IA, Search for, symbol server, resumen de traza con IA, ai.classify, breakpoints con accion (M3), hot-reload plugins (M11), headless (M10), MCP bypass, bus de eventos + streaming poll_events (Fase 3), DB de analisis portable por hash (M6), informe JSON, comparacion de dumps (diff_files), CFG basico.");
             ImGui::BulletText("PARCIAL: seguir procesos hijos (M7): se detectan/reportan/listan (list_children) pero falta following completo (adoptar el hijo como target activo con su propio contexto). Capa de comandos: falta parser de texto avanzado (solo key=val).");
+            ImGui::BulletText("HECHO (2026-09-04, look x64dbg): lineas de salto anidadas punteadas/solidas con flechas y corchetes de procedimiento en la CPU; coloreado por tokens (saltos/call/ret rojos); destinos 'mod.DIR'/'<mod.simbolo>'; columna Comentario automatica para todo el modulo (registros, memoria, strings, IAT); Call stack por hilo con Address/To/From/Size/Party/Comment.");
             ImGui::BulletText("HECHO (proyectos grandes): lenguaje de scripting (Script/run_script); SARIF 2.1.0; CFG interactivo con bloques basicos (pan/zoom); validacion de dumps (validate_dump).");
             ImGui::BulletText("PARCIAL: seguir procesos hijos (deteccion+listado+conmutacion manual, falta simultaneo); unpacking/IAT (dump+validacion+fix experimental, falta reconstruccion PE 100%% robusta).");
             ImGui::BulletText("FUERA DE ALCANCE por ahora: decompilador nativo real (el panel Code da interpretacion por IA, no genera pseudo-C fiel). Es un proyecto en si mismo.");
@@ -2366,46 +2370,500 @@ void App::drawCpuPanel() {
     ImGui::End();
 }
 
+// ---------------------------------------------------------------------------
+// CPU estilo x64dbg: simbolizacion de operandos, columna Comentario automatica
+// (registros -> simbolo/string, memoria, inmediatos) y coloreado por tokens.
+// ---------------------------------------------------------------------------
+static const std::set<std::string>& x64RegNames() {
+    static std::set<std::string> regs;
+    if (regs.empty()) {
+        const char* base[] = {"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp","rip","eax","ebx","ecx","edx","esi","edi","ebp","esp","eip",
+                              "ax","bx","cx","dx","si","di","bp","sp","al","ah","bl","bh","cl","ch","dl","dh","sil","dil","bpl","spl",
+                              "cs","ds","es","fs","gs","ss","eflags","rflags","flags"};
+        for (auto r : base) regs.insert(r);
+        for (int i = 8; i <= 15; ++i) { std::string r = "r" + std::to_string(i); regs.insert(r); regs.insert(r + "b"); regs.insert(r + "w"); regs.insert(r + "d"); }
+        for (int i = 0; i < 32; ++i) { regs.insert("xmm" + std::to_string(i)); regs.insert("ymm" + std::to_string(i)); regs.insert("zmm" + std::to_string(i)); }
+        for (int i = 0; i < 8; ++i) { regs.insert("st" + std::to_string(i)); regs.insert("st(" + std::to_string(i) + ")"); regs.insert("mm" + std::to_string(i)); regs.insert("k" + std::to_string(i)); regs.insert("cr" + std::to_string(i)); regs.insert("dr" + std::to_string(i)); }
+        regs.insert("cr8");
+    }
+    return regs;
+}
+static bool x64IsSizeKw(const std::string& t) {
+    return t == "byte" || t == "word" || t == "dword" || t == "qword" || t == "tbyte" || t == "fword" ||
+           t == "xmmword" || t == "ymmword" || t == "zmmword" || t == "ptr" || t == "far" || t == "near" || t == "short";
+}
+// Registro parcial -> registro completo de 64 bits (para leer su valor en regs_).
+static std::string x64FullReg(const std::string& r) {
+    static const std::map<std::string, std::string> m = {
+        {"eax","rax"},{"ax","rax"},{"al","rax"},{"ah","rax"},{"ebx","rbx"},{"bx","rbx"},{"bl","rbx"},{"bh","rbx"},
+        {"ecx","rcx"},{"cx","rcx"},{"cl","rcx"},{"ch","rcx"},{"edx","rdx"},{"dx","rdx"},{"dl","rdx"},{"dh","rdx"},
+        {"esi","rsi"},{"si","rsi"},{"sil","rsi"},{"edi","rdi"},{"di","rdi"},{"dil","rdi"},{"ebp","rbp"},{"bp","rbp"},{"bpl","rbp"},
+        {"esp","rsp"},{"sp","rsp"},{"spl","rsp"},{"eip","rip"}};
+    auto it = m.find(r); if (it != m.end()) return it->second;
+    if (r.size() >= 2 && r[0] == 'r' && std::isdigit((unsigned char)r[1])) {
+        std::string s = r; while (!s.empty() && !std::isdigit((unsigned char)s.back())) s.pop_back();
+        return s;
+    }
+    return r;
+}
+struct X64Token { std::string text; int kind = 0; }; // 0 punct, 1 mnemonic, 2 reg, 3 number, 4 sizekw, 5 symbol/mod.addr, 6 segment fs/gs, 7 ident
+static std::vector<X64Token> x64Tokenize(const std::string& text) {
+    std::vector<X64Token> out; size_t i = 0; bool first = true;
+    auto isIdent = [](char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '.' || c == '<' || c == '>' || c == '!' || c == '(' || c == ')' || c == '@' || c == '$' || c == '?'; };
+    while (i < text.size()) {
+        char c = text[i];
+        if (isIdent(c)) {
+            size_t j = i; while (j < text.size() && isIdent(text[j])) ++j;
+            X64Token t; t.text = text.substr(i, j - i);
+            std::string low = t.text; for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
+            bool segNext = (j < text.size() && text[j] == ':');
+            if (first) t.kind = 1;
+            else if (segNext && (low == "fs" || low == "gs")) t.kind = 6;
+            else if (x64RegNames().count(low)) t.kind = 2;
+            else if (x64IsSizeKw(low)) t.kind = 4;
+            else if (std::isdigit((unsigned char)low[0])) t.kind = 3;
+            else if (low.find('.') != std::string::npos || low[0] == '<') t.kind = 5;
+            else t.kind = 7;
+            first = false; out.push_back(std::move(t)); i = j;
+        } else { X64Token t; t.text = std::string(1, c); t.kind = 0; out.push_back(std::move(t)); ++i; }
+    }
+    return out;
+}
+static std::string x64Hex(uint64_t v) { char b[32]; std::snprintf(b, sizeof(b), "%llX", (unsigned long long)v); return b; }
+static void x64DashedLine(ImDrawList* d, ImVec2 a, ImVec2 b, ImU32 col, float th, bool dashed) {
+    if (!dashed) { d->AddLine(a, b, col, th); return; }
+    const float dash = 3.0f, gap = 3.0f, period = dash + gap;
+    if (std::fabs(b.x - a.x) < 0.5f) {   // vertical: fase por Y absoluta para que las filas encajen
+        float y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
+        float y = y0 - std::fmod(y0, period);
+        for (; y < y1; y += period) { float s = std::max(y, y0), e = std::min(y + dash, y1); if (e > s) d->AddLine(ImVec2(a.x, s), ImVec2(a.x, e), col, th); }
+    } else {
+        float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x);
+        for (float x = x0; x < x1; x += period) d->AddLine(ImVec2(x, a.y), ImVec2(std::min(x + dash, x1), a.y), col, th);
+    }
+}
+
+void App::cpuTouchGeneration() {
+    const int st = (int)dbgState_;
+    uint64_t h = regs_.rip * 31 + regs_.rsp; h = h * 1315423911u + regs_.rax; h = h * 31 + regs_.rbx; h = h * 31 + regs_.rcx; h = h * 31 + regs_.rdx;
+    h = h * 31 + regs_.rsi; h = h * 31 + regs_.rdi; h = h * 31 + regs_.rbp; h = h * 31 + regs_.r8; h = h * 31 + regs_.r9; h = h * 31 + regs_.r10;
+    h = h * 31 + regs_.r11; h = h * 31 + regs_.r12; h = h * 31 + regs_.r13; h = h * 31 + regs_.r14; h = h * 31 + regs_.r15;
+    size_t nm = 0;
+    if (dbgState_ == DbgState::Paused) nm = debugger_.modules().size();
+    else if (fileLoaded_) nm = 1;
+    if (st != cpuGenState_ || h != cpuGenRegs_ || nm != cpuGenMods_) {
+        if (st != cpuGenState_ || nm != cpuGenMods_) { symCache_.clear(); secCache_.clear(); refreshModRanges(); }
+        cpuGenState_ = st; cpuGenRegs_ = h; cpuGenMods_ = nm; ++cpuGen_;
+    }
+}
+
+void App::refreshModRanges() {
+    modRanges_.clear();
+    char winDir[MAX_PATH] = {0}; GetWindowsDirectoryA(winDir, MAX_PATH);
+    std::string wd = winDir; for (auto& c : wd) c = (char)std::tolower((unsigned char)c);
+    auto isSystem = [&](std::string path) { for (auto& c : path) c = (char)std::tolower((unsigned char)c); return !wd.empty() && path.rfind(wd, 0) == 0; };
+    if (dbgState_ == DbgState::Paused) {
+        for (auto& m : debugger_.modules()) {
+            uint32_t e_lfanew = 0, sizeImg = 0; uint8_t hdr[2] = {0, 0};
+            if (debugger_.readMemory(m.base, hdr, 2) == 2 && hdr[0] == 'M' && hdr[1] == 'Z') {
+                debugger_.readMemory(m.base + 0x3C, &e_lfanew, 4);
+                debugger_.readMemory(m.base + e_lfanew + 24 + 0x38, &sizeImg, 4);
+            }
+            if (!sizeImg) sizeImg = 0x10000;
+            modRanges_.push_back({m.base, sizeImg, m.name, m.path, isSystem(m.path)});
+        }
+    }
+    if (fileLoaded_ && pe_.imageBase()) {
+        std::string pth(loadedPath_.begin(), loadedPath_.end());
+        auto q = pth.find_last_of("\\/");
+        std::string name = q == std::string::npos ? pth : pth.substr(q + 1);
+        bool have = false; for (auto& r : modRanges_) if (r.base == pe_.imageBase()) have = true;
+        if (!have) modRanges_.push_back({pe_.imageBase(), pe_.sizeOfImage(), name, pth, isSystem(pth)});
+    }
+}
+
+const App::ModRange* App::modRangeAt(uint64_t va) const {
+    for (auto& r : modRanges_) if (va >= r.base && va < r.base + r.size) return &r;
+    return nullptr;
+}
+
+std::string App::modShortName(const ModRange* m) const {
+    if (!m) return "";
+    std::string n = m->name; auto d = n.find_last_of('.');
+    if (d != std::string::npos && d > 0) n = n.substr(0, d);
+    return n;
+}
+
+std::string App::symCached(uint64_t va) {
+    if (dbgState_ != DbgState::Paused || !va) return "";
+    auto it = symCache_.find(va); if (it != symCache_.end()) return it->second;
+    if (symCache_.size() > 200000) symCache_.clear();
+    std::string s = debugger_.symbolAt(va);
+    symCache_[va] = s; return s;
+}
+
+// "mod!nombre+0xOFF" (DbgHelp) -> "mod.nombre+OFF" (x64dbg). Etiquetas propias primero.
+std::string App::fmtSymX64(uint64_t va) {
+    auto lb = labels_.find(canonVA(va));
+    if (lb != labels_.end()) { const ModRange* m = modRangeAt(va); return (m ? modShortName(m) + "." : "") + lb->second; }
+    std::string s = symCached(va);
+    if (s.empty()) return "";
+    auto p = s.find('!'); if (p != std::string::npos) s[p] = '.';
+    auto q = s.find("+0x"); if (q != std::string::npos) s.erase(q + 1, 2);
+    return s;
+}
+
+// Destino de call/jmp como en x64dbg: "<mod.simbolo>" si cae exactamente en un
+// simbolo, "mod.DIRECCION" si esta dentro de un modulo, y "0x..." si no.
+std::string App::fmtAddrX64(uint64_t va) {
+    std::string s = fmtSymX64(va);
+    if (!s.empty() && s.find('+') == std::string::npos) return "<" + s + ">";
+    const ModRange* m = modRangeAt(va);
+    if (m) return modShortName(m) + "." + x64Hex(va);
+    return "0x" + x64Hex(va);
+}
+
+bool App::regValueByName(const std::string& nameIn, uint64_t& out) const {
+    std::string n = nameIn; for (auto& c : n) c = (char)std::tolower((unsigned char)c);
+    std::string f = x64FullReg(n);
+    const Registers& r = regs_;
+    static const std::map<std::string, size_t> off = {
+        {"rax", offsetof(Registers, rax)}, {"rbx", offsetof(Registers, rbx)}, {"rcx", offsetof(Registers, rcx)}, {"rdx", offsetof(Registers, rdx)},
+        {"rsi", offsetof(Registers, rsi)}, {"rdi", offsetof(Registers, rdi)}, {"rbp", offsetof(Registers, rbp)}, {"rsp", offsetof(Registers, rsp)},
+        {"rip", offsetof(Registers, rip)}, {"r8", offsetof(Registers, r8)}, {"r9", offsetof(Registers, r9)}, {"r10", offsetof(Registers, r10)},
+        {"r11", offsetof(Registers, r11)}, {"r12", offsetof(Registers, r12)}, {"r13", offsetof(Registers, r13)}, {"r14", offsetof(Registers, r14)}, {"r15", offsetof(Registers, r15)}};
+    auto it = off.find(f); if (it == off.end()) return false;
+    uint64_t v = 0; std::memcpy(&v, reinterpret_cast<const uint8_t*>(&r) + it->second, sizeof(v));
+    // Sub-registros: recortar al ancho del operando (eax=32, ax=16, al=8, ah=bits 8-15).
+    if (n.size() == 3 && n[0] == 'e') v &= 0xFFFFFFFFull;
+    else if (n.size() >= 3 && n.back() == 'd' && n[0] == 'r' && std::isdigit((unsigned char)n[1])) v &= 0xFFFFFFFFull;
+    else if (n.size() >= 3 && n.back() == 'w' && n[0] == 'r' && std::isdigit((unsigned char)n[1])) v &= 0xFFFFull;
+    else if (n.size() >= 3 && n.back() == 'b' && n[0] == 'r' && std::isdigit((unsigned char)n[1])) v &= 0xFFull;
+    else if (n.size() == 2 && n[1] == 'x') v &= 0xFFFFull;
+    else if (n.size() == 2 && n[1] == 'l') v &= 0xFFull;
+    else if (n.size() == 2 && n[1] == 'h') v = (v >> 8) & 0xFFull;
+    else if (n == "si" || n == "di" || n == "bp" || n == "sp") v &= 0xFFFFull;
+    else if (n == "sil" || n == "dil" || n == "bpl" || n == "spl") v &= 0xFFull;
+    out = v; return true;
+}
+
+// Direccion efectiva de "[rax+rcx*8+0x10]" con los registros actuales. Falla con
+// segmentos fs/gs o registros desconocidos (xmm, etc.).
+bool App::effectiveAddress(const std::string& exprIn, uint64_t& ea) const {
+    std::string e = exprIn; for (auto& c : e) c = (char)std::tolower((unsigned char)c);
+    if (e.find("fs:") != std::string::npos || e.find("gs:") != std::string::npos) return false;
+    auto a = e.find('['), b = e.find(']'); if (a == std::string::npos || b == std::string::npos || b <= a) return false;
+    e = e.substr(a + 1, b - a - 1);
+    uint64_t sum = 0; size_t i = 0; bool any = false;
+    while (i < e.size()) {
+        int sign = 1;
+        if (e[i] == '+') { ++i; } else if (e[i] == '-') { sign = -1; ++i; }
+        size_t j = i; while (j < e.size() && e[j] != '+' && e[j] != '-') ++j;
+        std::string term = e.substr(i, j - i);
+        if (term.empty()) return false;
+        uint64_t val = 0; uint64_t scale = 1;
+        auto st = term.find('*');
+        if (st != std::string::npos) { scale = std::strtoull(term.substr(st + 1).c_str(), nullptr, 0); term = term.substr(0, st); if (!scale) return false; }
+        if (std::isdigit((unsigned char)term[0])) val = std::strtoull(term.c_str(), nullptr, 0);
+        else if (!regValueByName(term, val)) return false;
+        sum += (uint64_t)sign * val * scale; any = true; i = j;
+    }
+    if (!any) return false;
+    ea = sum; return true;
+}
+
+// Cadena ASCII o UTF-16 legible en 'va' (proceso vivo): "texto" / L"texto", o "".
+std::string App::stringAtVA(uint64_t va, size_t maxLen) {
+    if (dbgState_ != DbgState::Paused || !va) return "";
+    uint8_t buf[128] = {0};
+    size_t got = debugger_.readMemory(va, buf, sizeof(buf));
+    if (got < 4) return "";
+    size_t n = 0; while (n < got && buf[n] >= 0x20 && buf[n] < 0x7F) ++n;
+    if (n >= 4 && (n == got || buf[n] == 0)) { std::string s((const char*)buf, std::min(n, maxLen)); if (n > maxLen) s += "..."; return "\"" + s + "\""; }
+    size_t w = 0; while (w * 2 + 1 < got && buf[w * 2] >= 0x20 && buf[w * 2] < 0x7F && buf[w * 2 + 1] == 0) ++w;
+    if (w >= 4 && (w * 2 + 1 >= got || (buf[w * 2] == 0 && buf[w * 2 + 1] == 0))) {
+        std::string s; for (size_t k = 0; k < std::min(w, maxLen); ++k) s += (char)buf[k * 2];
+        if (w > maxLen) s += "..."; return "L\"" + s + "\"";
+    }
+    return "";
+}
+
+// Texto de la columna Comentario para una instruccion (cacheado por pausa):
+// "dll.API" de call/jmp por IAT, y en vivo: reg:simbolo, reg:"string", [mem]:simbolo, inmediatos.
+std::string App::buildInfoText(const Instruction& in) {
+    if (infoCacheGen_ != cpuGen_) { infoCache_.clear(); infoCacheGen_ = cpuGen_; }
+    auto hit = infoCache_.find(in.address); if (hit != infoCache_.end()) return hit->second;
+    std::vector<std::string> parts; std::set<std::string> seen;
+    auto add = [&](const std::string& s) { if (!s.empty() && seen.insert(s).second) parts.push_back(s); };
+    auto ac = autoComments_.find(in.address); if (ac != autoComments_.end()) add(ac->second);
+    const bool live = dbgState_ == DbgState::Paused;
+    const bool is64 = live ? debugger_.is64() : pe_.is64Bit();
+    if (live) {
+        auto toks = x64Tokenize(in.text);
+        bool inBracket = false; std::string bracket;
+        for (size_t k = 0; k < toks.size(); ++k) {
+            const auto& t = toks[k];
+            if (t.text == "[") { inBracket = true; bracket = "["; continue; }
+            if (inBracket) { bracket += t.text; if (t.text == "]") inBracket = false; }
+            if (t.kind == 2) {
+                std::string low = t.text; for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+                if (low == "rip" || low == "eip" || low == "rsp" || low == "esp" || low == "sp" || low == "spl") continue;
+                uint64_t v = 0; if (!regValueByName(low, v) || !v) continue;
+                std::string sym = fmtSymX64(v);
+                if (sym.empty()) sym = stringAtVA(v);
+                if (!sym.empty()) add(low + ":" + sym);
+            } else if (t.kind == 3 && !inBracket && !in.hasBranchTarget) {
+                uint64_t v = std::strtoull(t.text.c_str(), nullptr, 0);
+                if (v > 0x10000 && modRangeAt(v)) { std::string sym = fmtSymX64(v); if (sym.empty()) sym = stringAtVA(v); if (!sym.empty()) add(sym); }
+            }
+        }
+        // Operando de memoria: valor apuntado -> simbolo / string.
+        auto a = in.text.find('['), b = in.text.find(']');
+        if (a != std::string::npos && b != std::string::npos && b > a) {
+            std::string expr = in.text.substr(a, b - a + 1);
+            uint64_t ea = 0;
+            if (effectiveAddress(in.text, ea) && ea > 0x10000) {
+                std::string label = expr;
+                uint64_t ptr = 0; size_t psz = is64 ? 8 : 4;
+                std::string got;
+                if (in.hasBranchTarget && in.branchTarget == ea) {   // call/jmp [iat]: el destino real
+                    if (debugger_.readMemory(ea, &ptr, psz) == psz && ptr) { got = fmtSymX64(ptr); if (got.empty() && modRangeAt(ptr)) got = fmtAddrX64(ptr); }
+                } else {
+                    std::string st = stringAtVA(ea);
+                    if (!st.empty()) got = st;
+                    else if (debugger_.readMemory(ea, &ptr, psz) == psz && ptr > 0x10000) { got = fmtSymX64(ptr); if (got.empty()) got = stringAtVA(ptr); }
+                }
+                if (!got.empty()) add(label + ":" + got);
+            }
+        }
+    }
+    std::string out;
+    for (auto& p : parts) { if (!out.empty()) out += ", "; out += p; if (out.size() > 160) break; }
+    infoCache_[in.address] = out;
+    return out;
+}
+
+// Instruccion coloreada por tokens (estilo x64dbg): mnemonico azul, saltos/call/ret
+// rojos, int3/nop grises, registros lila, inmediatos rojos, fs:/gs: con fondo rojo,
+// y el destino de call/jmp como "mod.DIR" o "<mod.simbolo>".
+void App::drawInstructionColored(const Instruction& in, bool isCur) {
+    std::string text = in.text;
+    if (in.hasBranchTarget && text.find('[') == std::string::npos) {
+        size_t p = text.rfind("0x");
+        if (p != std::string::npos) { size_t e = p + 2; while (e < text.size() && std::isxdigit((unsigned char)text[e])) ++e; text.replace(p, e - p, fmtAddrX64(in.branchTarget)); }
+    }
+    const ImVec4 cMnem(0.55f, 0.75f, 1.0f, 1), cBranch(1.0f, 0.40f, 0.40f, 1), cGray(0.5f, 0.5f, 0.5f, 1), cReg(0.80f, 0.62f, 1.0f, 1),
+                 cNum(1.0f, 0.55f, 0.55f, 1), cKw(0.5f, 0.7f, 0.9f, 1), cSym(1.0f, 0.62f, 0.55f, 1), cPunct(0.85f, 0.85f, 0.85f, 1), cCur(0.35f, 1.0f, 0.35f, 1);
+    auto toks = x64Tokenize(text);
+    bool firstOut = true;
+    for (const auto& t : toks) {
+        ImVec4 col = cPunct;
+        bool redBg = false;
+        switch (t.kind) {
+            case 1: { std::string m = t.text; for (auto& c : m) c = (char)std::tolower((unsigned char)c);
+                      if (in.isJump || in.isCall || in.isRet) col = cBranch;
+                      else if (m == "int3" || m == "nop" || m == "db") col = cGray; else col = cMnem; break; }
+            case 2: col = cReg; break;
+            case 3: col = cNum; break;
+            case 4: col = cKw; break;
+            case 5: col = cSym; break;
+            case 6: col = ImVec4(1, 1, 1, 1); redBg = true; break;
+            default: col = cPunct; break;
+        }
+        if (isCur) { col = cCur; redBg = false; }
+        if (!firstOut) ImGui::SameLine(0, 0);
+        firstOut = false;
+        if (redBg) {
+            ImVec2 p = ImGui::GetCursorScreenPos(); ImVec2 sz = ImGui::CalcTextSize(t.text.c_str());
+            ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + sz.x, p.y + sz.y), ImGui::GetColorU32(ImVec4(0.75f, 0.15f, 0.15f, 1)));
+        }
+        ImGui::TextColored(col, "%s", t.text.c_str());
+    }
+}
+
+
+// Secciones de un modulo cargado (tabla de secciones leida de memoria) para la
+// linea de ubicacion ".text:VA mod:$RVA #offset". Para el binario abierto en
+// modo estatico se usan las secciones del PeFile.
+const std::vector<App::SecInfo>& App::sectionsOfModule(const ModRange* m) {
+    static const std::vector<SecInfo> empty;
+    if (!m) return empty;
+    auto it = secCache_.find(m->base); if (it != secCache_.end()) return it->second;
+    std::vector<SecInfo> out;
+    if (dbgState_ == DbgState::Paused) {
+        uint32_t e_lfanew = 0; uint16_t nsec = 0, optSize = 0;
+        if (debugger_.readMemory(m->base + 0x3C, &e_lfanew, 4) == 4 && e_lfanew && e_lfanew < 0x1000) {
+            const uint64_t pe = m->base + e_lfanew;
+            debugger_.readMemory(pe + 6, &nsec, 2); debugger_.readMemory(pe + 20, &optSize, 2);
+            uint64_t sec = pe + 24 + optSize;
+            for (uint16_t i = 0; i < nsec && i < 96; ++i, sec += 40) {
+                uint8_t h[40] = {0}; if (debugger_.readMemory(sec, h, 40) != 40) break;
+                SecInfo si; si.name = std::string((const char*)h, strnlen((const char*)h, 8));
+                std::memcpy(&si.vsize, h + 8, 4); std::memcpy(&si.va, h + 12, 4); std::memcpy(&si.raw, h + 20, 4);
+                out.push_back(si);
+            }
+        }
+    }
+    if (out.empty() && fileLoaded_ && m->base == pe_.imageBase())
+        for (const auto& sc : pe_.sections()) out.push_back({sc.name, sc.virtualAddress, sc.virtualSize ? sc.virtualSize : sc.rawSize, sc.rawOffset});
+    return secCache_[m->base] = out;
+}
+
+std::string App::cpuLocationLine(uint64_t va) {
+    const ModRange* m = modRangeAt(va);
+    if (!m) return "0x" + x64Hex(va);
+    const uint32_t rva = (uint32_t)(va - m->base);
+    std::string secName; uint32_t fileOff = 0; bool haveOff = false;
+    for (const auto& sc : sectionsOfModule(m)) {
+        const uint32_t vs = std::max<uint32_t>(sc.vsize, 1);
+        if (rva >= sc.va && rva < sc.va + vs) { secName = sc.name; fileOff = rva - sc.va + sc.raw; haveOff = true; break; }
+    }
+    std::string out;
+    if (!secName.empty()) out = secName + ":";
+    out += vaStr(va, dbgState_ == DbgState::Paused ? debugger_.is64() : pe_.is64Bit()) + " " + m->name + ":$" + x64Hex(rva);
+    if (haveOff) out += " #" + x64Hex(fileOff);
+    return out;
+}
+
+// Cuadro de informacion bajo el desensamblado (x64dbg): valores de los operandos de
+// la instruccion seleccionada (reg=valor, [mem]=[EA]=valor, destino con simbolo) y
+// la linea de ubicacion seccion:VA modulo:$RVA #offset.
+void App::drawCpuInfoBox() {
+    const float h = ImGui::GetTextLineHeightWithSpacing() * 3.0f + 8.0f;
+    ImGui::BeginChild("cpuinfo", ImVec2(0, h), true, ImGuiWindowFlags_NoScrollbar);
+    int idx = selectedInsn_;
+    if (idx < 0 && dbgState_ == DbgState::Paused) for (int i = 0; i < (int)insns_.size(); ++i) if (insns_[i].address == currentIp_) { idx = i; break; }
+    if (idx >= 0 && idx < (int)insns_.size()) {
+        const auto& in = insns_[idx];
+        const bool live = dbgState_ == DbgState::Paused;
+        const bool is64 = live ? debugger_.is64() : pe_.is64Bit();
+        std::vector<std::string> lines; std::set<std::string> seen;
+        auto add = [&](const std::string& t) { if (!t.empty() && seen.insert(t).second) lines.push_back(t); };
+        if (live) {
+            auto toks = x64Tokenize(in.text);
+            bool inBracket = false; std::string sizeKw;
+            for (const auto& t : toks) {
+                if (t.text == "[") inBracket = true; else if (t.text == "]") inBracket = false;
+                if (t.kind == 4 && t.text != "ptr") sizeKw = t.text;
+                if (t.kind == 2 && !inBracket) {
+                    std::string low = t.text; for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+                    uint64_t v = 0; if (!regValueByName(low, v)) continue;
+                    std::string line = low + "=" + x64Hex(v);
+                    std::string sym = fmtSymX64(v); if (sym.empty()) sym = stringAtVA(v);
+                    if (!sym.empty()) line += " " + sym;
+                    add(line);
+                }
+            }
+            auto a = in.text.find('['), b = in.text.find(']');
+            if (a != std::string::npos && b != std::string::npos && b > a) {
+                uint64_t ea = 0;
+                std::string expr = in.text.substr(a, b - a + 1);
+                std::string pre; { size_t k = a; while (k > 0 && in.text[k - 1] != ' ' && in.text[k - 1] != ',') --k; pre = in.text.substr(k, a - k); }  // "ss:"/"ds:"
+                std::string line = (sizeKw.empty() ? "" : sizeKw + " ptr ") + pre + expr;
+                if (effectiveAddress(in.text, ea)) {
+                    size_t sz = is64 ? 8 : 4;
+                    if (sizeKw == "byte") sz = 1; else if (sizeKw == "word") sz = 2; else if (sizeKw == "dword") sz = 4; else if (sizeKw == "qword") sz = 8;
+                    uint64_t val = 0;
+                    line += "=[" + vaStr(ea, is64) + "]";
+                    if (sz <= 8 && debugger_.readMemory(ea, &val, sz) == sz) {
+                        line += "=" + x64Hex(val);
+                        std::string sym = fmtSymX64(val); if (sym.empty()) sym = stringAtVA(val); if (sym.empty()) sym = stringAtVA(ea);
+                        if (!sym.empty()) line += " " + sym;
+                    } else line += "=???";
+                } else line += " (fs:/gs: o registro no resoluble)";
+                add(line);
+            }
+        }
+        if (in.hasBranchTarget && in.text.find('[') == std::string::npos) {
+            std::string line = fmtAddrX64(in.branchTarget);
+            std::string sym = fmtSymX64(in.branchTarget); if (!sym.empty() && line.find('<') == std::string::npos) line += " " + sym;
+            add(line);
+        }
+        // Maximo 2 lineas de valores + 1 de ubicacion
+        std::string l1, l2;
+        for (size_t i = 0; i < lines.size(); ++i) { std::string& dst = (i % 2 == 0) ? l1 : l2; if (!dst.empty()) dst += "   "; dst += lines[i]; }
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1), "%s", l1.c_str());
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1), "%s", l2.c_str());
+        ImGui::TextColored(ImVec4(0.7f, 0.8f, 0.9f, 1), "%s", cpuLocationLine(in.address).c_str());
+    } else {
+        ImGui::TextDisabled("Selecciona una instruccion para ver sus operandos y su ubicacion (seccion:VA modulo:$RVA #offset).");
+    }
+    ImGui::EndChild();
+}
+
 void App::drawCpuContent() {
     ImGui::Text("%s   base 0x%s   %zu instrucciones",
                 liveView_ ? "[memoria viva]" : "[archivo estatico]",
                 hex64(disBase_).c_str(), insns_.size());
     ImGui::Separator();
 
-    if (ImGui::BeginTable("dis", 5,
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable)) {
+    cpuTouchGeneration();   // caches de simbolos/comentarios por pausa (estilo x64dbg)
+    const float infoBoxH = ImGui::GetTextLineHeightWithSpacing() * 3.0f + 8.0f;   // cuadro de info (x64dbg) bajo el listado
+    if (ImGui::BeginTable("dis", 6,
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable,
+            ImVec2(0, -infoBoxH))) {
         ImGui::TableSetupColumn("BP",  ImGuiTableColumnFlags_WidthFixed, 24);
-        ImGui::TableSetupColumn("Flow", ImGuiTableColumnFlags_WidthFixed, 46);
+        ImGui::TableSetupColumn("Flow", ImGuiTableColumnFlags_WidthFixed, 74);
         ImGui::TableSetupColumn("Direccion", ImGuiTableColumnFlags_WidthFixed, 140);
-        ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 150);
-        ImGui::TableSetupColumn("Instruccion", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 165);
+        ImGui::TableSetupColumn("Instruccion", ImGuiTableColumnFlags_WidthFixed, 430);
+        ImGui::TableSetupColumn("Comentario", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
         auto bps = debugger_.breakpoints();
         auto hasBp = [&](uint64_t a){ for (auto& b : bps) if (b.address == a) return true; return false; };
 
-        // Guias de flujo estilo Olly: cada jump cuyo destino esta en la vista
-        // recibe un carril vertical a la izquierda de la direccion y una flecha
-        // al llegar a la instruccion destino. Se limita a seis carriles para que
-        // una rutina muy ramificada siga siendo legible.
-        struct FlowGuide { int from = 0, to = 0, lane = 0; };
+        // Lineas de salto estilo x64dbg: cada jump cuyo destino esta en la vista se
+        // dibuja como una linea vertical (punteada = condicional, solida = jmp) con un
+        // conector horizontal en el origen y una flecha en el destino. Los saltos que
+        // envuelven a otros van mas a la izquierda (carril = profundidad de anidamiento).
+        struct FlowGuide { int from = 0, to = 0, lane = 0; bool cond = false; };
         std::map<uint64_t, int> indexByAddress;
         for (int i = 0; i < (int)insns_.size(); ++i) indexByAddress[insns_[i].address] = i;
         std::vector<FlowGuide> flowGuides;
-        std::array<int, 6> laneEnds{}; laneEnds.fill(-1);
         for (int i = 0; i < (int)insns_.size(); ++i) {
             const auto& branch = insns_[i];
-            if (!branch.isJump || !branch.hasBranchTarget) continue;
+            if (!branch.isJump || !branch.hasBranchTarget || branch.text.find('[') != std::string::npos) continue;
             const auto target = indexByAddress.find(branch.branchTarget);
             if (target == indexByAddress.end() || target->second == i) continue;
-            int lane = 0;
-            const int spanEnd = std::max(i, target->second);
-            for (; lane < (int)laneEnds.size(); ++lane) if (laneEnds[lane] < i) break;
-            if (lane == (int)laneEnds.size()) lane = lane % (int)laneEnds.size();
-            laneEnds[lane] = std::max(laneEnds[lane], spanEnd);
-            flowGuides.push_back({i, target->second, lane});
+            std::string mn = branch.text.substr(0, branch.text.find(' '));
+            flowGuides.push_back({i, target->second, 0, mn != "jmp"});
         }
+        const int maxLanes = 8;
+        for (auto& g : flowGuides) {
+            const int lo = std::min(g.from, g.to), hi = std::max(g.from, g.to);
+            int depth = 0;
+            for (const auto& o : flowGuides) {
+                if (&o == &g) continue;
+                const int olo = std::min(o.from, o.to), ohi = std::max(o.from, o.to);
+                if (olo <= lo && ohi >= hi && (ohi - olo) > (hi - lo)) ++depth;
+            }
+            g.lane = std::min(depth, maxLanes - 1);
+        }
+        // Corchetes de procedimiento: de la primera instruccion util tras el relleno
+        // (int3/nop) hasta el ret, como los "brackets" de funcion de x64dbg.
+        struct FuncSpan { int start = 0, end = 0; };
+        std::vector<FuncSpan> funcSpans;
+        {
+            int start = -1;
+            auto isPad = [](const Instruction& in) { return in.mnemonic == "int3" || in.mnemonic == "nop" || in.mnemonic == "db"; };
+            for (int i = 0; i < (int)insns_.size(); ++i) {
+                if (start < 0 && !isPad(insns_[i])) start = i;
+                if (start >= 0 && insns_[i].isRet) { funcSpans.push_back({start, i}); start = -1; }
+            }
+        }
+        auto jumpGuideColor = [&](const FlowGuide& g) -> ImU32 {
+            const bool sel = (g.from == selectedInsn_ || g.to == selectedInsn_);
+            const bool cur = (dbgState_ == DbgState::Paused && insns_[g.from].address == currentIp_);
+            if (cur && g.cond) {
+                std::string mn = insns_[g.from].text.substr(0, insns_[g.from].text.find(' '));
+                return ImGui::GetColorU32(jumpWillBeTaken(mn, regs_.eflags) ? ImVec4(0.4f, 1, 0.4f, 1) : ImVec4(1, 0.45f, 0.45f, 1));
+            }
+            if (cur) return ImGui::GetColorU32(ImVec4(0.4f, 1, 0.4f, 1));
+            if (sel) return ImGui::GetColorU32(ImVec4(1.0f, 0.85f, 0.3f, 1));
+            return ImGui::GetColorU32(ImVec4(0.62f, 0.62f, 0.66f, 0.95f));
+        };
 
         const float cpuViewH = ImGui::GetContentRegionAvail().y;   // alto scrollable (tras el encabezado)
         ImGuiListClipper clipper;
@@ -2612,20 +3070,32 @@ void App::drawCpuContent() {
                 const float flowHeight = ImGui::GetTextLineHeight();
                 const float flowMidY = flowOrigin.y + flowHeight * 0.5f;
                 const float flowWidth = ImGui::GetColumnWidth();
+                const float flowRight = flowOrigin.x + flowWidth - 10.0f;   // borde donde apuntan las flechas
+                const float laneStep = std::max(5.0f, (flowRight - flowOrigin.x - 8.0f) / (float)maxLanes);
                 ImDrawList* draw = ImGui::GetWindowDrawList();
+                // Corchete de procedimiento (linea solida pegada a la direccion)
+                for (const auto& fs : funcSpans) {
+                    if (i < fs.start || i > fs.end) continue;
+                    const float bx = flowOrigin.x + flowWidth - 4.0f;
+                    const ImU32 bc = ImGui::GetColorU32(ImVec4(0.72f, 0.72f, 0.72f, 0.9f));
+                    if (fs.start == fs.end) { draw->AddLine(ImVec2(bx, flowMidY - 3), ImVec2(bx + 3, flowMidY - 3), bc); draw->AddLine(ImVec2(bx, flowMidY - 3), ImVec2(bx, flowMidY + 3), bc); draw->AddLine(ImVec2(bx, flowMidY + 3), ImVec2(bx + 3, flowMidY + 3), bc); continue; }
+                    if (i == fs.start) { draw->AddLine(ImVec2(bx, flowMidY), ImVec2(bx, flowOrigin.y + flowHeight), bc); draw->AddLine(ImVec2(bx, flowMidY), ImVec2(bx + 3, flowMidY), bc); }
+                    else if (i == fs.end) { draw->AddLine(ImVec2(bx, flowOrigin.y), ImVec2(bx, flowMidY), bc); draw->AddLine(ImVec2(bx, flowMidY), ImVec2(bx + 3, flowMidY), bc); }
+                    else draw->AddLine(ImVec2(bx, flowOrigin.y), ImVec2(bx, flowOrigin.y + flowHeight), bc);
+                }
+                // Lineas de salto
                 for (const auto& guide : flowGuides) {
                     const int first = std::min(guide.from, guide.to), last = std::max(guide.from, guide.to);
                     if (i < first || i > last) continue;
-                    const float x = flowOrigin.x + 6.0f + guide.lane * 6.5f;
-                    const ImU32 color = ImGui::GetColorU32(guide.to > guide.from ? ImVec4(0.95f,0.70f,0.25f,0.9f)
-                                                                                   : ImVec4(0.45f,0.78f,1.0f,0.9f));
-                    draw->AddLine(ImVec2(x, flowOrigin.y), ImVec2(x, flowOrigin.y + flowHeight), color, 1.4f);
-                    if (i == guide.from) draw->AddCircleFilled(ImVec2(x, flowMidY), 2.2f, color);
+                    const float x = flowOrigin.x + 4.0f + guide.lane * laneStep;
+                    const ImU32 color = jumpGuideColor(guide);
+                    const float y0 = (i == first) ? flowMidY : flowOrigin.y;
+                    const float y1 = (i == last) ? flowMidY : flowOrigin.y + flowHeight;
+                    x64DashedLine(draw, ImVec2(x, y0), ImVec2(x, y1), color, 1.2f, guide.cond);
+                    if (i == guide.from) x64DashedLine(draw, ImVec2(x, flowMidY), ImVec2(flowRight, flowMidY), color, 1.2f, guide.cond);
                     if (i == guide.to) {
-                        if (guide.to > guide.from)
-                            draw->AddTriangleFilled(ImVec2(x, flowOrigin.y + flowHeight), ImVec2(x - 3.0f, flowOrigin.y + flowHeight - 5.0f), ImVec2(x + 3.0f, flowOrigin.y + flowHeight - 5.0f), color);
-                        else
-                            draw->AddTriangleFilled(ImVec2(x, flowOrigin.y), ImVec2(x - 3.0f, flowOrigin.y + 5.0f), ImVec2(x + 3.0f, flowOrigin.y + 5.0f), color);
+                        x64DashedLine(draw, ImVec2(x, flowMidY), ImVec2(flowRight, flowMidY), color, 1.2f, guide.cond);
+                        draw->AddTriangleFilled(ImVec2(flowRight + 5.0f, flowMidY), ImVec2(flowRight - 1.0f, flowMidY - 4.0f), ImVec2(flowRight - 1.0f, flowMidY + 4.0f), color);
                     }
                 }
                 ImGui::Dummy(ImVec2(flowWidth, flowHeight));
@@ -2634,6 +3104,11 @@ void App::drawCpuContent() {
                 ImGui::TextColored(isCur ? ImVec4(0.4f,1,0.4f,1) : ImVec4(0.6f,0.8f,1,1),
                                    "%s", vaStr(in.address, dbgState_==DbgState::Paused ? debugger_.is64() : pe_.is64Bit()).c_str());
                 ImGui::TableSetColumnIndex(3);
+                // Marcador de direccion del salto (x64dbg): v = hacia abajo, ^ = hacia arriba.
+                if (in.isJump && in.hasBranchTarget && in.text.find('[') == std::string::npos) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1), "%s", in.branchTarget > in.address ? "v" : "^");
+                    ImGui::SameLine(0, 4);
+                } else { ImGui::TextUnformatted(" "); ImGui::SameLine(0, 4); }
                 ImGui::TextDisabled("%s", in.bytes.c_str());
                 ImGui::TableSetColumnIndex(4);
                 auto lbit = labels_.find(canonVA(in.address));
@@ -2641,12 +3116,7 @@ void App::drawCpuContent() {
                     ImGui::TextColored(ImVec4(0.5f,1,0.8f,1), "%s:", lbit->second.c_str());
                     ImGui::SameLine();
                 }
-                ImVec4 col(0.9f,0.9f,0.9f,1);
-                if (in.isCall) col = ImVec4(0.6f,1,0.6f,1);
-                else if (in.isJump) col = ImVec4(1,0.8f,0.5f,1);
-                else if (in.isRet)  col = ImVec4(1,0.6f,0.6f,1);
-                if (isCur) col = ImVec4(0.35f,1.0f,0.35f,1);   // proxima instruccion a ejecutar: letras verdes
-                ImGui::TextColored(col, "%s", in.text.c_str());
+                drawInstructionColored(in, isCur);
                 if (in.hasBranchTarget && ImGui::IsItemHovered())
                     ImGui::SetTooltip("-> 0x%s", hex64(in.branchTarget).c_str());
                 // Indicador de salto condicional en la instruccion actual (estilo Olly): dice si saltara.
@@ -2659,16 +3129,15 @@ void App::drawCpuContent() {
                                            taken ? "(saltara)" : "(no salta)");
                     }
                 }
+                // Columna Comentario (x64dbg): comentario propio (verde) o analisis automatico
+                // (dll.API, reg:simbolo, reg:"string", [mem]:simbolo) en azul.
+                ImGui::TableSetColumnIndex(5);
                 auto cmit = comments_.find(canonVA(in.address));
                 if (cmit != comments_.end()) {
-                    ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(0.5f,0.75f,0.5f,1), "; %s", cmit->second.c_str());
+                    ImGui::TextColored(ImVec4(0.5f,0.9f,0.5f,1), "%s", cmit->second.c_str());
                 } else {
-                    auto acit = autoComments_.find(in.address);
-                    if (acit != autoComments_.end()) {
-                        ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(0.45f,0.7f,0.9f,1), "; %s", acit->second.c_str());
-                    }
+                    const std::string info = buildInfoText(in);
+                    if (!info.empty()) ImGui::TextColored(ImVec4(0.55f,0.75f,0.95f,1), "%s", info.c_str());
                 }
             }
         }
@@ -2684,6 +3153,7 @@ void App::drawCpuContent() {
         }
         ImGui::EndTable();
     }
+    drawCpuInfoBox();
 
     // Navegacion con teclado (estilo OllyDbg) cuando el panel CPU tiene foco.
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !insns_.empty()) {
@@ -5868,30 +6338,83 @@ void App::drawExecModulesPanel() {
 void App::drawCallStackPanel() {
     beginManaged("Call stack");
     if (dbgState_ != DbgState::Paused) { ImGui::TextDisabled("(disponible al pausar)"); ImGui::End(); return; }
-    const auto frames = debugger_.walkStack();
-    ImGui::TextDisabled("StackWalk64 + DbgHelp; fuente solo aparece si hay PDB/simbolos disponibles.");
-    if (ImGui::BeginTable("cs", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY)) {
-        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 28);
-        ImGui::TableSetupColumn("PC", ImGuiTableColumnFlags_WidthFixed, 150);
-        ImGui::TableSetupColumn("Frame / Stack", ImGuiTableColumnFlags_WidthFixed, 220);
-        ImGui::TableSetupColumn("Simbolo", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Fuente", ImGuiTableColumnFlags_WidthStretch);
+    cpuTouchGeneration();
+    const bool is64 = regs_.is64;
+    const uint64_t ptrSize = is64 ? 8 : 4;
+    auto threads = debugger_.threads();
+    // Lista de hilos (izquierda), como x64dbg: "Main Thread" = el primero del proceso.
+    ImGui::BeginChild("csthreads", ImVec2(200, 0), true);
+    ImGui::TextDisabled("ID");
+    ImGui::Separator();
+    if (ImGui::Selectable("Todos los hilos", callStackThreadSel_ < 0)) callStackThreadSel_ = -1;
+    for (size_t t = 0; t < threads.size(); ++t) {
+        char lbl[96];
+        std::snprintf(lbl, sizeof(lbl), "%s%s (%u)", threads[t].current ? "* " : "", t == 0 ? "Main Thread" : "Hilo", threads[t].id);
+        if (ImGui::Selectable(lbl, callStackThreadSel_ == (int)t)) callStackThreadSel_ = (int)t;
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("csframes", ImVec2(0, 0), false);
+    if (ImGui::BeginTable("cs", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150);
+        ImGui::TableSetupColumn("To",      ImGuiTableColumnFlags_WidthFixed, 150);
+        ImGui::TableSetupColumn("From",    ImGuiTableColumnFlags_WidthFixed, 150);
+        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn("Party",   ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn("Comment", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
-        for (size_t depth = 0; depth < frames.size(); ++depth) {
-            const auto& f = frames[depth];
-            ImGui::TableNextRow();
-            ImGui::PushID(static_cast<int>(depth));
-            ImGui::TableSetColumnIndex(0); ImGui::Text("%zu", depth);
-            ImGui::TableSetColumnIndex(1);
-            if (ImGui::Selectable(vaStr(f.instruction, regs_.is64).c_str(), false)) gotoAddress(f.instruction);
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%s / %s", vaStr(f.frame, regs_.is64).c_str(), vaStr(f.stack, regs_.is64).c_str());
-            ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(f.symbol.empty() ? "-" : f.symbol.c_str());
-            ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted(f.source.empty() ? "-" : f.source.c_str());
-            ImGui::PopID();
+        int rowId = 0;
+        bool firstGroup = true;
+        for (size_t t = 0; t < threads.size(); ++t) {
+            if (callStackThreadSel_ >= 0 && (int)t != callStackThreadSel_) continue;
+            const auto frames = threads[t].current ? debugger_.walkStack() : debugger_.walkStackOf(threads[t].id);
+            if (frames.empty()) continue;
+            if (!firstGroup) { ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(" "); }  // separador entre hilos
+            firstGroup = false;
+            // Address = donde vive la direccion de retorno en la pila; To = a donde regresa;
+            // From = instruccion del frame; Size = distancia al siguiente frame (x64dbg).
+            std::vector<uint64_t> addrs(frames.size());
+            for (size_t i = 0; i < frames.size(); ++i)
+                addrs[i] = (i + 1 < frames.size() && frames[i + 1].stack >= ptrSize) ? frames[i + 1].stack - ptrSize : frames[i].stack;
+            for (size_t i = 0; i < frames.size(); ++i) {
+                const uint64_t from = frames[i].instruction;
+                const uint64_t to = (i + 1 < frames.size()) ? frames[i + 1].instruction : 0;
+                const uint64_t size = (i + 1 < frames.size() && addrs[i + 1] >= addrs[i]) ? addrs[i + 1] - addrs[i] : 0;
+                const ModRange* m = modRangeAt(from);
+                const bool system = m && m->system;
+                std::string comment = fmtSymX64(from);
+                if (comment.empty() && m) comment = modShortName(m) + "." + x64Hex(from);
+                ImGui::TableNextRow();
+                ImGui::PushID(rowId++);
+                ImGui::TableSetColumnIndex(0);
+                if (ImGui::Selectable(vaStr(addrs[i], is64).c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (ImGui::IsMouseDoubleClicked(0)) gotoAddress(from);
+                }
+                if (ImGui::BeginPopupContextItem("csctx")) {
+                    if (ImGui::MenuItem("Follow From in CPU")) gotoAddress(from);
+                    if (to && ImGui::MenuItem("Follow To in CPU")) gotoAddress(to);
+                    if (ImGui::MenuItem("Follow Address in dump")) followInDump(addrs[i]);
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copiar From")) ImGui::SetClipboardText(("0x" + hex64(from)).c_str());
+                    if (ImGui::MenuItem("Copiar To")) ImGui::SetClipboardText(("0x" + hex64(to)).c_str());
+                    ImGui::EndPopup();
+                }
+                ImGui::TableSetColumnIndex(1); ImGui::TextColored(ImVec4(0.6f, 0.8f, 1, 1), "%s", vaStr(to, is64).c_str());
+                ImGui::TableSetColumnIndex(2); ImGui::TextColored(ImVec4(0.6f, 0.8f, 1, 1), "%s", vaStr(from, is64).c_str());
+                ImGui::TableSetColumnIndex(3); ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1), "%s", x64Hex(size).c_str());
+                ImGui::TableSetColumnIndex(4);
+                if (m) ImGui::TextColored(system ? ImVec4(0.6f, 0.75f, 0.9f, 1) : ImVec4(1.0f, 0.65f, 0.3f, 1), "%s", system ? "System" : "User");
+                else ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(5);
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.55f, 1), "%s", comment.c_str());
+                if (!frames[i].source.empty()) { ImGui::SameLine(); ImGui::TextDisabled("  %s", frames[i].source.c_str()); }
+                ImGui::PopID();
+            }
         }
         ImGui::EndTable();
     }
+    ImGui::EndChild();
     ImGui::End();
 }
 
