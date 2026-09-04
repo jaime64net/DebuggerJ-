@@ -413,6 +413,10 @@ private:
     // --- Search for (menu CPU estilo OllyDbg/x64dbg) ---
     struct SearchHit { uint64_t address = 0; std::string text; };
     std::vector<SearchHit> searchResults_;
+    std::set<int> srSel_;              // filas seleccionadas en Search results (Ctrl/Shift/Ctrl+A)
+    int           srAnchor_ = -1;      // ancla para Shift+clic en Search results
+    size_t        srSelCount_ = 0;     // tamano de searchResults_ al que corresponde srSel_ (se limpia si cambia)
+    void          setBreakpointsOnAddresses(const std::vector<uint64_t>& addrs, bool add, const char* label);
     std::string   searchResultsTitle_;
     bool          showSearchResults_ = false;
     bool          openSearchCmd_ = false;

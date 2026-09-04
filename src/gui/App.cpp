@@ -1584,7 +1584,8 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Variables globales (paridad x64dbg $vars): por MCP var_set/var_get/var_list. Usables en cualquier expresion (Watch, condiciones, eval).");
             ImGui::BulletText("Favourites (menu Favourites): herramientas externas configurables en favourites.txt (nombre|comando, con %%DEBUGGEE%% y %%PID%%). Tools -> Reiniciar como administrador relanza elevado.");
             ImGui::BulletText("Struct (Window -> Struct): aplica una definicion de campos (byte/word/dword/qword/ptr/string) a una direccion base (que admite expresiones) y muestra los valores leidos de memoria, con offsets automaticos.");
-            ImGui::BulletText("CPU -> clic derecho -> Search for: 'All commands' busca una subcadena en todas las instrucciones; 'All intermodular calls' lista las llamadas a APIs de otros modulos (via IAT y thunks); 'All referenced text strings' lista las instrucciones cuyo operando (inmediato, [VA] o lea rip-relative) apunta a un texto ASCII/UTF-16 de la imagen (del archivo, o de la memoria viva si el proceso esta pausado); 'Binary string' busca hex o texto. Resultados en la ventana Search results (doble clic para navegar, 'Copiar todo').");
+            ImGui::BulletText("CPU -> clic derecho -> Search for: 'All commands' busca una subcadena en todas las instrucciones; 'All intermodular calls' lista las llamadas a APIs de otros modulos (via IAT y thunks); 'All referenced text strings' lista las instrucciones cuyo operando (inmediato, [VA] o lea rip-relative) apunta a un texto ASCII/UTF-16 de la imagen (del archivo, o de la memoria viva si el proceso esta pausado); 'Binary string' busca hex o texto. Resultados en la ventana Search results: doble clic navega; clic, Ctrl+clic, Shift+clic y Ctrl+A seleccionan; clic derecho ofrece agregar/quitar breakpoint en los seleccionados o en TODOS los resultados, hardware BP, copiar. Botones 'BP en todos' y 'BP en seleccionados'.");
+            ImGui::BulletText("CPU: Shift+clic o Shift+flechas seleccionan un rango de instrucciones; clic derecho -> Breakpoints -> 'Agregar/Quitar breakpoint en las N seleccionadas', o F2 (con rango: agrega en todas si falta alguna, si no las quita todas).");
             ImGui::BulletText("Archivo -> Attach a proceso / Detach: elegir un proceso de la lista (o PID manual) o desadjuntar dejando el proceso vivo (tambien en el menu Depurar y por MCP attach/detach). Archivo -> Cerrar actual cierra archivo y sesion.");
             ImGui::BulletText("Tools -> Options -> Simbolos: configura un symbol server (symsrv), ej 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols', para resolver nombres y mejorar el call stack. Se persiste y aplica en la proxima sesion.");
             ImGui::BulletText("MCP Log: cachea todo a mcp_log_cache.txt; botones Load cache, Copy to clipboard, y el texto es seleccionable (Ctrl+C).");
@@ -2077,9 +2078,20 @@ void App::drawCpuContent() {
                     if (ImGui::MenuItem("Goto RVA / VA...")) { gotoRvaBuf_[0] = '\0'; openGotoRva_ = true; }
                     ImGui::Separator();
                     if (ImGui::BeginMenu("Breakpoints")) {
-                        if (ImGui::MenuItem(bp ? "Quitar breakpoint" : "Agregar breakpoint")) {
+                        if (ImGui::MenuItem(bp ? "Quitar breakpoint" : "Agregar breakpoint", "F2")) {
                             if (bp) debugger_.removeBreakpoint(in.address);
                             else    debugger_.addBreakpoint(in.address, "cpu");
+                        }
+                        if (selCount > 1) {
+                            // Rango seleccionado (Shift+clic / Shift+flechas): BP en todas las lineas.
+                            int lo = std::min(selAnchor_, selectedInsn_), hi = std::max(selAnchor_, selectedInsn_);
+                            std::vector<uint64_t> addrs;
+                            for (int k = lo; k <= hi && k < (int)insns_.size(); ++k) addrs.push_back(insns_[k].address);
+                            char lblAdd[64], lblDel[64];
+                            std::snprintf(lblAdd, sizeof(lblAdd), "Agregar breakpoint en las %d seleccionadas", selCount);
+                            std::snprintf(lblDel, sizeof(lblDel), "Quitar breakpoints de las %d seleccionadas", selCount);
+                            if (ImGui::MenuItem(lblAdd)) setBreakpointsOnAddresses(addrs, true, "cpu-sel");
+                            if (ImGui::MenuItem(lblDel)) setBreakpointsOnAddresses(addrs, false, "cpu-sel");
                         }
                         if (ImGui::MenuItem("Add breakpoint exception"))
                             debugger_.addExceptionBreak(0xC0000005, in.address, "desde CPU");
@@ -2251,10 +2263,17 @@ void App::drawCpuContent() {
             if (s.hasBranchTarget) gotoAddress(s.branchTarget);
         }
         // F2: poner/quitar breakpoint en la linea seleccionada (el click NO lo hace).
+        // Con un rango seleccionado, F2 lo aplica a todas: si alguna no tiene BP, agrega en todas; si todas tienen, quita todas.
         if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
-            uint64_t a = insns_[selectedInsn_].address;
-            bool has = false; for (auto& b : debugger_.breakpoints()) if (b.address == a) has = true;
-            if (has) debugger_.removeBreakpoint(a); else debugger_.addBreakpoint(a, "cpu");
+            int lo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
+            int hi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
+            std::vector<uint64_t> addrs; bool allHave = true;
+            for (int k = lo; k <= hi && k < (int)insns_.size(); ++k) {
+                uint64_t a = insns_[k].address; addrs.push_back(a);
+                bool has = false; for (auto& b : debugger_.breakpoints()) if (b.address == a) has = true;
+                if (!has) allHave = false;
+            }
+            setBreakpointsOnAddresses(addrs, !allHave, "cpu");
         }
     }
     if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A))
@@ -4264,19 +4283,60 @@ void App::searchBinaryString(const std::string& pattern, bool isHex, bool utf16)
     pushLog(searchResultsTitle_);
 }
 
+// Agrega o quita breakpoints software en un lote de direcciones (CPU seleccion / Search results).
+void App::setBreakpointsOnAddresses(const std::vector<uint64_t>& addrs, bool add, const char* label) {
+    int done = 0;
+    for (uint64_t a : addrs) {
+        bool has = false; for (auto& b : debugger_.breakpoints()) if (b.address == a) { has = true; break; }
+        if (add && !has) { if (debugger_.addBreakpoint(a, label)) ++done; }
+        else if (!add && has) { debugger_.removeBreakpoint(a); ++done; }
+    }
+    pushLog((add ? "Breakpoints agregados: " : "Breakpoints quitados: ") + std::to_string(done) + " de " + std::to_string(addrs.size()));
+}
+
 void App::drawSearchResultsPanel() {
     ImGui::SetNextWindowSize(ImVec2(560, 360), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Search results", &showSearchResults_)) { ImGui::End(); return; }
+    // La seleccion pertenece a un listado concreto: si el listado cambio, se descarta.
+    if (srSelCount_ != searchResults_.size()) { srSel_.clear(); srAnchor_ = -1; srSelCount_ = searchResults_.size(); }
+
+    auto selectedAddrs = [&]() { std::vector<uint64_t> v; for (int i : srSel_) if (i >= 0 && i < (int)searchResults_.size()) v.push_back(searchResults_[i].address); return v; };
+    auto allAddrs = [&]() { std::vector<uint64_t> v; for (auto& h : searchResults_) v.push_back(h.address); return v; };
+    auto selectAll = [&]() { srSel_.clear(); for (int i = 0; i < (int)searchResults_.size(); ++i) srSel_.insert(i); };
+    auto copyRows = [&](bool onlySel) {
+        std::string all;
+        for (int i = 0; i < (int)searchResults_.size(); ++i) {
+            if (onlySel && !srSel_.count(i)) continue;
+            all += "0x" + hex64(searchResults_[i].address) + "  " + searchResults_[i].text + "\n";
+        }
+        ImGui::SetClipboardText(all.c_str());
+    };
+
     ImGui::TextUnformatted(searchResultsTitle_.c_str());
     ImGui::SameLine();
-    if (ImGui::SmallButton("Copiar todo")) {
-        std::string all;
-        for (auto& h : searchResults_) all += "0x" + hex64(h.address) + "  " + h.text + "\n";
-        ImGui::SetClipboardText(all.c_str());
-    }
+    if (ImGui::SmallButton("Copiar todo")) copyRows(false);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Seleccionar todo")) selectAll();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(searchResults_.empty());
+    if (ImGui::SmallButton("BP en todos")) setBreakpointsOnAddresses(allAddrs(), true, "search");
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(srSel_.empty());
+    char lblSel[48]; std::snprintf(lblSel, sizeof(lblSel), "BP en seleccionados (%d)", (int)srSel_.size());
+    if (ImGui::SmallButton(lblSel)) setBreakpointsOnAddresses(selectedAddrs(), true, "search");
+    ImGui::EndDisabled();
     ImGui::Separator();
-    ImGui::TextDisabled("Doble clic en una fila para ir a la direccion.");
-    if (ImGui::BeginTable("sr", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg)) {
+    ImGui::TextDisabled("Doble clic: ir a la direccion. Clic / Ctrl+clic / Shift+clic / Ctrl+A seleccionan. Clic derecho: menu.");
+
+    const bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_RootAndChildWindows);
+    if (hovered && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) selectAll();
+
+    const auto& bps = debugger_.breakpoints();
+    auto hasBp = [&](uint64_t a){ for (auto& b : bps) if (b.address == a) return true; return false; };
+
+    if (ImGui::BeginTable("sr", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("BP", ImGuiTableColumnFlags_WidthFixed, 24);
         ImGui::TableSetupColumn("Direccion", ImGuiTableColumnFlags_WidthFixed, 150);
         ImGui::TableSetupColumn("Instruccion / tipo");
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -4285,13 +4345,49 @@ void App::drawSearchResultsPanel() {
             const auto& h = searchResults_[i];
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
+            if (hasBp(h.address)) ImGui::TextColored(ImVec4(1,0.35f,0.35f,1), "*"); else ImGui::TextUnformatted(" ");
+            ImGui::TableSetColumnIndex(1);
             ImGui::PushID(i);
             std::string va = "0x" + hex64(h.address);
-            if (ImGui::Selectable(va.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)
-                && ImGui::IsMouseDoubleClicked(0))
-                gotoAddress(h.address);
+            const bool sel = srSel_.count(i) > 0;
+            if (ImGui::Selectable(va.c_str(), sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.KeyShift && srAnchor_ >= 0) {              // rango desde el ancla
+                    if (!io.KeyCtrl) srSel_.clear();
+                    for (int k = std::min(srAnchor_, i); k <= std::max(srAnchor_, i); ++k) srSel_.insert(k);
+                } else if (io.KeyCtrl) {                            // toggle individual
+                    if (sel) srSel_.erase(i); else srSel_.insert(i);
+                    srAnchor_ = i;
+                } else { srSel_.clear(); srSel_.insert(i); srAnchor_ = i; }
+                if (ImGui::IsMouseDoubleClicked(0)) gotoAddress(h.address);
+            }
+            // Menu contextual: si el clic derecho cae fuera de la seleccion, selecciona esa fila.
+            if (ImGui::BeginPopupContextItem("srctx")) {
+                if (!srSel_.count(i)) { srSel_.clear(); srSel_.insert(i); srAnchor_ = i; }
+                const int n = (int)srSel_.size();
+                if (n > 1) ImGui::TextDisabled("%d filas seleccionadas", n);
+                else ImGui::TextDisabled("%s", va.c_str());
+                ImGui::Separator();
+                if (ImGui::MenuItem("Ir a la direccion", "Doble clic")) gotoAddress(h.address);
+                ImGui::Separator();
+                char l1[64], l2[64];
+                std::snprintf(l1, sizeof(l1), "Agregar breakpoint en seleccionados (%d)", n);
+                std::snprintf(l2, sizeof(l2), "Quitar breakpoint de seleccionados (%d)", n);
+                if (ImGui::MenuItem(l1)) setBreakpointsOnAddresses(selectedAddrs(), true, "search");
+                if (ImGui::MenuItem(l2)) setBreakpointsOnAddresses(selectedAddrs(), false, "search");
+                if (ImGui::MenuItem("Agregar breakpoint en TODOS los resultados")) setBreakpointsOnAddresses(allAddrs(), true, "search");
+                if (ImGui::MenuItem("Quitar breakpoint de TODOS los resultados")) setBreakpointsOnAddresses(allAddrs(), false, "search");
+                if (ImGui::MenuItem("Hardware BP (ejecucion) en seleccionados", nullptr, false, n <= 4)) {
+                    for (uint64_t a : selectedAddrs()) debugger_.addHwBreakpoint(a, 0, 1, "search-hw");
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Seleccionar todo", "Ctrl+A")) selectAll();
+                if (ImGui::MenuItem("Copiar seleccionados")) copyRows(true);
+                if (ImGui::MenuItem("Copiar direccion")) ImGui::SetClipboardText(va.c_str());
+                ImGui::EndPopup();
+            }
             ImGui::PopID();
-            ImGui::TableSetColumnIndex(1);
+            ImGui::TableSetColumnIndex(2);
             ImGui::TextUnformatted(h.text.c_str());
         }
         ImGui::EndTable();
