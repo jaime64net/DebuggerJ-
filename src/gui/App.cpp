@@ -311,7 +311,8 @@ void App::refreshLiveDisassembly(uint64_t around) {
         disBase_ = start;
         insns_ = dis_.disassemble(buf.data(), got, start, 400);
         liveView_ = true;
-        for (int i = 0; i < (int)insns_.size(); ++i) if (insns_[i].address == around) { selectedInsn_ = i; pendingScroll_ = i; break; }
+        selectedInsn_ = -1; selAnchor_ = -1;
+        for (int i = 0; i < (int)insns_.size(); ++i) if (insns_[i].address == around) { selectedInsn_ = i; selAnchor_ = i; pendingScroll_ = i; break; }
         rebuildAutoComments();
         return;
     }
@@ -328,7 +329,8 @@ void App::refreshLiveDisassembly(uint64_t around) {
     size_t skip = (size_t)(bestStart - start);
     insns_ = dis_.disassemble(buf.data() + skip, got - skip, bestStart, 400);
     liveView_ = true;
-    for (int i = 0; i < (int)insns_.size(); ++i) if (insns_[i].address == around) { selectedInsn_ = i; pendingScroll_ = i; break; }
+    selectedInsn_ = -1; selAnchor_ = -1;
+    for (int i = 0; i < (int)insns_.size(); ++i) if (insns_[i].address == around) { selectedInsn_ = i; selAnchor_ = i; pendingScroll_ = i; break; }
     rebuildAutoComments();
 }
 
@@ -422,12 +424,10 @@ void App::clearAutoAnalysis() {
 
 void App::gotoAddress(uint64_t va) {
     if (dbgState_ == DbgState::Paused) {
-        refreshLiveDisassembly(va);
-        selectedInsn_ = 0;
-        pendingScroll_ = 0;
+        refreshLiveDisassembly(va);   // ya selecciona y centra 'va' (y fija el ancla)
     } else {
         for (size_t i = 0; i < insns_.size(); ++i) {
-            if (insns_[i].address == va) { selectedInsn_ = (int)i; pendingScroll_ = (int)i; return; }
+            if (insns_[i].address == va) { selectedInsn_ = (int)i; selAnchor_ = (int)i; pendingScroll_ = (int)i; return; }
         }
         // El destino puede estar fuera de las primeras 20k instrucciones de la
         // seccion. Cargar una vista estatica desde la VA permite que Jump To
@@ -440,7 +440,7 @@ void App::gotoAddress(uint64_t va) {
                 dis_.setMode(pe_.is64Bit());
                 insns_ = dis_.disassemble(pe_.raw().data() + rawOffset, length, va, 1024);
                 disBase_ = va; liveView_ = false;
-                selectedInsn_ = 0; pendingScroll_ = 0;
+                selectedInsn_ = 0; selAnchor_ = 0; pendingScroll_ = 0;
                 pushLog("Jump To -> 0x" + hex64(va));
             }
         }
