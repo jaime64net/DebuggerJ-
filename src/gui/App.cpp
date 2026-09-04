@@ -2396,8 +2396,9 @@ void App::drawCpuContent() {
                 const auto& in = insns_[i];
                 ImGui::TableNextRow();
                 bool isCur = (dbgState_ == DbgState::Paused && in.address == currentIp_);
-                if (isCur) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.35f,0.28f,0.05f,1)));
-                else {
+                // Fondo azul SOLO para la linea/rango seleccionado (donde esta el cursor).
+                // La proxima instruccion a ejecutar (RIP) NO usa fondo: se marca con letras verdes.
+                {
                     int sLo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
                     int sHi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
                     if (selectedInsn_ >= 0 && i >= sLo && i <= sHi)
@@ -2609,7 +2610,7 @@ void App::drawCpuContent() {
                 ImGui::Dummy(ImVec2(flowWidth, flowHeight));
 
                 ImGui::TableSetColumnIndex(2);
-                ImGui::TextColored(isCur ? ImVec4(1,0.9f,0.4f,1) : ImVec4(0.6f,0.8f,1,1),
+                ImGui::TextColored(isCur ? ImVec4(0.4f,1,0.4f,1) : ImVec4(0.6f,0.8f,1,1),
                                    "%s", vaStr(in.address, dbgState_==DbgState::Paused ? debugger_.is64() : pe_.is64Bit()).c_str());
                 ImGui::TableSetColumnIndex(3);
                 ImGui::TextDisabled("%s", in.bytes.c_str());
@@ -2623,6 +2624,7 @@ void App::drawCpuContent() {
                 if (in.isCall) col = ImVec4(0.6f,1,0.6f,1);
                 else if (in.isJump) col = ImVec4(1,0.8f,0.5f,1);
                 else if (in.isRet)  col = ImVec4(1,0.6f,0.6f,1);
+                if (isCur) col = ImVec4(0.35f,1.0f,0.35f,1);   // proxima instruccion a ejecutar: letras verdes
                 ImGui::TextColored(col, "%s", in.text.c_str());
                 if (in.hasBranchTarget && ImGui::IsItemHovered())
                     ImGui::SetTooltip("-> 0x%s", hex64(in.branchTarget).c_str());
