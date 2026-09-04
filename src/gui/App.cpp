@@ -294,14 +294,40 @@ void App::refreshDisassembly() {
 void App::refreshLiveDisassembly(uint64_t around) {
     insns_.clear();
     autoComments_.clear();
-    uint8_t buf[2048];
-    uint64_t start = around;
-    size_t got = debugger_.readMemory(start, buf, sizeof(buf));
-    if (got == 0) return;
-    disBase_ = start;
     dis_.setMode(debugger_.is64());
-    insns_ = dis_.disassemble(buf, got, start, 400);
+    // Queremos ver codigo HACIA ARRIBA y hacia abajo de 'around' (como OllyDbg), no solo
+    // hacia abajo. Leemos desde unos bytes antes y desensamblamos hacia delante; probamos
+    // varios offsets de inicio hasta que las fronteras de instruccion caigan justo en
+    // 'around' (el desensamblado x86 no se puede retroceder de forma exacta).
+    const uint64_t backBytes = 64;
+    uint64_t start = around > backBytes ? around - backBytes : around;
+    std::vector<uint8_t> buf(0x900);
+    size_t got = debugger_.readMemory(start, buf.data(), buf.size());
+    if (got == 0) {   // no se pudo leer antes (borde de pagina): caer a leer justo en 'around'
+        start = around; got = debugger_.readMemory(start, buf.data(), buf.size());
+        if (got == 0) return;
+        disBase_ = start;
+        insns_ = dis_.disassemble(buf.data(), got, start, 400);
+        liveView_ = true;
+        for (int i = 0; i < (int)insns_.size(); ++i) if (insns_[i].address == around) { selectedInsn_ = i; pendingScroll_ = i; break; }
+        rebuildAutoComments();
+        return;
+    }
+    // Busca un offset de arranque cuyo flujo de instrucciones pase exactamente por 'around'.
+    uint64_t bestStart = around; bool aligned = false;
+    for (uint64_t off = 0; off <= backBytes && start + off <= around; ++off) {
+        uint64_t a = start + off; bool hit = false;
+        auto probe = dis_.disassemble(buf.data() + off, got - off, a, 64);
+        for (const auto& in : probe) { if (in.address == around) { hit = true; break; } if (in.address > around) break; }
+        if (hit) { bestStart = a; aligned = true; break; }
+    }
+    if (!aligned) bestStart = around;
+    disBase_ = bestStart;
+    size_t skip = (size_t)(bestStart - start);
+    insns_ = dis_.disassemble(buf.data() + skip, got - skip, bestStart, 400);
     liveView_ = true;
+    for (int i = 0; i < (int)insns_.size(); ++i) if (insns_[i].address == around) { selectedInsn_ = i; pendingScroll_ = i; break; }
+    rebuildAutoComments();
 }
 
 void App::refreshStaticStrings() {
@@ -2388,9 +2414,16 @@ void App::drawCpuContent() {
                 int selHi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
                 bool inSel = (i >= selLo && i <= selHi && selectedInsn_ >= 0);
                 // Selectable transparente que cubre toda la fila (seleccion + doble clic).
+                // Sin resaltado propio ni hover: el fondo del renglon lo pinta TableSetBgColor,
+                // asi pasar el raton por otras lineas NO cambia su fondo.
                 ImGui::SameLine(0,0);
-                if (ImGui::Selectable("##sel", inSel,
-                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0,0,0,0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0,0,0,0));
+                ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0,0,0,0));
+                bool selClicked = ImGui::Selectable("##sel", inSel,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick);
+                ImGui::PopStyleColor(3);
+                if (selClicked) {
                     if (ImGui::GetIO().KeyShift && selAnchor_ >= 0) selectedInsn_ = i;   // extiende rango
                     else { selectedInsn_ = i; selAnchor_ = i; }                          // nueva seleccion
                     // Doble clic = editar la instruccion (ensamblar en su direccion), estilo x64dbg.
