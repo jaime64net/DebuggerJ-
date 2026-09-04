@@ -288,10 +288,12 @@ void App::refreshDisassembly() {
     uint64_t epVA = pe_.entryPointVA();
     for (size_t i = 0; i < insns_.size(); ++i)
         if (insns_[i].address == epVA) { selectedInsn_ = (int)i; break; }
+    rebuildAutoComments();
 }
 
 void App::refreshLiveDisassembly(uint64_t around) {
     insns_.clear();
+    autoComments_.clear();
     uint8_t buf[2048];
     uint64_t start = around;
     size_t got = debugger_.readMemory(start, buf, sizeof(buf));
@@ -1567,6 +1569,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Cache de breakpoints por binario (estilo .udd): los breakpoints software (con condicion, hits, solo-log y accion M3), hardware, de excepcion y la mascara de eventos se guardan solos en cache/<hash>.bp.json al cambiar, y se RESTAURAN Y ACTIVAN al abrir el .exe o al adjuntarse a un proceso (relocalizados a la base runtime). Guardar/Cargar sesion sigue existiendo para instantaneas manuales.");
             ImGui::BulletText("Stop (toolbar o Depurar -> Detener) termina el proceso y RECARGA el archivo abierto en vista estatica: CPU, strings, packers, memoria y registros vuelven a los valores del archivo (como recien abierto). Los comentarios/etiquetas persisten en disco.");
             ImGui::BulletText("Archivo -> Cerrar actual (Ctrl+W) cierra el archivo y la sesion activa dejando la app vacia, sin salir. Archivo -> Salir cierra DebuggerJ++.");
+            ImGui::BulletText("Comentarios automaticos: las call/jmp a APIs importadas se anotan solas en la CPU con 'dll.API' (color azul, via IAT y thunks), sin necesidad de Analyze. Un comentario propio (';') tiene prioridad. En la instruccion actual, un salto condicional muestra '(saltara)'/'(no salta)' segun EFLAGS.");
             ImGui::BulletText("Registros: ademas de generales y flags, el panel muestra segmentos (CS/DS/ES/FS/GS/SS), LastErr (con el texto del error de Windows) y la FPU x87 (ST0-ST7, con su valor). CPU -> clic derecho -> 'Follow in dump' sigue en el volcado esta instruccion, su operando de memoria o el destino del salto; la casilla 'Follow RIP' del volcado lo hace seguir automaticamente lo que trazas (como OllyDbg).");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
             ImGui::BulletText("Editar instrucciones y parches (estilo x64dbg): DOBLE CLIC en una instruccion de la CPU la ensambla/edita in situ "
@@ -2581,10 +2584,26 @@ void App::drawCpuContent() {
                 ImGui::TextColored(col, "%s", in.text.c_str());
                 if (in.hasBranchTarget && ImGui::IsItemHovered())
                     ImGui::SetTooltip("-> 0x%s", hex64(in.branchTarget).c_str());
+                // Indicador de salto condicional en la instruccion actual (estilo Olly): dice si saltara.
+                if (isCur && in.isJump && in.hasBranchTarget) {
+                    std::string mn = in.text.substr(0, in.text.find(' '));
+                    if (mn != "jmp") {
+                        bool taken = jumpWillBeTaken(mn, regs_.eflags);
+                        ImGui::SameLine();
+                        ImGui::TextColored(taken ? ImVec4(0.4f,1,0.4f,1) : ImVec4(0.8f,0.8f,0.8f,1),
+                                           taken ? "(saltara)" : "(no salta)");
+                    }
+                }
                 auto cmit = comments_.find(canonVA(in.address));
                 if (cmit != comments_.end()) {
                     ImGui::SameLine();
                     ImGui::TextColored(ImVec4(0.5f,0.75f,0.5f,1), "; %s", cmit->second.c_str());
+                } else {
+                    auto acit = autoComments_.find(in.address);
+                    if (acit != autoComments_.end()) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(0.45f,0.7f,0.9f,1), "; %s", acit->second.c_str());
+                    }
                 }
             }
         }
@@ -3544,6 +3563,60 @@ void App::drawMemoryPanel() {
 // ---------------------------------------------------------------------------
 // extractBracketVA es static (arriba); esta version publica la reutiliza desde otros metodos.
 bool App::extractBracketVAPublic(const std::string& text, uint64_t& va) { return extractBracketVA(text, va); }
+
+// Comentarios automaticos: resuelve el destino de cada call/jmp a "dll.API" usando
+// la IAT (call/jmp [IAT]) y los thunks (call thunk; thunk: jmp [IAT]). Estilo OllyDbg.
+void App::rebuildAutoComments() {
+    autoComments_.clear();
+    if (!fileLoaded_) return;
+    std::map<uint64_t, std::string> iat;
+    for (const auto& imp : pe_.imports()) {
+        std::string nm = imp.name.empty() ? (imp.dll + ".#" + std::to_string(imp.ordinal)) : (imp.dll + "." + imp.name);
+        auto dot = nm.find(".dll."); if (dot != std::string::npos) nm.erase(dot, 4);   // kernel32.dll.X -> kernel32.X
+        iat[pe_.imageBase() + imp.iatRva] = nm;
+    }
+    std::map<uint64_t, size_t> byAddr;
+    for (size_t i = 0; i < insns_.size(); ++i) byAddr[insns_[i].address] = i;
+    for (const auto& in : insns_) {
+        if (!in.isCall && !in.isJump) continue;
+        uint64_t memVA = 0;
+        if (extractBracketVA(in.text, memVA)) {
+            auto it = iat.find(memVA);
+            if (it != iat.end()) { autoComments_[in.address] = (in.isCall ? "call " : "jmp ") + it->second; continue; }
+        }
+        if (in.hasBranchTarget) {
+            auto bi = byAddr.find(in.branchTarget);
+            if (bi != byAddr.end()) {
+                const auto& tgt = insns_[bi->second];
+                uint64_t thunkVA = 0;
+                if (tgt.isJump && extractBracketVA(tgt.text, thunkVA)) {
+                    auto it = iat.find(thunkVA);
+                    if (it != iat.end()) autoComments_[in.address] = (in.isCall ? "call " : "jmp ") + it->second;
+                }
+            }
+        }
+    }
+}
+
+// Predice si un salto condicional se tomara segun EFLAGS (para el indicador estilo Olly).
+bool App::jumpWillBeTaken(const std::string& m, uint32_t f) const {
+    auto CF=[&]{return (f>>0)&1;}; auto PF=[&]{return (f>>2)&1;}; auto ZF=[&]{return (f>>6)&1;};
+    auto SF=[&]{return (f>>7)&1;}; auto OF=[&]{return (f>>11)&1;};
+    std::string j = m; for (auto& c : j) c=(char)tolower((unsigned char)c);
+    if (j=="jmp") return true;
+    if (j=="je"||j=="jz")   return ZF();
+    if (j=="jne"||j=="jnz") return !ZF();
+    if (j=="js")  return SF();      if (j=="jns") return !SF();
+    if (j=="jo")  return OF();      if (j=="jno") return !OF();
+    if (j=="jp"||j=="jpe") return PF();  if (j=="jnp"||j=="jpo") return !PF();
+    if (j=="jc"||j=="jb"||j=="jnae")  return CF();
+    if (j=="jnc"||j=="jae"||j=="jnb") return !CF();
+    if (j=="jbe"||j=="jna") return CF()||ZF();   if (j=="ja"||j=="jnbe") return !CF()&&!ZF();
+    if (j=="jl"||j=="jnge") return SF()!=OF();   if (j=="jge"||j=="jnl") return SF()==OF();
+    if (j=="jle"||j=="jng") return ZF()||(SF()!=OF()); if (j=="jg"||j=="jnle") return !ZF()&&(SF()==OF());
+    if (j=="jcxz"||j=="jecxz"||j=="jrcxz") return false;   // depende de (r/e)cx, no de flags
+    return false;
+}
 
 // Follow in dump: carga en el volcado hex la memoria alrededor de 'va'.
 void App::followInDump(uint64_t va) {

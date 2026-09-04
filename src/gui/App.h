@@ -423,6 +423,10 @@ private:
 
     // --- Volcado Hex dedicado ---
     bool          dumpFollowRip_ = true;   // el volcado sigue el RIP mientras trazas (Olly)
+    // Comentarios automaticos: destino de call/jmp -> "dll.API" (IAT + thunks). Se recalcula al desensamblar.
+    std::map<uint64_t, std::string> autoComments_;
+    void          rebuildAutoComments();
+    bool          jumpWillBeTaken(const std::string& mnemonic, uint32_t eflags) const;
     void          followInDump(uint64_t va);
     bool          extractBracketVAPublic(const std::string& text, uint64_t& va);
     char          dumpGotoBuf_[32] = {0};
