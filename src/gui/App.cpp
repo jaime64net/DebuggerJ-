@@ -936,19 +936,30 @@ void App::render() {
         const bool ipChanged = (live.ip() != 0 && live.ip() != currentIp_);
         if (stateChanged || ipChanged) {
             regsBeforeStep_ = regs_; haveRegsBefore_ = true;   // para Undo
+            const uint64_t oldIp = currentIp_;
             regs_ = live;
             currentIp_ = regs_.ip();
             curModule_ = moduleNameAt(currentIp_);
-            // Estilo OllyDbg: si el RIP ya esta en el listado actual, NO recargamos ni
-            // recentramos; solo movemos la seleccion al RIP y dejamos que el codigo se
-            // quede quieto (el grid solo hara scroll cuando el RIP salga del area visible,
-            // ver cpuEnsureRipVisible_). Solo si el RIP no esta (salto/ret lejano) se
-            // recarga el desensamblado centrado en el.
-            int ripIdx = -1;
-            if (liveView_ && !insns_.empty())
-                for (int k = 0; k < (int)insns_.size(); ++k) if (insns_[k].address == currentIp_) { ripIdx = k; break; }
-            if (ripIdx < 0) refreshLiveDisassembly(currentIp_);   // fija selectedInsn_ + pendingScroll_ (centra)
-            else { selectedInsn_ = ripIdx; selAnchor_ = ripIdx; cpuEnsureRipVisible_ = true; }
+            // Distinguir un paso SECUENCIAL (el RIP avanzo a la instruccion de justo
+            // debajo) de un SALTO/CALL/RET (el RIP fue a otra parte):
+            //  - Secuencial: estilo OllyDbg, el RIP baja una fila y el codigo se queda
+            //    quieto; el grid solo scrollea al llegar al borde (cpuEnsureRipVisible_).
+            //  - Salto/lejano: se centra el RIP en la CPU para que se vea donde cayo.
+            int oldIdx = -1, ripIdx = -1;
+            if (liveView_ && !insns_.empty()) {
+                for (int k = 0; k < (int)insns_.size(); ++k) {
+                    if (oldIp && insns_[k].address == oldIp) oldIdx = k;
+                    if (insns_[k].address == currentIp_) ripIdx = k;
+                }
+            }
+            const bool sequential = (oldIdx >= 0 && (uint64_t)(insns_[oldIdx].address + insns_[oldIdx].length) == currentIp_ && ripIdx == oldIdx + 1);
+            if (ripIdx < 0) {
+                refreshLiveDisassembly(currentIp_);              // no esta en la vista: recarga y centra
+            } else if (sequential) {
+                selectedInsn_ = ripIdx; selAnchor_ = ripIdx; cpuEnsureRipVisible_ = true;   // baja una fila
+            } else {
+                selectedInsn_ = ripIdx; selAnchor_ = ripIdx; pendingScroll_ = ripIdx;         // salto: centrar
+            }
             if (dumpFollowRip_) followInDump(currentIp_);   // el volcado sigue lo que trazas (estilo Olly)
             if (stateChanged) memMap_ = debugger_.memoryMap();
             if (debugger_.foundOEP()) pluginOEP_ = debugger_.foundOEP();
@@ -2593,7 +2604,7 @@ void App::drawCpuContent() {
                     }
                     ImGui::EndPopup();
                 }
-                if (i == pendingScroll_) { ImGui::SetScrollHereY(0.35f); pendingScroll_ = -1; }
+                if (i == pendingScroll_) { ImGui::SetScrollHereY(0.5f); pendingScroll_ = -1; }   // RIP/destino al centro visible
                 ImGui::PopID();
 
                 ImGui::TableSetColumnIndex(1);
