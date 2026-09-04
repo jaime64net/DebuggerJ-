@@ -4225,14 +4225,16 @@ void App::drawPluginsPanel() {
     }
 
     // ---- Plugin 1: Anti-debug ----
-    if (ImGui::CollapsingHeader("Activar anti-debug", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Anti-debug (ocultar el debugger)", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("Oculta el debugger al proceso (anti-anti-debug).");
         ImGui::Checkbox("PEB->BeingDebugged = 0", &antiOpt_.beingDebugged);
         ImGui::Checkbox("PEB->NtGlobalFlag (limpiar FLG_HEAP_*)", &antiOpt_.ntGlobalFlag);
         ImGui::Checkbox("Heap Flags / ForceFlags", &antiOpt_.heapFlags);
         ImGui::Checkbox("Re-aplicar en cada pausa", &antiReapply_);
         ImGui::BeginDisabled(!active);
-        if (ImGui::Button(antiActive_ ? "Desactivar anti-debug" : "Activar anti-debug")) {
+        // ID estable (###): el texto visible cambia con el toggle pero el ID no,
+        // y no choca con el del CollapsingHeader (bug "conflicting ID" de ImGui).
+        if (ImGui::Button(antiActive_ ? "Desactivar anti-debug###antidbgToggle" : "Activar anti-debug###antidbgToggle")) {
             std::string lg;
             if (antiActive_) {   // toggle OFF: restaura valores "con debugger presente"
                 revertAntiAntiDebug(debugger_, debugger_.is64(), antiOpt_, lg);
