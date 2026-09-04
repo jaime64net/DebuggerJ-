@@ -288,6 +288,18 @@ private:
     bool          fileLoaded_ = false;
     bool          showAttach_ = false;
     char          attachPid_[16] = {0};
+    // Lista de procesos para Attach (Toolhelp32): PID, nombre, arquitectura, titulo de ventana y ruta.
+    struct ProcEntry { uint32_t pid = 0; std::string name, arch, title, path; };
+    std::vector<ProcEntry> procList_;
+    char          procFilter_[128] = {0};
+    uint32_t      procSelPid_ = 0;
+    void          refreshProcessList();
+    void          openAttachDialog();     // abre la ventana de attach con la lista recien cargada
+    void          closeCurrent();         // Archivo -> Cerrar actual: cierra archivo y sesion sin salir de la app
+    void          stopSession();          // Stop: termina el proceso y recarga el archivo en vista estatica
+    void          finishStopReload();     // completa el Stop cuando el motor ya salio (render)
+    void          resetLiveState();       // limpia registros/memoria/IP de la sesion viva
+    bool          reloadAfterStop_ = false;
     int           selectedInsn_ = -1;
     int           selAnchor_ = -1;     // ancla para seleccion multiple (rango [anchor..sel])
     int           pendingScroll_ = -1; // indice de instruccion al que hay que desplazar

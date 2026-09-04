@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <array>
 #include <set>
@@ -919,6 +920,10 @@ void App::render() {
         }
     }
 
+    // Stop pedido por el usuario: cuando el motor reporta Exited (o ya volvio a Idle)
+    // recargamos el archivo para que todas las ventanas muestren los valores estaticos.
+    if (reloadAfterStop_ && (s == DbgState::Exited || s == DbgState::Idle)) { reloadAfterStop_ = false; finishStopReload(); }
+
     drainMcpQueue();
 
     // Aplicar el .ini del layout (main) al inicio del frame, antes de dibujar ventanas.
@@ -1325,7 +1330,7 @@ void App::drawMenuBar() {
                 if (!pick.empty()) openFile(pick);
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Attach a proceso (PID)...", nullptr, false, dbgState_ == DbgState::Idle)) showAttach_ = true;
+            if (ImGui::MenuItem("Attach a proceso...", nullptr, false, dbgState_ == DbgState::Idle)) openAttachDialog();
             {
                 bool canDetach = dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused || dbgState_ == DbgState::Launching;
                 if (ImGui::MenuItem("Detach (sin terminar)", nullptr, false, canDetach)) {
@@ -1351,7 +1356,9 @@ void App::drawMenuBar() {
                 if (GetSaveFileNameW(&ofn)) { std::string err; if (!saveSarifReport(path, err)) pushLog("SARIF: " + err); else pushLog("SARIF exportado."); }
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Cerrar", "Alt+F4")) {
+            // Cerrar actual: cierra el archivo abierto (y termina la sesion si la hay) sin salir de la app.
+            if (ImGui::MenuItem("Cerrar actual (close current)", "Ctrl+W", false, fileLoaded_ || dbgState_ != DbgState::Idle)) closeCurrent();
+            if (ImGui::MenuItem("Salir", "Alt+F4")) {
                 if (dbgState_ != DbgState::Idle) debugger_.detachAndStop();
                 PostQuitMessage(0);
             }
@@ -1359,12 +1366,12 @@ void App::drawMenuBar() {
         }
         if (ImGui::BeginMenu("Depurar")) {
             if (ImGui::MenuItem("Lanzar bajo debug", "F9", false, fileLoaded_)) startDebugSession();
-            if (ImGui::MenuItem("Adjuntar a PID...", nullptr, false, dbgState_ == DbgState::Idle)) showAttach_ = true;
+            if (ImGui::MenuItem("Adjuntar a proceso...", nullptr, false, dbgState_ == DbgState::Idle)) openAttachDialog();
             if (ImGui::MenuItem("Desadjuntar (sin terminar)", nullptr, false, dbgState_ == DbgState::Running || dbgState_ == DbgState::Paused || dbgState_ == DbgState::Launching)) {
                 std::string error;
                 if (!debugger_.detach(error)) pushLog("Desadjuntar: " + error);
             }
-            if (ImGui::MenuItem("Detener", nullptr, false, dbgState_ != DbgState::Idle)) debugger_.stop();
+            if (ImGui::MenuItem("Detener (recarga el archivo)", nullptr, false, dbgState_ != DbgState::Idle)) stopSession();
             ImGui::Separator();
             bool paused = (dbgState_ == DbgState::Paused);
             if (ImGui::MenuItem("Saltar instruccion (skip)", nullptr, false, paused)) skipInstruction();
@@ -1471,8 +1478,9 @@ void App::drawToolbar() {
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!active);
-    if (ImGui::Button("[] Stop", ImVec2(80, 30))) debugger_.stop();
+    if (ImGui::Button("[] Stop", ImVec2(80, 30))) stopSession();
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Termina el proceso y recarga el archivo (vista estatica)");
 
     ImGui::SameLine(); ImGui::TextUnformatted("|"); ImGui::SameLine();
 
@@ -1502,6 +1510,7 @@ void App::drawToolbar() {
         if (!active) startDebugSession();
         else if (paused) debugger_.go();
     }
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_W) && (fileLoaded_ || dbgState_ != DbgState::Idle)) closeCurrent();
 
     toolbarHeight_ = ImGui::GetWindowSize().y;
     ImGui::End();
@@ -1526,7 +1535,9 @@ void App::drawHelpWindow() {
             ImGui::BulletText("La cadena SEH x86 de procesos WOW64 se obtiene desde el TEB32 indicado por FS, no desde el TEB64 del host; Window -> Excepciones y MCP seh muestran pares record/handler.");
             ImGui::BulletText("Los breakpoints de la imagen principal se relocalizan automaticamente cuando ASLR cambia la base al lanzar o adjuntarse.");
             ImGui::BulletText("F5 lanza o continua; F8 entra en calls (step into); F10 los salta (step over); F11 ejecuta hasta ret; Pause detiene una sesion activa.");
-            ImGui::BulletText("Depurar -> Adjuntar a PID permite analizar un proceso existente. 'Desadjuntar' lo deja ejecutando sin DebuggerJ++; Detener finaliza la sesion. Requiere permisos suficientes y se recomienda usarlo solo en la VM de analisis.");
+            ImGui::BulletText("Depurar -> Adjuntar a proceso abre una LISTA de procesos (PID, nombre, x86/x64, titulo de ventana y ruta) con filtro; doble clic o 'Adjuntar' se conecta (queda un campo de PID manual como respaldo). 'Desadjuntar' deja el proceso ejecutando sin DebuggerJ++. Requiere permisos suficientes y se recomienda usarlo solo en la VM de analisis.");
+            ImGui::BulletText("Stop (toolbar o Depurar -> Detener) termina el proceso y RECARGA el archivo abierto en vista estatica: CPU, strings, packers, memoria y registros vuelven a los valores del archivo (como recien abierto). Los comentarios/etiquetas persisten en disco.");
+            ImGui::BulletText("Archivo -> Cerrar actual (Ctrl+W) cierra el archivo y la sesion activa dejando la app vacia, sin salir. Archivo -> Salir cierra DebuggerJ++.");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
             ImGui::BulletText("Editar instrucciones y parches (estilo x64dbg): DOBLE CLIC en una instruccion de la CPU la ensambla/edita in situ "
                               "(precargada; si la nueva es mas corta se rellena con NOP). Clic derecho -> 'Patch bytes (hex)', 'NOP instruccion', "
@@ -1574,7 +1585,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Favourites (menu Favourites): herramientas externas configurables en favourites.txt (nombre|comando, con %%DEBUGGEE%% y %%PID%%). Tools -> Reiniciar como administrador relanza elevado.");
             ImGui::BulletText("Struct (Window -> Struct): aplica una definicion de campos (byte/word/dword/qword/ptr/string) a una direccion base (que admite expresiones) y muestra los valores leidos de memoria, con offsets automaticos.");
             ImGui::BulletText("CPU -> clic derecho -> Search for: 'All commands' busca una subcadena en todas las instrucciones; 'All intermodular calls' lista las llamadas a APIs de otros modulos (via IAT y thunks); 'Binary string' busca hex o texto. Resultados en la ventana Search results (doble clic para navegar, 'Copiar todo').");
-            ImGui::BulletText("Archivo -> Attach a proceso / Detach: adjuntar por PID o desadjuntar dejando el proceso vivo (tambien en el menu Depurar y por MCP attach/detach).");
+            ImGui::BulletText("Archivo -> Attach a proceso / Detach: elegir un proceso de la lista (o PID manual) o desadjuntar dejando el proceso vivo (tambien en el menu Depurar y por MCP attach/detach). Archivo -> Cerrar actual cierra archivo y sesion.");
             ImGui::BulletText("Tools -> Options -> Simbolos: configura un symbol server (symsrv), ej 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols', para resolver nombres y mejorar el call stack. Se persiste y aplica en la proxima sesion.");
             ImGui::BulletText("MCP Log: cachea todo a mcp_log_cache.txt; botones Load cache, Copy to clipboard, y el texto es seleccionable (Ctrl+C).");
             ImGui::BulletText("Breakpoints inteligentes (M3): CPU -> clic derecho -> Breakpoints -> 'Accion al golpear'. La accion puede ser 'ai:<pregunta>' (consulta al agente), 'cmd {args}' (tool dbg_*) o JSON crudo; se ejecuta cada vez que el BP pausa. Tambien por MCP: set_bp con 'action'.");
@@ -1631,7 +1642,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Elige permiso: Solo lectura, Control de sesion o Modificacion. Bind 0.0.0.0 solo para WSL/red de confianza.");
             ImGui::BulletText("Registra mcp/server.mjs en tu cliente MCP. Consulta mcp/README.md para comandos exactos.");
             ImGui::TextUnformatted("Tools principales");
-            ImGui::BulletText("Sesion: status, open, attach, detach, launch, restart, go, pause, step_into, step_over, step_to_ret y stop. detach solo libera un Attach; stop termina el proceso.");
+            ImGui::BulletText("Sesion: status, open, attach, detach, launch, restart, go, pause, step_into, step_over, step_to_ret y stop. detach solo libera un Attach; stop termina el proceso y recarga el archivo abierto en vista estatica (igual que el boton Stop de la UI).");
             ImGui::BulletText("Informe: report genera Markdown sin escribir disco; export_report guarda Markdown y por ello requiere nivel Modificacion.");
             ImGui::BulletText("Control: set_bp (break_on_hit, condition y log_only), set_hwbp, set_membp, breakpoints de excepcion y set_event_breaks requieren Control de sesion. set_membp requiere pausa; type=0 acceso, 1 escritura, 8 ejecucion.");
             ImGui::BulletText("Analisis: disasm, analyze_code, list_functions/xrefs/loops, bookmarks, modules, sections, imports, exports, symbol/source, stack, call_stack, mem_map y find_refs.");
@@ -1718,21 +1729,181 @@ void App::drawHelpWindow() {
     ImGui::End();
 }
 
+// ---------------------------------------------------------------------------
+// Attach: lista de procesos (Toolhelp32) en vez de pedir el PID a mano
+// ---------------------------------------------------------------------------
+static BOOL CALLBACK enumWindowTitles(HWND h, LPARAM lp) {
+    auto* m = reinterpret_cast<std::map<uint32_t, std::string>*>(lp);
+    if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+    if (!pid || m->count(pid)) return TRUE;
+    wchar_t t[256] = {0};
+    if (GetWindowTextW(h, t, 256) > 0) (*m)[pid] = wToUtf8(t);
+    return TRUE;
+}
+
+void App::refreshProcessList() {
+    procList_.clear();
+    std::map<uint32_t, std::string> titles;
+    EnumWindows(enumWindowTitles, reinterpret_cast<LPARAM>(&titles));
+    const DWORD self = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) { pushLog("No se pudo enumerar procesos."); return; }
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == 0 || pe.th32ProcessID == self) continue;
+            ProcEntry e; e.pid = pe.th32ProcessID; e.name = wToUtf8(pe.szExeFile);
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, e.pid);
+            if (h) {
+                wchar_t path[MAX_PATH] = {0}; DWORD n = MAX_PATH;
+                if (QueryFullProcessImageNameW(h, 0, path, &n)) e.path = wToUtf8(path);
+                BOOL wow = FALSE;
+                if (IsWow64Process(h, &wow)) e.arch = wow ? "x86" : "x64";
+                CloseHandle(h);
+            } else e.arch = "?";
+            auto it = titles.find(e.pid); if (it != titles.end()) e.title = it->second;
+            procList_.push_back(std::move(e));
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    std::sort(procList_.begin(), procList_.end(), [](const ProcEntry& a, const ProcEntry& b) {
+        int c = _stricmp(a.name.c_str(), b.name.c_str());
+        return c != 0 ? c < 0 : a.pid < b.pid;
+    });
+}
+
+void App::openAttachDialog() {
+    procSelPid_ = 0; attachPid_[0] = '\0';
+    refreshProcessList();
+    showAttach_ = true;
+}
+
 void App::drawAttachWindow() {
-    ImGui::SetNextWindowSize(ImVec2(390, 130), ImGuiCond_Appearing);
-    if (!ImGui::Begin("Adjuntar a proceso", &showAttach_, ImGuiWindowFlags_NoResize)) { ImGui::End(); return; }
-    ImGui::TextWrapped("Introduce el PID decimal de un proceso existente. DebuggerJ++ intentara abrir su ejecutable para el analisis estatico antes de adjuntarse.");
-    bool enter = ImGui::InputTextWithHint("PID", "ej. 1234", attachPid_, sizeof(attachPid_), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SetNextWindowSize(ImVec2(820, 520), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Adjuntar a proceso", &showAttach_)) { ImGui::End(); return; }
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("##procfilter", "filtrar por nombre, PID, titulo o ruta", procFilter_, sizeof(procFilter_));
     ImGui::SameLine();
-    if ((ImGui::Button("Adjuntar") || enter) && attachPid_[0]) {
-        attachToProcess(static_cast<uint32_t>(strtoul(attachPid_, nullptr, 10)));
-        attachPid_[0] = '\0';
+    if (ImGui::Button("Actualizar")) refreshProcessList();
+    ImGui::SameLine(); ImGui::TextDisabled("%d procesos", (int)procList_.size());
+    ImGui::SameLine(0, 30);
+    ImGui::TextUnformatted("PID manual:"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    bool enterPid = ImGui::InputTextWithHint("##pid", "1234", attachPid_, sizeof(attachPid_), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal);
+
+    std::string f = procFilter_;
+    std::transform(f.begin(), f.end(), f.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    auto matches = [&](const ProcEntry& e) {
+        if (f.empty()) return true;
+        auto has = [&](const std::string& v) {
+            std::string l = v; std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+            return l.find(f) != std::string::npos;
+        };
+        return has(e.name) || has(std::to_string(e.pid)) || has(e.title) || has(e.path);
+    };
+
+    uint32_t attachNow = 0;
+    const float footer = ImGui::GetFrameHeightWithSpacing() * 2.2f;
+    ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
+                         ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+    if (ImGui::BeginTable("proclist", 5, tf, ImVec2(0, -footer))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn("Proceso", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Arch", ImGuiTableColumnFlags_WidthFixed, 42);
+        ImGui::TableSetupColumn("Titulo de ventana", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+        ImGui::TableSetupColumn("Ruta", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+        ImGui::TableHeadersRow();
+        for (const auto& e : procList_) {
+            if (!matches(e)) continue;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            char lbl[32]; std::snprintf(lbl, sizeof(lbl), "%u##p%u", e.pid, e.pid);
+            bool sel = (procSelPid_ == e.pid);
+            if (ImGui::Selectable(lbl, sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                procSelPid_ = e.pid;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) attachNow = e.pid;
+            }
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(e.name.c_str());
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(e.arch.c_str());
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(e.title.c_str());
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", e.path.c_str());
+        }
+        ImGui::EndTable();
+    }
+
+    if (enterPid && attachPid_[0]) attachNow = static_cast<uint32_t>(strtoul(attachPid_, nullptr, 10));
+    const bool canAttach = procSelPid_ != 0 || attachPid_[0] != '\0';
+    ImGui::BeginDisabled(!canAttach);
+    if (ImGui::Button("Adjuntar", ImVec2(110, 0))) attachNow = attachPid_[0] ? static_cast<uint32_t>(strtoul(attachPid_, nullptr, 10)) : procSelPid_;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancelar", ImVec2(110, 0))) showAttach_ = false;
+    ImGui::SameLine();
+    ImGui::TextDisabled("Doble clic sobre un proceso lo adjunta. Puede fallar por permisos, arquitectura o protecciones del sistema.");
+
+    if (attachNow) {
+        attachToProcess(attachNow);
+        attachPid_[0] = '\0'; procSelPid_ = 0;
         showAttach_ = false;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancelar")) showAttach_ = false;
-    ImGui::TextDisabled("El proceso puede rechazar el attach por permisos, arquitectura o protecciones del sistema.");
     ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// Cerrar actual / Stop con recarga estatica
+// ---------------------------------------------------------------------------
+void App::resetLiveState() {
+    regs_ = Registers{};
+    currentIp_ = 0; curModule_.clear();
+    memMap_.clear();
+    haveRegsBefore_ = false;
+    liveView_ = false;
+    runToTemp_.clear();
+    runUntilActive_ = false;
+    animateActive_ = false;
+    for (auto& w : watches_) { w.value.clear(); w.haveLast = false; }
+}
+
+void App::closeCurrent() {
+    if (debugger_.state() != DbgState::Idle) debugger_.detachAndStop();
+    reloadAfterStop_ = false; pendingSwitchPid_ = 0;
+    dbgState_ = DbgState::Idle;
+    resetLiveState();
+    std::string closed = wToUtf8(loadedPath_);
+    pe_ = PeFile{};
+    fileLoaded_ = false; loadedPath_.clear(); openError_.clear();
+    insns_.clear(); disBase_ = 0;
+    selectedInsn_ = -1; selAnchor_ = -1; pendingScroll_ = -1; lastXrefSel_ = -1;
+    strings_.clear(); searchHits_.clear(); searchStatus_.clear();
+    packerLoaded_ = false; packerMatches_.clear(); patches_.clear();
+    peidScanned_ = false; peidResult_ = DieResult{};
+    comments_.clear(); labels_.clear(); refs_.clear(); bookmarks_.clear();
+    analyzedFunctions_.clear(); analysisXrefs_.clear(); analysisLoops_.clear(); analysisCacheLoaded_ = false;
+    searchResults_.clear(); showSearchResults_ = false;
+    memBuf_.clear(); memBase_ = 0; dumpBuf_.clear(); dumpBase_ = 0;
+    pushLog(closed.empty() ? "Sesion cerrada." : "Cerrado: " + closed);
+}
+
+void App::stopSession() {
+    DbgState s = debugger_.state();
+    if (s == DbgState::Idle) return;
+    if (s == DbgState::Exited) { finishStopReload(); return; }
+    reloadAfterStop_ = true;
+    debugger_.stop();
+    pushLog("Stop: terminando el proceso...");
+}
+
+void App::finishStopReload() {
+    debugger_.detachAndStop();      // une el hilo del motor y vuelve a Idle
+    dbgState_ = DbgState::Idle;
+    resetLiveState();
+    if (!loadedPath_.empty()) {
+        std::wstring path = loadedPath_;
+        openFile(path);             // vuelve a cargar el PE: CPU, strings, packers, etc. en vista estatica
+        pushLog("Proceso terminado; archivo recargado en vista estatica.");
+    } else pushLog("Proceso terminado.");
 }
 
 // ---------------------------------------------------------------------------
@@ -5647,7 +5818,7 @@ std::string App::handleMcpCommand(const std::string& line) {
     else if (cmd == "step_into")   { debugger_.stepInto(); }
     else if (cmd == "step_over")   { debugger_.stepOver(); }
     else if (cmd == "step_to_ret") { debugger_.stepToRet(); }
-    else if (cmd == "stop")        { debugger_.stop(); }
+    else if (cmd == "stop")        { stopSession(); }
     else if (cmd == "get_regs") {
         if (!need_paused()) goto done;
         Registers r = debugger_.registers();
