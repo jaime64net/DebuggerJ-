@@ -456,6 +456,8 @@ private:
     std::string   stringAtVA(uint64_t va, size_t maxLen = 40);
     void          drawInstructionColored(const Instruction& in, bool isCur);
     int           callStackThreadSel_ = -1;    // -1 = todos los hilos
+    int           cpuVisLastSel_ = -1;         // ultima seleccion vigilada por la garantia de visibilidad
+    int           cpuVisCheckFrames_ = 0;      // cuadros restantes en que se verifica que la seleccion se vea
     struct SecInfo { std::string name; uint32_t va = 0, vsize = 0, raw = 0; };
     std::map<uint64_t, std::vector<SecInfo>> secCache_;   // base de modulo -> secciones (leidas de memoria)
     const std::vector<SecInfo>& sectionsOfModule(const ModRange* m);

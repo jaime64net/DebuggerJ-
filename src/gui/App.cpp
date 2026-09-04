@@ -1600,6 +1600,8 @@ void App::drawHelpWindow() {
             ImGui::TextUnformatted("Flujo recomendado");
             ImGui::BulletText("Archivo -> Abrir: analiza el PE estatico, secciones, imports, exports, strings y packers. La cache evita repetir esos escaneos.");
             ImGui::BulletText("CPU (estilo x64dbg): la columna Flow dibuja cada salto de la vista como una linea vertical (punteada = condicional, solida = jmp) con un conector en el origen y una flecha en el destino; los saltos que envuelven a otros van mas a la izquierda; el salto de la linea seleccionada se pinta amarillo y el de la instruccion actual verde (saltara) o rojo (no salta). Una linea solida pegada a la direccion marca el procedimiento (desde la primera instruccion util hasta el ret). Junto a los bytes, 'v'/'^' indica si el salto va hacia abajo o arriba.");
+            ImGui::BulletText("CPU visibilidad: el renglon seleccionado (o el RIP al trazar, o el destino de un salto/Enter/goto) SIEMPRE queda dentro de las filas visibles; si por cualquier motivo cae fuera, la vista se centra en el.");
+            ImGui::BulletText("CPU navegacion: doble clic o Enter sobre un jmp/jcc/call SIGUE al destino (si esta en la vista lo selecciona y centra; si no, carga el codigo ahi); clic derecho -> Jump To hace lo mismo. Espacio (o doble clic en una instruccion que no salta) abre el ensamblador. Ctrl+A = Analyze this solo con el foco en la CPU.");
             ImGui::BulletText("CPU colores: mnemonico azul; jmp/jcc/call/ret rojos; int3/nop grises; registros lila; inmediatos rojos; fs:/gs: con fondo rojo. El destino de call/jmp se muestra como 'modulo.DIRECCION' o '<modulo.simbolo>' cuando cae exacto en un simbolo (DbgHelp/etiquetas).");
             ImGui::BulletText("CPU columna Comentario: para TODO el modulo, sin Analyze: comentario propio (verde) o analisis automatico (azul): 'dll.API' en call/jmp por IAT, 'reg:simbolo' o 'reg:\"texto\"' segun el valor actual de cada registro usado, '[mem]:simbolo' para el puntero leido en el operando de memoria e inmediatos que caen en un modulo. Se recalcula en cada pausa.");
             ImGui::BulletText("Call stack (x64dbg): lista de hilos a la izquierda (Main Thread = primero; '*' = hilo actual; 'Todos los hilos' muestra cada pila separada) y tabla Address (donde vive la direccion de retorno), To (a donde regresa), From (instruccion del frame), Size, Party (System = modulo bajo Windows, User = resto) y Comment (modulo.simbolo+off). Doble clic o menu contextual para seguir From/To en la CPU.");
@@ -2908,12 +2910,21 @@ void App::drawCpuContent() {
                 if (selClicked) {
                     if (ImGui::GetIO().KeyShift && selAnchor_ >= 0) selectedInsn_ = i;   // extiende rango
                     else { selectedInsn_ = i; selAnchor_ = i; }                          // nueva seleccion
-                    // Doble clic = editar la instruccion (ensamblar en su direccion), estilo x64dbg.
-                    // (Seguir el salto sigue disponible con clic derecho -> "Jump To".)
+                    // Doble clic sobre un jmp/jcc/call con destino = SEGUIR al destino (como
+                    // Enter en x64dbg): si esta en la vista lo selecciona y centra; si no,
+                    // navega con gotoAddress. En cualquier otra instruccion, doble clic =
+                    // ensamblar en su direccion (tambien con Espacio, como x64dbg).
                     if (ImGui::IsMouseDoubleClicked(0)) {
-                        asmAddr_ = in.address; asmFillLen_ = (int)in.length; asmError_.clear();
-                        std::snprintf(asmBuf_, sizeof(asmBuf_), "%s", in.text.c_str());
-                        openAsmText_ = true;
+                        if (in.hasBranchTarget && (in.isJump || in.isCall) && in.text.find('[') == std::string::npos) {
+                            int dstIdx = -1;
+                            for (int k = 0; k < (int)insns_.size(); ++k) if (insns_[k].address == in.branchTarget) { dstIdx = k; break; }
+                            if (dstIdx >= 0) { selectedInsn_ = dstIdx; selAnchor_ = dstIdx; pendingScroll_ = dstIdx; }
+                            else gotoAddress(in.branchTarget);
+                        } else {
+                            asmAddr_ = in.address; asmFillLen_ = (int)in.length; asmError_.clear();
+                            std::snprintf(asmBuf_, sizeof(asmBuf_), "%s", in.text.c_str());
+                            openAsmText_ = true;
+                        }
                     }
                 }
                 // Menu contextual (clic derecho sobre el renglon)
@@ -3022,7 +3033,7 @@ void App::drawCpuContent() {
                     }
                     ImGui::Separator();
                     // --- Edicion de bytes / parches (estilo x64dbg) ---
-                    if (ImGui::MenuItem("Ensamblar / editar instruccion...", "Doble clic", false, patchTargetActive())) {
+                    if (ImGui::MenuItem("Ensamblar / editar instruccion...", "Espacio", false, patchTargetActive())) {
                         asmAddr_ = in.address; asmFillLen_ = (int)in.length; asmError_.clear();
                         std::snprintf(asmBuf_, sizeof(asmBuf_), "%s", in.text.c_str()); openAsmText_ = true;
                     }
@@ -3050,7 +3061,7 @@ void App::drawCpuContent() {
                     ImGui::Separator();
                     if (ImGui::MenuItem("Copiar direccion"))
                         ImGui::SetClipboardText(("0x" + hex64(in.address)).c_str());
-                    if (in.isJump && in.hasBranchTarget && ImGui::MenuItem("Jump To"))
+                    if ((in.isJump || in.isCall) && in.hasBranchTarget && ImGui::MenuItem("Jump To (seguir destino)", "Enter / Doble clic"))
                         gotoAddress(in.branchTarget);
                     ImGui::Separator();
                     // Follow in dump: sigue en el volcado la direccion referida por la instruccion.
@@ -3143,13 +3154,28 @@ void App::drawCpuContent() {
         }
         // Scroll SOLO cuando el RIP sale del area visible (estilo OllyDbg): al trazar,
         // el RIP baja una fila y el codigo se queda quieto hasta tocar el borde.
+        bool scrolledNow = false;
         if (cpuEnsureRipVisible_ && selectedInsn_ >= 0 && clipper.ItemsHeight > 0.0f) {
             const float rowH = clipper.ItemsHeight;
             const float top = selectedInsn_ * rowH, bot = top + rowH;
             const float sy = ImGui::GetScrollY();
-            if (top < sy) ImGui::SetScrollY(top);
-            else if (bot > sy + cpuViewH) ImGui::SetScrollY(bot - cpuViewH);
+            if (top < sy) { ImGui::SetScrollY(top); scrolledNow = true; }
+            else if (bot > sy + cpuViewH) { ImGui::SetScrollY(bot - cpuViewH); scrolledNow = true; }
             cpuEnsureRipVisible_ = false;
+        }
+        // GARANTIA de visibilidad: pase lo que pase (trace, salto, Enter, goto, teclado),
+        // el renglon seleccionado tiene que quedar dentro de las filas visibles. Tras cada
+        // cambio de seleccion se verifica durante 3 cuadros (el scroll de ImGui se aplica
+        // al cuadro siguiente) y, si quedo fuera, se centra.
+        if (selectedInsn_ != cpuVisLastSel_) { cpuVisLastSel_ = selectedInsn_; cpuVisCheckFrames_ = 3; }
+        if (cpuVisCheckFrames_ > 0 && !scrolledNow && pendingScroll_ < 0 && selectedInsn_ >= 0 && clipper.ItemsHeight > 0.0f) {
+            const float rowH = clipper.ItemsHeight;
+            const float top = selectedInsn_ * rowH, bot = top + rowH;
+            const float sy = ImGui::GetScrollY();
+            if (top < sy || bot > sy + cpuViewH) ImGui::SetScrollY(std::max(0.0f, top - (cpuViewH - rowH) * 0.5f));
+            --cpuVisCheckFrames_;
+        } else if (cpuVisCheckFrames_ > 0 && (scrolledNow || pendingScroll_ >= 0)) {
+            // ya hubo un scroll dirigido este cuadro: se vuelve a verificar en el siguiente
         }
         ImGui::EndTable();
     }
@@ -3194,6 +3220,13 @@ void App::drawCpuContent() {
             }
             setBreakpointsOnAddresses(addrs, !allHave, "cpu");
         }
+        // Espacio = ensamblar/editar la instruccion seleccionada (x64dbg).
+        if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::IsKeyPressed(ImGuiKey_Space) && !ImGui::GetIO().WantTextInput && patchTargetActive()) {
+            const auto& s = insns_[selectedInsn_];
+            asmAddr_ = s.address; asmFillLen_ = (int)s.length; asmError_.clear();
+            std::snprintf(asmBuf_, sizeof(asmBuf_), "%s", s.text.c_str());
+            openAsmText_ = true;
+        }
         // ';' = comentario en la linea seleccionada, ':' (Shift+;) = etiqueta (como OllyDbg).
         if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::IsKeyPressed(ImGuiKey_Semicolon) && !ImGui::GetIO().WantTextInput) {
             annotAddr_ = canonVA(insns_[selectedInsn_].address);
@@ -3204,7 +3237,10 @@ void App::drawCpuContent() {
             openAnnot_ = true;
         }
     }
-    if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A))
+    // Ctrl+A = Analyze this SOLO con el foco en la CPU y sin campo de texto activo
+    // (antes se disparaba desde cualquier ventana y etiquetaba 'sub_' sin querer).
+    if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput)
         analyzeCodeAt(insns_[selectedInsn_].address);
 
     // Xrefs automaticos: al seleccionar un call/jmp, buscar quien salta/llama a su destino
