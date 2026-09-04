@@ -336,14 +336,31 @@ std::vector<Debugger::StackFrame> Debugger::walkStack(size_t maxFrames) {
 std::vector<std::pair<uint64_t, uint64_t>> Debugger::sehChain() {
     std::vector<std::pair<uint64_t, uint64_t>> out;
     if (is64_ || !pid_ || !curTid_) return out; // cadena FS:[0] solo en x86
-    HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, curTid_);
+    HANDLE h = OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT, FALSE, curTid_);
     if (!h) return out;
+    uint64_t teb = 0;
+#if defined(_WIN64)
+    // NtQueryInformationThread(ThreadBasicInformation) devuelve el TEB nativo
+    // de 64 bits cuando el debugger x64 inspecciona un proceso WOW64. FS:[0],
+    // sin embargo, pertenece al TEB32. Recuperamos su base desde el selector FS
+    // del contexto WOW64 para no interpretar campos del TEB64 como punteros SEH.
+    WOW64_CONTEXT context{};
+    context.ContextFlags = WOW64_CONTEXT_SEGMENTS;
+    LDT_ENTRY selector{};
+    if (Wow64GetThreadContext(h, &context) &&
+        GetThreadSelectorEntry(h, context.SegFs, &selector)) {
+        teb = static_cast<uint64_t>(selector.BaseLow) |
+              (static_cast<uint64_t>(selector.HighWord.Bytes.BaseMid) << 16) |
+              (static_cast<uint64_t>(selector.HighWord.Bytes.BaseHi) << 24);
+    }
+#else
+    // En un host x86, ThreadBasicInformation apunta directamente al TEB32.
     typedef LONG(NTAPI * Fn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     auto f = (Fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
     struct TBI { LONG ExitStatus; PVOID TebBaseAddress; struct { HANDLE p, t; } Cid;
                  ULONG_PTR Aff; LONG Prio, BasePrio; } tbi{};
-    uint64_t teb = 0;
     if (f && f(h, 0, &tbi, sizeof(tbi), nullptr) == 0) teb = (uint64_t)tbi.TebBaseAddress;
+#endif
     CloseHandle(h);
     if (!teb) return out;
     uint32_t node = 0; readMemory(teb, &node, 4); // TEB.NtTib.ExceptionList (offset 0)
@@ -1107,9 +1124,46 @@ void Debugger::debugLoop() {
                             }
                         }
                     } else {
-                        // breakpoint no nuestro (p.ej. __debugbreak del propio programa)
+                        // INT3 del SISTEMA (dentro de ntdll): DbgBreakPoint del hilo de
+                        // DbgUiRemoteBreakin (attach / Pause), o LdrpDoDebuggerBreak del
+                        // loader cuando nos adjuntamos a un proceso que aun se estaba
+                        // inicializando (Wait for respawn adjunta a los pocos ms de nacer,
+                        // asi que llegan AMBOS: el del breakin y el del loader). Estos se
+                        // consumen con DBG_CONTINUE como hace x64dbg; entregarlos al SEH
+                        // dejaba el proceso "pegado" en segunda oportunidad al dar Play.
+                        bool systemBp = false;
+                        {
+                            std::lock_guard<std::mutex> lk(modMutex_);
+                            const LoadedModule* best = nullptr;
+                            for (const auto& m : modules_) if (m.base <= addr && (!best || m.base > best->base)) best = &m;
+                            if (best && addr - best->base < 0x400000) {
+                                std::string n = best->name;
+                                for (auto& ch : n) ch = (char)tolower((unsigned char)ch);
+                                systemBp = (n == "ntdll.dll");
+                            }
+                        }
+                        if (systemBp) {
+                            pauseUI = true; breakVA = addr;
+                            history_.push_back(addr);
+                            continueStatus = DBG_CONTINUE;
+                            log(std::string("Breakpoint de sistema (ntdll) en 0x") +
+                                [&]{ char text[32]; sprintf_s(text, "%llX", (unsigned long long)addr); return std::string(text); }() +
+                                "; se consume al continuar.");
+                            break;
+                        }
+                        // Breakpoint no nuestro (p.ej. __debugbreak o una proteccion
+                        // basada en excepciones). Pausamos en primera oportunidad,
+                        // pero al reanudar debemos entregarlo al SEH/VEH del programa.
+                        // DBG_CONTINUE lo consumiría y alteraría el comportamiento del
+                        // debuggee, especialmente ante secuencias INT3 deliberadas.
                         pauseUI = true; breakVA = addr;
                         history_.push_back(addr);
+                        continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+                        log(std::string("INT3 ajeno al debugger en 0x") +
+                            [&]{ char text[32]; sprintf_s(text, "%llX", (unsigned long long)addr); return std::string(text); }() +
+                            (ev.u.Exception.dwFirstChance
+                                ? "; se entregara al SEH/VEH al continuar."
+                                : "; segunda oportunidad (no fue manejado por el proceso)."));
                     }
                 }
                 break;

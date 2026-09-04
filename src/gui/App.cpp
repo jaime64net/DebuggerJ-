@@ -1548,6 +1548,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Archivo -> Abrir: analiza el PE estatico, secciones, imports, exports, strings y packers. La cache evita repetir esos escaneos.");
             ImGui::BulletText("CPU: navega con doble clic en calls, jumps, referencias y modulos. Las guias Flow a la izquierda de las direcciones muestran cada jmp/jz/jnz/etc. que cae dentro de la vista; punto = origen, flecha = destino, naranja = hacia abajo y azul = hacia arriba. Clic derecho sobre el jump -> Jump To abre su destino. El mismo menu permite agregar bookmarks.");
             ImGui::BulletText("Analyze this: analiza linealmente hasta un ret, guarda una funcion candidata, xrefs call/jump y loops por saltos hacia atras. Consulta Window -> Analysis para navegar esos resultados; se guardan en cache. No sustituye un CFG/decompilador completo.");
+            ImGui::BulletText("Panel Breakpoints: 'Remove all' quita todos los software; 'Remove all (sw+hw+exc)' tambien hardware y de excepcion. La cache .bp.json del binario se actualiza sola.");
             ImGui::BulletText("Breakpoints: clic en la columna BP de CPU para software; usa el panel Breakpoints para hardware, excepciones y memoria. 'Parar en N' ignora los N-1 primeros hits.");
             ImGui::BulletText("Memory breakpoints: con el proceso pausado, elige acceso, escritura o ejecucion y un rango. Usan PAGE_GUARD como OllyDbg: Windows protege paginas completas (normalmente 4 KiB), asi que puede haber accesos vecinos. No se permiten sobre la pagina de pila actual ni sobre una pagina que ya use PAGE_GUARD.");
             ImGui::BulletText("Condiciones y acciones: un BP software acepta registros, hit/hits, &, | y comparadores; por ejemplo rax == 0, ecx & 1 != 0 o hit >= 5. Con 'solo log' registra la coincidencia y continua. Numeros en decimal o con prefijo 0x.");
@@ -3278,6 +3279,16 @@ void App::drawBreakpointsPanel() {
     static std::map<uint64_t, std::array<char, 160>> conditionEdits;
     auto bps = debugger_.breakpoints();
     ImGui::Text("%zu breakpoints", bps.size());
+    ImGui::SameLine();
+    ImGui::BeginDisabled(bps.empty());
+    if (ImGui::SmallButton("Remove all")) {
+        std::vector<uint64_t> all; for (const auto& b : bps) all.push_back(b.address);
+        setBreakpointsOnAddresses(all, false, "bp-panel");
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Quita TODOS los breakpoints software (la cache del binario se actualiza sola)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Remove all (sw+hw+exc)")) { clearAllBreakpoints(); pushLog("Todos los breakpoints (software, hardware y de excepcion) eliminados."); }
     ImGui::Separator();
     if (ImGui::BeginTable("bps", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
         ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, 30);
