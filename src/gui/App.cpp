@@ -1569,6 +1569,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Cache de breakpoints por binario (estilo .udd): los breakpoints software (con condicion, hits, solo-log y accion M3), hardware, de excepcion y la mascara de eventos se guardan solos en cache/<hash>.bp.json al cambiar, y se RESTAURAN Y ACTIVAN al abrir el .exe o al adjuntarse a un proceso (relocalizados a la base runtime). Guardar/Cargar sesion sigue existiendo para instantaneas manuales.");
             ImGui::BulletText("Stop (toolbar o Depurar -> Detener) termina el proceso y RECARGA el archivo abierto en vista estatica: CPU, strings, packers, memoria y registros vuelven a los valores del archivo (como recien abierto). Los comentarios/etiquetas persisten en disco.");
             ImGui::BulletText("Archivo -> Cerrar actual (Ctrl+W) cierra el archivo y la sesion activa dejando la app vacia, sin salir. Archivo -> Salir cierra DebuggerJ++.");
+            ImGui::BulletText("Enter sobre un salto/call en la CPU mueve la seleccion (renglon resaltado en azul) al destino y hace scroll: previsualiza donde caeria el salto sin ejecutar. Si el destino esta fuera de la vista, navega a el.");
             ImGui::BulletText("Comentarios automaticos: las call/jmp a APIs importadas se anotan solas en la CPU con 'dll.API' (color azul, via IAT y thunks), sin necesidad de Analyze. Un comentario propio (';') tiene prioridad. En la instruccion actual, un salto condicional muestra '(saltara)'/'(no salta)' segun EFLAGS.");
             ImGui::BulletText("Registros: ademas de generales y flags, el panel muestra segmentos (CS/DS/ES/FS/GS/SS), LastErr (con el texto del error de Windows) y la FPU x87 (ST0-ST7, con su valor). CPU -> clic derecho -> 'Follow in dump' sigue en el volcado esta instruccion, su operando de memoria o el destino del salto; la casilla 'Follow RIP' del volcado lo hace seguir automaticamente lo que trazas (como OllyDbg).");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
@@ -2368,6 +2369,12 @@ void App::drawCpuContent() {
                 ImGui::TableNextRow();
                 bool isCur = (dbgState_ == DbgState::Paused && in.address == currentIp_);
                 if (isCur) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.35f,0.28f,0.05f,1)));
+                else {
+                    int sLo = selAnchor_ >= 0 ? std::min(selAnchor_, selectedInsn_) : selectedInsn_;
+                    int sHi = selAnchor_ >= 0 ? std::max(selAnchor_, selectedInsn_) : selectedInsn_;
+                    if (selectedInsn_ >= 0 && i >= sLo && i <= sHi)
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.15f,0.28f,0.42f,1)));
+                }
 
                 // Col BP: muestra el breakpoint. El click en la FILA solo selecciona;
                 // el doble-click sigue el salto/call (como OllyDbg). El BP se pone/quita
@@ -2623,10 +2630,18 @@ void App::drawCpuContent() {
             pendingScroll_ = selectedInsn_;              // mantener la seleccion visible
         }
         // Enter: seguir el salto/call de la instruccion seleccionada (como OllyDbg).
+        // Si el destino ya esta en la vista, SOLO mueve la seleccion (renglon resaltado)
+        // y hace scroll hasta el, para previsualizar donde caeria el salto sin recargar.
+        // Si no esta, navega con gotoAddress.
         if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() &&
             (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
             const auto& s = insns_[selectedInsn_];
-            if (s.hasBranchTarget) gotoAddress(s.branchTarget);
+            if (s.hasBranchTarget) {
+                int dstIdx = -1;
+                for (int k = 0; k < (int)insns_.size(); ++k) if (insns_[k].address == s.branchTarget) { dstIdx = k; break; }
+                if (dstIdx >= 0) { selectedInsn_ = dstIdx; selAnchor_ = dstIdx; pendingScroll_ = dstIdx; }
+                else gotoAddress(s.branchTarget);
+            }
         }
         // F2: poner/quitar breakpoint en la linea seleccionada (el click NO lo hace).
         // Con un rango seleccionado, F2 lo aplica a todas: si alguna no tiene BP, agrega en todas; si todas tienen, quita todas.
