@@ -144,6 +144,7 @@ private:
     void drawSearchResultsPanel();          // resultados de "Search for" (estilo Olly)
     void searchAllCommands(const std::string& needle);
     void searchIntermodularCalls();
+    void searchReferencedStrings();   // Search for -> All referenced text strings (estilo OllyDbg)
     void searchBinaryString(const std::string& pattern, bool isHex, bool utf16);
 
     // --- Motor de expresiones (Fase 2) ---

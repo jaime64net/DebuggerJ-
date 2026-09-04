@@ -1584,7 +1584,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Variables globales (paridad x64dbg $vars): por MCP var_set/var_get/var_list. Usables en cualquier expresion (Watch, condiciones, eval).");
             ImGui::BulletText("Favourites (menu Favourites): herramientas externas configurables en favourites.txt (nombre|comando, con %%DEBUGGEE%% y %%PID%%). Tools -> Reiniciar como administrador relanza elevado.");
             ImGui::BulletText("Struct (Window -> Struct): aplica una definicion de campos (byte/word/dword/qword/ptr/string) a una direccion base (que admite expresiones) y muestra los valores leidos de memoria, con offsets automaticos.");
-            ImGui::BulletText("CPU -> clic derecho -> Search for: 'All commands' busca una subcadena en todas las instrucciones; 'All intermodular calls' lista las llamadas a APIs de otros modulos (via IAT y thunks); 'Binary string' busca hex o texto. Resultados en la ventana Search results (doble clic para navegar, 'Copiar todo').");
+            ImGui::BulletText("CPU -> clic derecho -> Search for: 'All commands' busca una subcadena en todas las instrucciones; 'All intermodular calls' lista las llamadas a APIs de otros modulos (via IAT y thunks); 'All referenced text strings' lista las instrucciones cuyo operando (inmediato, [VA] o lea rip-relative) apunta a un texto ASCII/UTF-16 de la imagen (del archivo, o de la memoria viva si el proceso esta pausado); 'Binary string' busca hex o texto. Resultados en la ventana Search results (doble clic para navegar, 'Copiar todo').");
             ImGui::BulletText("Archivo -> Attach a proceso / Detach: elegir un proceso de la lista (o PID manual) o desadjuntar dejando el proceso vivo (tambien en el menu Depurar y por MCP attach/detach). Archivo -> Cerrar actual cierra archivo y sesion.");
             ImGui::BulletText("Tools -> Options -> Simbolos: configura un symbol server (symsrv), ej 'srv*C:\\symbols*https://msdl.microsoft.com/download/symbols', para resolver nombres y mejorar el call stack. Se persiste y aplica en la proxima sesion.");
             ImGui::BulletText("MCP Log: cachea todo a mcp_log_cache.txt; botones Load cache, Copy to clipboard, y el texto es seleccionable (Ctrl+C).");
@@ -2140,6 +2140,7 @@ void App::drawCpuContent() {
                     if (ImGui::BeginMenu("Search for")) {
                         if (ImGui::MenuItem("All commands...")) { searchCmdBuf_[0] = '\0'; openSearchCmd_ = true; }
                         if (ImGui::MenuItem("All intermodular calls")) searchIntermodularCalls();
+                        if (ImGui::MenuItem("All referenced text strings")) searchReferencedStrings();
                         if (ImGui::MenuItem("Binary string...")) { searchBinBuf_[0] = '\0'; openSearchBin_ = true; }
                         ImGui::EndMenu();
                     }
@@ -4167,6 +4168,74 @@ void App::searchIntermodularCalls() {
         }
     }
     searchResultsTitle_ = "Intermodular calls  (" + std::to_string(searchResults_.size()) + ")";
+    showSearchResults_ = true;
+    pushLog(searchResultsTitle_);
+}
+
+// "All referenced text strings" (OllyDbg): recorre el listado buscando operandos
+// (inmediatos o [VA] absolutas, incl. lea rip-relative) que apunten dentro de la
+// imagen a un texto ASCII o UTF-16 legible. Lee del archivo estatico, o de la
+// memoria viva si el proceso esta pausado (asi ve strings descifradas en runtime).
+void App::searchReferencedStrings() {
+    searchResults_.clear();
+    if (!fileLoaded_) { pushLog("Abre un ejecutable primero."); return; }
+    const bool live = (dbgState_ == DbgState::Paused);
+    const uint64_t base = live && debugger_.imageBase() ? debugger_.imageBase() : pe_.imageBase();
+    const uint64_t end  = base + pe_.sizeOfImage();
+
+    auto readAt = [&](uint64_t va, uint8_t* out, size_t n) -> size_t {
+        if (live) return debugger_.readMemory(va, out, n);
+        if (va < pe_.imageBase()) return 0;
+        return pe_.readAtRva((uint32_t)(va - pe_.imageBase()), out, n);
+    };
+    auto printable = [](uint32_t c) { return (c >= 0x20 && c < 0x7F) || c == '\t'; };
+    // Devuelve el texto si en 'va' hay una cadena ASCII (>= 4) o UTF-16 (>= 4); vacio si no.
+    auto stringAt = [&](uint64_t va, std::string& out) -> bool {
+        uint8_t buf[256] = {0};
+        size_t got = readAt(va, buf, sizeof(buf));
+        if (got < 4) return false;
+        // ASCII
+        size_t n = 0; while (n < got && printable(buf[n])) ++n;
+        if (n >= 4 && (n == got || buf[n] == 0 || buf[n] == '\r' || buf[n] == '\n')) {
+            size_t m = n; while (m < got && (printable(buf[m]) || buf[m]=='\r' || buf[m]=='\n')) ++m;
+            out = std::string((const char*)buf, std::min<size_t>(m, 120));
+            for (auto& ch : out) if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+            if (m > 120) out += "...";
+            return true;
+        }
+        // UTF-16LE
+        size_t w = 0; while (w + 1 < got && printable(buf[w]) && buf[w+1] == 0) w += 2;
+        if (w >= 8 && (w + 1 >= got || (buf[w] == 0 && buf[w+1] == 0))) {
+            out.clear(); for (size_t i = 0; i < w && i < 240; i += 2) out += (char)buf[i];
+            if (w > 240) out += "...";
+            out = "L\"" + out; return true;   // marca UTF-16 (se cierra abajo)
+        }
+        return false;
+    };
+
+    std::set<std::pair<uint64_t,uint64_t>> seen;   // (insn, target) para no duplicar
+    for (const auto& in : insns_) {
+        if (in.isCall || in.isJump) continue;
+        // Candidatos: todos los "0x..." del texto (inmediatos y [VA]).
+        size_t pos = in.text.find(' ');
+        if (pos == std::string::npos) continue;
+        const std::string ops = in.text.substr(pos + 1);
+        size_t hx = 0;
+        while ((hx = ops.find("0x", hx)) != std::string::npos) {
+            uint64_t va = strtoull(ops.c_str() + hx + 2, nullptr, 16);
+            hx += 2;
+            if (va < base || va >= end) continue;
+            if (seen.count({in.address, va})) continue;
+            std::string txt;
+            if (!stringAt(va, txt)) continue;
+            seen.insert({in.address, va});
+            bool wide = txt.rfind("L\"", 0) == 0;
+            std::string shown = wide ? txt + "\"" : "\"" + txt + "\"";
+            searchResults_.push_back({ in.address, in.text + "  ; 0x" + hex64(va) + " " + shown });
+        }
+    }
+    searchResultsTitle_ = std::string("Referenced text strings") + (live ? " [memoria viva]" : " [archivo]") +
+                          "  (" + std::to_string(searchResults_.size()) + ")";
     showSearchResults_ = true;
     pushLog(searchResultsTitle_);
 }
