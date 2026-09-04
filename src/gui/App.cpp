@@ -284,10 +284,12 @@ void App::refreshDisassembly() {
         insns_ = dis_.disassemble(pe_.raw().data() + off, len, disBase_, 20000);
         break;
     }
-    // Seleccionar el entrypoint
+    // Seleccionar y POSICIONAR en el entrypoint (la proxima instruccion a ejecutar al lanzar).
     uint64_t epVA = pe_.entryPointVA();
+    selectedInsn_ = -1;
     for (size_t i = 0; i < insns_.size(); ++i)
-        if (insns_[i].address == epVA) { selectedInsn_ = (int)i; break; }
+        if (insns_[i].address == epVA) { selectedInsn_ = (int)i; selAnchor_ = (int)i; pendingScroll_ = (int)i; break; }
+    if (selectedInsn_ < 0 && !insns_.empty()) { selectedInsn_ = 0; selAnchor_ = 0; pendingScroll_ = 0; }
     rebuildAutoComments();
 }
 
