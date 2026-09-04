@@ -256,18 +256,26 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         }
     }
 
+    // Orden de cierre: los backends se apagan con sus contextos activos y, ANTES de destruir
+    // las ventanas, se anulan g_contCtx/g_mainCtx. DestroyWindow entrega WM_DESTROY/WM_NCDESTROY
+    // al WndProc compartido y este usaria un ImGuiContext ya liberado (crash 0xC0000005 /
+    // 0xC000041D al salir, visto en el Event Log el 2026-09-04).
     if (g_contCtx) {
         ImGui::SetCurrentContext(g_contCtx);
         ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext(g_contCtx);
+        g_contCtx = nullptr;
     }
     ImGui::SetCurrentContext(g_mainCtx);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext(g_mainCtx);
+    g_mainCtx = nullptr;
+    ImGui::SetCurrentContext(nullptr);
     CleanupDeviceD3D();
     if (g_contHwnd) DestroyWindow(g_contHwnd);
+    g_contHwnd = nullptr;
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;
