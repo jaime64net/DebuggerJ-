@@ -21,6 +21,9 @@ struct AntiDbgOptions {
 // Parchea el PEB del proceso depurado para esconder el debugger. Requiere sesion
 // activa (Paused/Running). Devuelve false si no hay proceso.
 bool applyAntiAntiDebug(Debugger& d, bool is64, const AntiDbgOptions& opt, std::string& logout);
+// Revierte el anti-anti-debug: restaura valores "con debugger presente" (BeingDebugged=1,
+// bits FLG_HEAP_* en NtGlobalFlag, flags de heap de depuracion) para que el toggle funcione.
+bool revertAntiAntiDebug(Debugger& d, bool is64, const AntiDbgOptions& opt, std::string& logout);
 
 // Vuelca la imagen del proceso a disco (memory-aligned). Si oepVA != 0 lo fija como
 // AddressOfEntryPoint. Devuelve false en error.

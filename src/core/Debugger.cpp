@@ -464,6 +464,7 @@ std::vector<Breakpoint> Debugger::breakpoints() {
 }
 uint32_t Debugger::addExceptionBreak(uint32_t code, uint64_t address, const std::string& label) {
     std::lock_guard<std::mutex> lk(excMutex_);
+    for (auto& x : excBreaks_) if (x.code == code && x.address == address) { x.enabled = true; return x.id; }   // sin duplicados
     ExceptionBreak e; e.id = nextExcId_++; e.code = code; e.address = address; e.label = label;
     excBreaks_.push_back(e);
     char b[96]; sprintf_s(b, "Exception BP #%u (code 0x%08X) agregado", e.id, code);
@@ -482,6 +483,24 @@ void Debugger::toggleExceptionBreak(uint32_t id, bool enabled) {
 std::vector<ExceptionBreak> Debugger::exceptionBreaks() {
     std::lock_guard<std::mutex> lk(excMutex_);
     return excBreaks_;
+}
+uint32_t Debugger::addExceptionIgnore(uint32_t code, uint64_t address, const std::string& label) {
+    std::lock_guard<std::mutex> lk(excMutex_);
+    for (auto& g : excIgnores_) if (g.code == code && g.address == address) return g.id;
+    ExceptionIgnore g; g.id = nextIgnId_++; g.code = code; g.address = address; g.label = label;
+    excIgnores_.push_back(g);
+    char b[128]; sprintf_s(b, "Ignorar excepcion #%u: code 0x%08X en %s (se pasa al programa sin pausar)", g.id, code,
+                          address ? [&]{ char t[32]; sprintf_s(t, "0x%llX", (unsigned long long)address); return std::string(t); }().c_str() : "cualquier direccion");
+    log(b);
+    return g.id;
+}
+void Debugger::removeExceptionIgnore(uint32_t id) {
+    std::lock_guard<std::mutex> lk(excMutex_);
+    for (auto it = excIgnores_.begin(); it != excIgnores_.end(); ++it) if (it->id == id) { excIgnores_.erase(it); return; }
+}
+std::vector<ExceptionIgnore> Debugger::exceptionIgnores() {
+    std::lock_guard<std::mutex> lk(excMutex_);
+    return excIgnores_;
 }
 
 // --------- Hardware breakpoints (DR0-DR3) ---------
@@ -1292,16 +1311,29 @@ void Debugger::debugLoop() {
                 // Revisar breakpoints de excepcion: si hay reglas, solo pausamos en las
                 // que coincidan; si no hay ninguna, comportamiento por defecto (pausar en
                 // primera oportunidad para que el analista decida).
-                bool anyRules = false, matched = false;
+                bool anyRules = false, matched = false, ignored = false;
                 {
                     std::lock_guard<std::mutex> lk(excMutex_);
+                    // (a) Reglas de IGNORAR: en primera oportunidad se pasan al programa sin pausar.
+                    if (ev.u.Exception.dwFirstChance)
+                        for (auto& g : excIgnores_)
+                            if ((g.code == 0 || g.code == er.ExceptionCode) && (g.address == 0 || g.address == addr)) { ignored = true; g.hits++; }
+                    // (b) Breakpoints de excepcion: codigo (0 = cualquiera) y direccion opcional como FILTRO.
                     anyRules = !excBreaks_.empty();
-                    for (auto& e : excBreaks_) {
-                        if (!e.enabled) continue;
-                        if (e.code == 0 || e.code == er.ExceptionCode) {
-                            matched = true; e.address = addr; e.hits++;
+                    if (!ignored)
+                        for (auto& e : excBreaks_) {
+                            if (!e.enabled) continue;
+                            if ((e.code == 0 || e.code == er.ExceptionCode) && (e.address == 0 || e.address == addr)) {
+                                matched = true; e.lastAddress = addr; e.hits++;
+                            }
                         }
-                    }
+                }
+                if (ignored) {
+                    char b[96]; sprintf_s(b, "Excepcion 0x%08X en 0x%llX ignorada (pasada al programa)",
+                                          (unsigned)er.ExceptionCode, (unsigned long long)addr);
+                    log(b);
+                    continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+                    break;
                 }
                 if (matched || (!anyRules && ev.u.Exception.dwFirstChance)) {
                     char b[80]; sprintf_s(b, "Excepcion 0x%08X en 0x%llX",

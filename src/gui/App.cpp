@@ -40,6 +40,7 @@ static std::string exeSiblingDir() {
     std::wstring dir = pos == std::wstring::npos ? L"." : p.substr(0, pos);
     return std::string(dir.begin(), dir.end());
 }
+static std::wstring exeSiblingDirW() { const std::string d = exeSiblingDir(); return std::wstring(d.begin(), d.end()); }
 
 // La caché pertenece a la instalación del debugger, no al directorio de la
 // muestra. Así no se escribe junto a un ejecutable potencialmente sospechoso.
@@ -1552,6 +1553,7 @@ void App::drawHelpWindow() {
             ImGui::BulletText("Breakpoints: clic en la columna BP de CPU para software; usa el panel Breakpoints para hardware, excepciones y memoria. 'Parar en N' ignora los N-1 primeros hits.");
             ImGui::BulletText("Memory breakpoints: con el proceso pausado, elige acceso, escritura o ejecucion y un rango. Usan PAGE_GUARD como OllyDbg: Windows protege paginas completas (normalmente 4 KiB), asi que puede haber accesos vecinos. No se permiten sobre la pagina de pila actual ni sobre una pagina que ya use PAGE_GUARD.");
             ImGui::BulletText("Condiciones y acciones: un BP software acepta registros, hit/hits, &, | y comparadores; por ejemplo rax == 0, ecx & 1 != 0 o hit >= 5. Con 'solo log' registra la coincidencia y continua. Numeros en decimal o con prefijo 0x.");
+            ImGui::BulletText("Excepciones: un 'breakpoint de excepcion' hace que el debugger PAUSE cuando ocurre esa excepcion (codigo; y si tiene direccion, solo ahi). Sin reglas, el debugger pausa en toda excepcion de primera oportunidad. Para que una excepcion NO pause y se entregue al SEH/VEH del programa (malware que usa access violation como flujo normal) usa 'Ignorar': CPU -> clic derecho -> Breakpoints -> Ignorar excepcion, o la seccion Ignorar del panel Excepciones (por codigo, por direccion o ambas). Las reglas persisten en la cache .bp.json del binario. MCP: add_exc_ignore / rm_exc_ignore / list_exc.");
             ImGui::BulletText("Excepciones incluye breakpoints de eventos: crear/terminar hilo y cargar/descargar DLL. Son utiles para observar carga dinamica e inyeccion.");
             ImGui::BulletText("Un INT3 ajeno a DebuggerJ++ se pausa en primera oportunidad y, al pulsar Play, se entrega al SEH/VEH del programa con DBG_EXCEPTION_NOT_HANDLED. Esto conserva aplicaciones y protecciones que usan excepciones deliberadas. Si vuelve en segunda oportunidad, el proceso no lo manejo.");
             ImGui::BulletText("La cadena SEH x86 de procesos WOW64 se obtiene desde el TEB32 indicado por FS, no desde el TEB64 del host; Window -> Excepciones y MCP seh muestran pares record/handler.");
@@ -2065,6 +2067,7 @@ void App::clearAllBreakpoints() {
     for (const auto& bp : debugger_.breakpoints()) if (!bp.oneShot) debugger_.removeBreakpoint(bp.address);
     for (const auto& bp : debugger_.hwBreakpoints()) debugger_.removeHwBreakpoint(bp.address);
     for (const auto& bp : debugger_.exceptionBreaks()) debugger_.removeExceptionBreak(bp.id);
+    for (const auto& g : debugger_.exceptionIgnores()) debugger_.removeExceptionIgnore(g.id);
     bpActions_.clear();
     runToTemp_.clear();
 }
@@ -2080,6 +2083,8 @@ std::string App::breakpointCacheSignature() {
         sig += "H" + hex64(canonVA(bp.address)) + std::to_string(bp.type) + std::to_string(bp.len) + bp.label + ";";
     for (const auto& bp : debugger_.exceptionBreaks())
         sig += "E" + std::to_string(bp.code) + hex64(canonVA(bp.address)) + (bp.enabled ? "1" : "0") + bp.label + ";";
+    for (const auto& g : debugger_.exceptionIgnores())
+        sig += "I" + std::to_string(g.code) + hex64(canonVA(g.address)) + ";";
     for (const auto& [a, act] : bpActions_) sig += "A" + hex64(canonVA(a)) + act + ";";
     return sig;
 }
@@ -2124,11 +2129,18 @@ void App::saveBreakpointCache() {
             item["code"] = bp.code; item["label"] = bp.label; item["enabled"] = bp.enabled;
             j["exceptionBreakpoints"].push_back(std::move(item));
         }
+        j["exceptionIgnores"] = njson::array();
+        for (const auto& g : debugger_.exceptionIgnores()) {
+            njson item = addressRef(g.address);
+            if (!g.address) item = njson::object();
+            item["code"] = g.code; item["label"] = g.label;
+            j["exceptionIgnores"].push_back(std::move(item));
+        }
         const std::string dump = j.dump(1);
         { std::ofstream f(path, std::ios::binary | std::ios::trunc); if (f) f << dump; }
         std::string h = peContentHash();
         if (!h.empty()) {
-            std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+            std::wstring dbPath = exeSiblingDirW() + L"\\cache\\" +
                                   std::wstring(h.begin(), h.end()) + L".bp.json";
             std::ofstream db(dbPath, std::ios::binary | std::ios::trunc); if (db) db << dump;
         }
@@ -2150,7 +2162,7 @@ void App::loadBreakpointCache() {
         if (!found) {   // binario movido/renombrado: copia por hash de contenido
             std::string h = peContentHash();
             if (!h.empty()) {
-                std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+                std::wstring dbPath = exeSiblingDirW() + L"\\cache\\" +
                                       std::wstring(h.begin(), h.end()) + L".bp.json";
                 std::ifstream db(dbPath, std::ios::binary);
                 if (db) { j = njson::parse(db); found = j.value("peHash", std::string{}) == h; }
@@ -2188,9 +2200,15 @@ void App::loadBreakpointCache() {
             debugger_.toggleExceptionBreak(id, item.value("enabled", true));
             ++nexc;
         }
-        if (nsw || nhw || nexc)
+        int nign = 0;
+        for (const auto& item : j.value("exceptionIgnores", njson::array())) {
+            uint64_t address = (item.contains("rva") || item.contains("address")) ? restoreAddress(item) : 0;
+            debugger_.addExceptionIgnore(item.value("code", uint32_t{0}), address, item.value("label", "cache"));
+            ++nign;
+        }
+        if (nsw || nhw || nexc || nign)
             pushLog("Breakpoints del binario restaurados y activos: " + std::to_string(nsw) + " software, " +
-                    std::to_string(nhw) + " hardware, " + std::to_string(nexc) + " de excepcion.");
+                    std::to_string(nhw) + " hardware, " + std::to_string(nexc) + " de excepcion, " + std::to_string(nign) + " excepciones ignoradas.");
     }
     bpCacheLoaded_ = true;
     bpCacheSig_ = breakpointCacheSignature();
@@ -2411,6 +2429,14 @@ void App::drawCpuContent() {
                                 char lbl[64]; std::snprintf(lbl, sizeof(lbl), "%08X  %s", c, exceptionName(c));
                                 if (ImGui::MenuItem(lbl)) debugger_.addExceptionBreak(c, in.address, "desde CPU");
                             }
+                            ImGui::EndMenu();
+                        }
+                        if (ImGui::BeginMenu("Ignorar excepcion (pasar al programa)")) {
+                            ImGui::TextDisabled("No pausar: la excepcion se entrega al SEH/VEH del programa");
+                            if (ImGui::MenuItem("ACCESS_VIOLATION en esta direccion")) debugger_.addExceptionIgnore(0xC0000005, in.address, "cpu");
+                            if (ImGui::MenuItem("Cualquier excepcion en esta direccion")) debugger_.addExceptionIgnore(0, in.address, "cpu");
+                            if (ImGui::MenuItem("TODAS las ACCESS_VIOLATION (C0000005)")) debugger_.addExceptionIgnore(0xC0000005, 0, "cpu");
+                            if (ImGui::MenuItem("TODAS las excepciones (cualquier codigo)")) debugger_.addExceptionIgnore(0, 0, "cpu");
                             ImGui::EndMenu();
                         }
                         if (ImGui::MenuItem("Hardware BP (ejecucion)"))
@@ -3926,14 +3952,54 @@ void App::drawExceptionsPanel() {
             }
             ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(exceptionName(e.code));
             ImGui::TableSetColumnIndex(3);
-            if (e.address) ImGui::TextColored(ImVec4(0.6f,0.8f,1,1), "0x%s", hex64(e.address).c_str());
-            else ImGui::TextDisabled("-");
+            if (e.address) { ImGui::TextColored(ImVec4(0.6f,0.8f,1,1), "0x%s", hex64(e.address).c_str()); if (ImGui::IsItemHovered()) ImGui::SetTooltip("Filtro: solo pausa cuando la excepcion ocurre en esta direccion"); }
+            else if (e.lastAddress) { ImGui::TextDisabled("* 0x%s", hex64(e.lastAddress).c_str()); if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cualquier direccion (ultimo disparo aqui)"); }
+            else ImGui::TextDisabled("cualquiera");
             ImGui::TableSetColumnIndex(4); ImGui::Text("%u", e.hits);
             ImGui::TableSetColumnIndex(5);
             if (ImGui::SmallButton("quitar")) debugger_.removeExceptionBreak(e.id);
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    ImGui::TextDisabled("Un breakpoint de excepcion PAUSA cuando ocurre la excepcion (con direccion = solo ahi). Para NO pausar usa 'Ignorar' abajo.");
+    ImGui::Separator();
+    {
+        auto igns = debugger_.exceptionIgnores();
+        ImGui::TextColored(ImVec4(1,0.85f,0.4f,1), "Ignorar (pasar al programa sin pausar): %zu reglas", igns.size());
+        if (ImGui::BeginTable("excign", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, 120))) {
+            ImGui::TableSetupColumn("Codigo", ImGuiTableColumnFlags_WidthFixed, 80);
+            ImGui::TableSetupColumn("Excepcion", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Direccion", ImGuiTableColumnFlags_WidthFixed, 150);
+            ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 45);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 60);
+            ImGui::TableHeadersRow();
+            for (auto& g : igns) {
+                ImGui::TableNextRow(); ImGui::PushID((int)(1000 + g.id));
+                ImGui::TableSetColumnIndex(0);
+                char code[16]; std::snprintf(code, sizeof(code), "%08X", g.code);
+                if (ImGui::Selectable(code, false, ImGuiSelectableFlags_AllowDoubleClick) && ImGui::IsMouseDoubleClicked(0) && g.address) gotoAddress(g.address);
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(g.code ? exceptionName(g.code) : "cualquier excepcion");
+                ImGui::TableSetColumnIndex(2);
+                if (g.address) ImGui::TextColored(ImVec4(0.6f,0.8f,1,1), "0x%s", hex64(g.address).c_str()); else ImGui::TextDisabled("cualquiera");
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%u", g.hits);
+                ImGui::TableSetColumnIndex(4);
+                if (ImGui::SmallButton("quitar")) debugger_.removeExceptionIgnore(g.id);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::SetNextItemWidth(90);
+        ImGui::InputTextWithHint("##igcode", "codigo hex", excIgnCodeBuf_, sizeof(excIgnCodeBuf_));
+        ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+        ImGui::InputTextWithHint("##igaddr", "VA (opcional)", excIgnAddrBuf_, sizeof(excIgnAddrBuf_));
+        ImGui::SameLine();
+        if (ImGui::Button("Ignorar")) {
+            debugger_.addExceptionIgnore((uint32_t)strtoul(excIgnCodeBuf_, nullptr, 16), strtoull(excIgnAddrBuf_, nullptr, 16), "manual");
+            excIgnAddrBuf_[0] = '\0';
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Ignorar todas las ACCESS_VIOLATION")) debugger_.addExceptionIgnore(0xC0000005, 0, "manual");
     }
 
     ImGui::Separator();
@@ -4017,10 +4083,14 @@ void App::drawPluginsPanel() {
         ImGui::Checkbox("Heap Flags / ForceFlags", &antiOpt_.heapFlags);
         ImGui::Checkbox("Re-aplicar en cada pausa", &antiReapply_);
         ImGui::BeginDisabled(!active);
-        if (ImGui::Button("Activar anti-debug")) {
+        if (ImGui::Button(antiActive_ ? "Desactivar anti-debug" : "Activar anti-debug")) {
             std::string lg;
-            bool ok = applyAntiAntiDebug(debugger_, debugger_.is64(), antiOpt_, lg);
-            antiActive_ = ok;
+            if (antiActive_) {   // toggle OFF: restaura valores "con debugger presente"
+                revertAntiAntiDebug(debugger_, debugger_.is64(), antiOpt_, lg);
+                antiActive_ = false;
+            } else {
+                antiActive_ = applyAntiAntiDebug(debugger_, debugger_.is64(), antiOpt_, lg);
+            }
             pluginStatus_ = lg; pushLog(lg);
         }
         ImGui::EndDisabled();
@@ -4216,7 +4286,7 @@ void App::saveAnalysisCache() {
         // M6: copia portable indexada por hash del contenido (sigue al binario si se mueve).
         std::string h = peContentHash();
         if (!h.empty()) {
-            std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+            std::wstring dbPath = exeSiblingDirW() + L"\\cache\\" +
                                   std::wstring(h.begin(), h.end()) + L".dbj";
             std::ofstream db(dbPath, std::ios::binary | std::ios::trunc);
             if (db) db << dump;
@@ -4282,7 +4352,7 @@ bool App::loadAnalysisCache() {
         if (!matched) {
             std::string h = peContentHash();
             if (!h.empty()) {
-                std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+                std::wstring dbPath = exeSiblingDirW() + L"\\cache\\" +
                                       std::wstring(h.begin(), h.end()) + L".dbj";
                 std::ifstream db(dbPath, std::ios::binary);
                 if (db) {
@@ -6040,7 +6110,7 @@ static int mcpRequiredAccess(const std::string& cmd) {
         cmd == "step_into" || cmd == "step_over" || cmd == "step_to_ret" || cmd == "stop" ||
         cmd == "set_bp" || cmd == "del_bp" || cmd == "set_hwbp" || cmd == "del_hwbp" ||
         cmd == "set_membp" || cmd == "del_membp" ||
-        cmd == "add_exc_bp" || cmd == "rm_exc_bp" || cmd == "set_event_breaks" ||
+        cmd == "add_exc_bp" || cmd == "rm_exc_bp" || cmd == "set_event_breaks" || cmd == "add_exc_ignore" || cmd == "rm_exc_ignore" ||
         cmd == "set_bookmark" || cmd == "del_bookmark" || cmd == "clear_analysis" ||
         cmd == "set_follow_children" || cmd == "switch_to_child" || cmd == "run_to" || cmd == "run_until" ||
         cmd == "wait_respawn" || cmd == "cancel_wait_respawn" ||
@@ -6099,7 +6169,7 @@ void App::loadExternalPlugins() {
 
 // M11: mtime combinado de los archivos de plugins/ (para el hot-reload).
 uint64_t App::pluginsDirStamp() {
-    std::wstring dirw = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\plugins\\*";
+    std::wstring dirw = exeSiblingDirW() + L"\\plugins\\*";
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW(dirw.c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
@@ -6442,7 +6512,13 @@ std::string App::handleMcpCommand(const std::string& line) {
     else if (cmd == "del_membp") { res["ok"] = debugger_.removeMemoryBreakpoint(static_cast<uint32_t>(a.value("id", 0))); }
     else if (cmd == "list_membp") { for (const auto& b : debugger_.memoryBreakpoints()) res["membps"].push_back({{"id",b.id},{"addr",b.address},{"size",b.size},{"type",b.type},{"hits",b.hits},{"label",b.label}}); }
     else if (cmd == "add_exc_bp") { res["id"] = debugger_.addExceptionBreak((uint32_t)jU64(a.value("code", njson(0))), jU64(a.value("addr", njson(0))), a.value("label","mcp")); }
-    else if (cmd == "list_exc") { for (auto& e : debugger_.exceptionBreaks()) res["exc"].push_back({{"id",e.id},{"code",e.code},{"addr",e.address},{"hits",e.hits}}); }
+    else if (cmd == "list_exc") {
+        res["exc"] = njson::array(); res["ignores"] = njson::array();
+        for (auto& e : debugger_.exceptionBreaks()) res["exc"].push_back({{"id",e.id},{"code",e.code},{"addr",e.address},{"last_addr",e.lastAddress},{"enabled",e.enabled},{"hits",e.hits}});
+        for (auto& g : debugger_.exceptionIgnores()) res["ignores"].push_back({{"id",g.id},{"code",g.code},{"addr",g.address},{"hits",g.hits}});
+    }
+    else if (cmd == "add_exc_ignore") { res["id"] = debugger_.addExceptionIgnore((uint32_t)jU64(a.value("code", njson(0))), jU64(a.value("addr", njson(0))), a.value("label","mcp")); }
+    else if (cmd == "rm_exc_ignore") { debugger_.removeExceptionIgnore((uint32_t)jU64(a["id"])); }
     else if (cmd == "get_event_breaks") { res["mask"] = debugger_.eventBreakMask(); }
     else if (cmd == "set_event_breaks") { debugger_.setEventBreakMask(static_cast<uint32_t>(jU64(a.value("mask", njson(0))))); res["mask"] = debugger_.eventBreakMask(); }
     else if (cmd == "modules") { for (auto& m : debugger_.modules()) res["modules"].push_back({{"base",m.base},{"name",m.name},{"path",m.path}}); }
@@ -6942,8 +7018,10 @@ std::vector<ToolDef> App::aiToolDefs() {
     add("set_membp",   "Memory breakpoint PAGE_GUARD. type=0 access/1 write/8 execute; protege paginas completas y requiere pausa.", obj({{"addr", HEX}, {"size", INT}, {"type", INT}, {"label", STR}}, {"addr"}));
     add("del_membp",   "Quita un memory breakpoint por id.", obj({{"id", INT}}, {"id"}));
     add("list_membp",  "Lista memory breakpoints PAGE_GUARD y sus hits.", obj(EMPTY, {}));
-    add("add_exc_bp",  "Breakpoint de excepcion. code=0 (cualquiera) o codigo hex.", obj({{"code", HEX}, {"addr", HEX}}, {}));
-    add("list_exc",    "Lista los breakpoints de excepcion.", obj(EMPTY, {}));
+    add("add_exc_bp",  "Breakpoint de excepcion: PAUSA cuando ocurre. code=0 (cualquiera) o codigo hex; addr opcional = solo en esa direccion.", obj({{"code", HEX}, {"addr", HEX}}, {}));
+    add("list_exc",    "Lista los breakpoints de excepcion (exc) y las reglas de ignorar (ignores).", obj(EMPTY, {}));
+    add("add_exc_ignore", "Ignorar excepcion: en primera oportunidad se pasa al programa SIN pausar (Shift+F9/ignore de OllyDbg). code=0 cualquiera; addr opcional.", obj({{"code", HEX}, {"addr", HEX}}, {}));
+    add("rm_exc_ignore", "Quita una regla de ignorar excepcion por id.", obj({{"id", INT}}, {"id"}));
     add("get_event_breaks", "Devuelve la mascara de breakpoints de eventos: 1 hilo nuevo, 2 fin hilo, 4 carga DLL, 8 descarga DLL.", obj(EMPTY, {}));
     add("set_event_breaks", "Configura breakpoints de eventos con mascara: 1=create thread, 2=exit thread, 4=load DLL, 8=unload DLL; combinables.", obj({{"mask", INT}}, {"mask"}));
     add("modules",     "Lista los modulos cargados.", obj(EMPTY, {}));

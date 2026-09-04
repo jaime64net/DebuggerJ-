@@ -342,6 +342,8 @@ private:
     char          excCodeBuf_[24] = "C0000005";
     char          excAddrBuf_[24] = {0};
     char          excLabelBuf_[64] = {0};
+    char          excIgnCodeBuf_[24] = "C0000005";
+    char          excIgnAddrBuf_[24] = {0};
 
     // --- Debugger ---
     Debugger      debugger_;

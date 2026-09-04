@@ -102,8 +102,20 @@ struct MemoryBreakpoint {
 struct ExceptionBreak {
     uint32_t    id = 0;
     uint32_t    code = 0;      // 0 = cualquiera; ej 0xC0000005 = ACCESS_VIOLATION
-    uint64_t    address = 0;   // ubicacion asociada / donde disparo por ultima vez
+    uint64_t    address = 0;   // FILTRO: 0 = en cualquier direccion; si no, solo pausa cuando la excepcion ocurre ahi
+    uint64_t    lastAddress = 0; // donde disparo por ultima vez
     bool        enabled = true;
+    uint32_t    hits = 0;
+    std::string label;
+};
+
+// Regla de IGNORAR: la excepcion (codigo, y opcionalmente direccion) se pasa al
+// programa en primera oportunidad SIN pausar (como "ignore" / Shift+F9 de OllyDbg).
+// Util para malware que usa excepciones como flujo normal (SEH tricks).
+struct ExceptionIgnore {
+    uint32_t    id = 0;
+    uint32_t    code = 0;      // 0 = cualquiera
+    uint64_t    address = 0;   // 0 = en cualquier direccion
     uint32_t    hits = 0;
     std::string label;
 };
@@ -180,6 +192,10 @@ public:
     void     removeExceptionBreak(uint32_t id);
     void     toggleExceptionBreak(uint32_t id, bool enabled);
     std::vector<ExceptionBreak> exceptionBreaks();
+    // --- Excepciones ignoradas (pasar al programa sin pausar) ---
+    uint32_t addExceptionIgnore(uint32_t code, uint64_t address, const std::string& label = "");
+    void     removeExceptionIgnore(uint32_t id);
+    std::vector<ExceptionIgnore> exceptionIgnores();
 
     // --- Hardware breakpoints (registros de depuracion DR0-DR3) ---
     // type: 0=ejecucion, 1=escritura, 3=lectura/escritura.  len: 1/2/4/8 bytes.
@@ -276,6 +292,8 @@ private:
     std::mutex excMutex_;
     std::vector<ExceptionBreak> excBreaks_;
     uint32_t   nextExcId_ = 1;
+    std::vector<ExceptionIgnore> excIgnores_;
+    uint32_t   nextIgnId_ = 1;
 
     std::mutex hwMutex_;
     HwBreakpoint hwBps_[4];         // por slot; address==0 => libre

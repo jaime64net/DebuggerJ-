@@ -74,6 +74,35 @@ bool applyAntiAntiDebug(Debugger& d, bool is64, const AntiDbgOptions& opt, std::
     return patched > 0;
 }
 
+bool revertAntiAntiDebug(Debugger& d, bool is64, const AntiDbgOptions& opt, std::string& logout) {
+    HANDLE h = (HANDLE)d.processHandle();
+    if (!h) { logout = "No hay proceso activo."; return false; }
+    typedef LONG(NTAPI * NtQIP_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    auto NtQIP = (NtQIP_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (!NtQIP) { logout = "No se encontro NtQueryInformationProcess."; return false; }
+    PROCESS_BASIC_INFORMATION pbi{};
+    if (NtQIP(h, 0, &pbi, sizeof(pbi), nullptr) != 0 || !pbi.PebBaseAddress) { logout = "No se pudo obtener el PEB."; return false; }
+    uint64_t peb = (uint64_t)pbi.PebBaseAddress;
+    int patched = 0;
+    if (opt.beingDebugged) { uint8_t one = 1; if (d.writeMemory(peb + 0x02, &one, 1)) patched++; }
+    if (opt.ntGlobalFlag)  { uint32_t ngf = 0; d.readMemory(peb + 0xBC, &ngf, 4); ngf |= 0x70u; if (d.writeMemory(peb + 0xBC, &ngf, 4)) patched++; }
+    if (opt.heapFlags) {
+        uint64_t heap = 0; d.readMemory(peb + 0x30, &heap, 8);
+        if (heap) { uint32_t flags = 0x40000062u, force = 0x40000060u; d.writeMemory(heap + 0x70, &flags, 4); d.writeMemory(heap + 0x74, &force, 4); patched++; }
+    }
+    if (!is64) {
+        ULONG_PTR peb32 = 0;
+        if (NtQIP(h, 26, &peb32, sizeof(peb32), nullptr) == 0 && peb32) {
+            if (opt.beingDebugged) { uint8_t one = 1; d.writeMemory((uint64_t)peb32 + 0x02, &one, 1); }
+            if (opt.ntGlobalFlag)  { uint32_t g = 0; d.readMemory((uint64_t)peb32 + 0x68, &g, 4); g |= 0x70u; d.writeMemory((uint64_t)peb32 + 0x68, &g, 4); }
+            patched++;
+        }
+    }
+    char b[128]; sprintf_s(b, "Anti-anti-debug revertido (%d parches) sobre PEB 0x%llX", patched, (unsigned long long)peb);
+    logout = b;
+    return patched > 0;
+}
+
 // ---------------------------------------------------------------------------
 // 2) Dump del proceso a disco (memory-aligned).
 // ---------------------------------------------------------------------------
