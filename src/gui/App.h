@@ -301,6 +301,19 @@ private:
     void          stopSession();          // Stop: termina el proceso y recarga el archivo en vista estatica
     void          finishStopReload();     // completa el Stop cuando el motor ya salio (render)
     void          resetLiveState();       // limpia registros/memoria/IP de la sesion viva
+    // --- Cache persistente de breakpoints por binario (estilo .udd de OllyDbg) ---
+    // Guarda sw/hw/exception BPs, mascara de eventos y acciones M3 en cache/<hash-ruta>.bp.json
+    // (+ copia por hash de contenido). Se carga y ACTIVA al abrir/adjuntar; autosave al cambiar.
+    std::string   bpCacheSig_;             // firma del ultimo guardado (detecta cambios)
+    int           bpCacheFrame_ = 0;
+    bool          bpCacheLoaded_ = false;
+    std::wstring  breakpointCachePath() const;
+    std::string   breakpointCacheSignature();
+    void          saveBreakpointCache();
+    void          loadBreakpointCache();   // limpia los BPs actuales y crea los del binario
+    void          clearAllBreakpoints();
+    void          tickBreakpointCache();   // en render(): autosave al detectar cambios
+    uint64_t      canonVA(uint64_t va) const;   // VA runtime -> VA preferida del PE (anotaciones estables ante ASLR)
     bool          reloadAfterStop_ = false;
     // --- Wait for respawn: termina/desadjunta el target y espera a que vuelva a existir para adjuntarlo pausado ---
     std::wstring  respawnPath_;                 // ruta completa esperada (si se pudo obtener)

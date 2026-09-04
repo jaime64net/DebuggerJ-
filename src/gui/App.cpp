@@ -204,6 +204,7 @@ void App::openFile(const std::wstring& path) {
     analyzedFunctions_.clear(); analysisXrefs_.clear(); analysisLoops_.clear();
     analysisCacheLoaded_ = false;
     loadAnnotations();
+    loadBreakpointCache();     // breakpoints/excepciones del binario (cache persistente, se activan ya)
     refreshDisassembly();
     if (!analysisCacheLoaded_) {
         refreshStaticStrings();
@@ -926,6 +927,7 @@ void App::render() {
     // recargamos el archivo para que todas las ventanas muestren los valores estaticos.
     if (reloadAfterStop_ && (s == DbgState::Exited || s == DbgState::Idle)) { reloadAfterStop_ = false; finishStopReload(); }
     tickWaitForRespawn();
+    tickBreakpointCache();
 
     drainMcpQueue();
 
@@ -1552,6 +1554,8 @@ void App::drawHelpWindow() {
             ImGui::BulletText("F5 lanza o continua; F8 entra en calls (step into); F10 los salta (step over); F11 ejecuta hasta ret; Pause detiene una sesion activa.");
             ImGui::BulletText("Depurar -> Adjuntar a proceso abre una LISTA de procesos (PID, nombre, x86/x64, titulo de ventana y ruta) con filtro; doble clic o 'Adjuntar' se conecta (queda un campo de PID manual como respaldo). 'Desadjuntar' deja el proceso ejecutando sin DebuggerJ++. Requiere permisos suficientes y se recomienda usarlo solo en la VM de analisis.");
             ImGui::BulletText("Wait for respawn (Archivo/Depurar, bajo Attach): con un proceso adjuntado o lanzado, lo termina, libera la sesion y deja un guard que vigila la tabla de procesos cada 30 ms; en cuanto reaparece un proceso con el mismo ejecutable (mismo nombre y, si se puede leer, misma ruta; nuevo PID) lo adjunta y queda pausado en el breakpoint del loader. Se ve en la barra de estado y se cancela desde el mismo menu. Tambien por MCP wait_respawn / cancel_wait_respawn.");
+            ImGui::BulletText("Comentarios y etiquetas como OllyDbg: selecciona una linea de la CPU y pulsa ';' (comentario) o ':' (etiqueta), o clic derecho -> Comentario... / Etiqueta.... Se muestran en la CPU (verde) y se guardan en la cache de analisis del binario (cache/<hash>.json + copia por hash de contenido), indexados por VA preferida del PE para sobrevivir a ASLR.");
+            ImGui::BulletText("Cache de breakpoints por binario (estilo .udd): los breakpoints software (con condicion, hits, solo-log y accion M3), hardware, de excepcion y la mascara de eventos se guardan solos en cache/<hash>.bp.json al cambiar, y se RESTAURAN Y ACTIVAN al abrir el .exe o al adjuntarse a un proceso (relocalizados a la base runtime). Guardar/Cargar sesion sigue existiendo para instantaneas manuales.");
             ImGui::BulletText("Stop (toolbar o Depurar -> Detener) termina el proceso y RECARGA el archivo abierto en vista estatica: CPU, strings, packers, memoria y registros vuelven a los valores del archivo (como recien abierto). Los comentarios/etiquetas persisten en disco.");
             ImGui::BulletText("Archivo -> Cerrar actual (Ctrl+W) cierra el archivo y la sesion activa dejando la app vacia, sin salir. Archivo -> Salir cierra DebuggerJ++.");
             ImGui::BulletText("Memoria, Stack y Dump muestran el proceso solo mientras esta pausado. Patch, NOP y Assemble modifican memoria viva.");
@@ -1889,6 +1893,8 @@ void App::closeCurrent() {
     reloadAfterStop_ = false; pendingSwitchPid_ = 0;
     dbgState_ = DbgState::Idle;
     resetLiveState();
+    if (fileLoaded_ && bpCacheLoaded_) saveBreakpointCache();
+    clearAllBreakpoints(); bpCacheLoaded_ = false; bpCacheSig_.clear();
     std::string closed = wToUtf8(loadedPath_);
     pe_ = PeFile{};
     fileLoaded_ = false; loadedPath_.clear(); openError_.clear();
@@ -2021,6 +2027,168 @@ void App::tickWaitForRespawn() {
         else if (s == DbgState::Idle || s == DbgState::Exited) { respawnPauseFrames_ = 0; pushLog("Wait for respawn: el attach no prospero (el proceso salio o fue rechazado)."); }
         else if (s == DbgState::Running && ++respawnPauseFrames_ > 60) { debugger_.pause(); respawnPauseFrames_ = 1; }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cache persistente de breakpoints (estilo .udd de OllyDbg)
+// ---------------------------------------------------------------------------
+uint64_t App::canonVA(uint64_t va) const {
+    const uint64_t rt = debugger_.imageBase();
+    if (rt && fileLoaded_ && rt != pe_.imageBase() && va >= rt && va < rt + pe_.sizeOfImage())
+        return pe_.imageBase() + (va - rt);
+    return va;
+}
+
+std::wstring App::breakpointCachePath() const {
+    if (loadedPath_.empty()) return {};
+    std::wstring p = analysisCachePath(loadedPath_);
+    if (p.empty()) return {};
+    if (p.size() > 5 && p.compare(p.size() - 5, 5, L".json") == 0) p.resize(p.size() - 5);
+    return p + L".bp.json";
+}
+
+void App::clearAllBreakpoints() {
+    for (const auto& bp : debugger_.breakpoints()) if (!bp.oneShot) debugger_.removeBreakpoint(bp.address);
+    for (const auto& bp : debugger_.hwBreakpoints()) debugger_.removeHwBreakpoint(bp.address);
+    for (const auto& bp : debugger_.exceptionBreaks()) debugger_.removeExceptionBreak(bp.id);
+    bpActions_.clear();
+    runToTemp_.clear();
+}
+
+// Firma textual de todo lo que persiste; si cambia, se vuelve a guardar.
+std::string App::breakpointCacheSignature() {
+    std::string sig = std::to_string(debugger_.eventBreakMask()) + "|";
+    for (const auto& bp : debugger_.breakpoints()) {
+        if (bp.oneShot || runToTemp_.count(bp.address)) continue;
+        sig += "S" + hex64(canonVA(bp.address)) + (bp.enabled ? "1" : "0") + std::to_string(bp.breakOnHit) + bp.condition + (bp.logOnly ? "L" : "") + bp.label + ";";
+    }
+    for (const auto& bp : debugger_.hwBreakpoints())
+        sig += "H" + hex64(canonVA(bp.address)) + std::to_string(bp.type) + std::to_string(bp.len) + bp.label + ";";
+    for (const auto& bp : debugger_.exceptionBreaks())
+        sig += "E" + std::to_string(bp.code) + hex64(canonVA(bp.address)) + (bp.enabled ? "1" : "0") + bp.label + ";";
+    for (const auto& [a, act] : bpActions_) sig += "A" + hex64(canonVA(a)) + act + ";";
+    return sig;
+}
+
+void App::saveBreakpointCache() {
+    if (!fileLoaded_ || loadedPath_.empty()) return;
+    const std::wstring path = breakpointCachePath();
+    if (path.empty()) return;
+    try {
+        const uint64_t runtimeBase = debugger_.imageBase() ? debugger_.imageBase() : pe_.imageBase();
+        const uint64_t runtimeEnd = runtimeBase + pe_.sizeOfImage();
+        auto addressRef = [&](uint64_t address) {
+            njson ref;
+            if (address >= runtimeBase && address < runtimeEnd) ref["rva"] = address - runtimeBase;
+            else ref["address"] = address;
+            return ref;
+        };
+        njson j;
+        j["schemaVersion"] = 1;
+        j["sourcePath"] = wToUtf8(loadedPath_);
+        j["peHash"] = peContentHash();
+        j["eventBreakMask"] = debugger_.eventBreakMask();
+        j["breakpoints"] = njson::array();
+        for (const auto& bp : debugger_.breakpoints()) {
+            if (bp.oneShot || runToTemp_.count(bp.address)) continue;
+            njson item = addressRef(bp.address);
+            item["label"] = bp.label; item["enabled"] = bp.enabled;
+            item["breakOnHit"] = bp.breakOnHit; item["condition"] = bp.condition; item["logOnly"] = bp.logOnly;
+            auto ai = bpActions_.find(bp.address);
+            if (ai != bpActions_.end() && !ai->second.empty()) item["action"] = ai->second;
+            j["breakpoints"].push_back(std::move(item));
+        }
+        j["hardwareBreakpoints"] = njson::array();
+        for (const auto& bp : debugger_.hwBreakpoints()) {
+            njson item = addressRef(bp.address);
+            item["label"] = bp.label; item["type"] = bp.type; item["len"] = bp.len;
+            j["hardwareBreakpoints"].push_back(std::move(item));
+        }
+        j["exceptionBreakpoints"] = njson::array();
+        for (const auto& bp : debugger_.exceptionBreaks()) {
+            njson item = addressRef(bp.address);
+            item["code"] = bp.code; item["label"] = bp.label; item["enabled"] = bp.enabled;
+            j["exceptionBreakpoints"].push_back(std::move(item));
+        }
+        const std::string dump = j.dump(1);
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); if (f) f << dump; }
+        std::string h = peContentHash();
+        if (!h.empty()) {
+            std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+                                  std::wstring(h.begin(), h.end()) + L".bp.json";
+            std::ofstream db(dbPath, std::ios::binary | std::ios::trunc); if (db) db << dump;
+        }
+        bpCacheSig_ = breakpointCacheSignature();
+    } catch (const std::exception& e) {
+        pushLog(std::string("Cache de breakpoints: no se pudo guardar: ") + e.what());
+    }
+}
+
+void App::loadBreakpointCache() {
+    bpCacheLoaded_ = false;
+    clearAllBreakpoints();
+    if (!fileLoaded_ || loadedPath_.empty()) return;
+    njson j;
+    bool found = false;
+    try {
+        const std::wstring path = breakpointCachePath();
+        if (!path.empty()) { std::ifstream f(path, std::ios::binary); if (f) { j = njson::parse(f); found = true; } }
+        if (!found) {   // binario movido/renombrado: copia por hash de contenido
+            std::string h = peContentHash();
+            if (!h.empty()) {
+                std::wstring dbPath = std::wstring(exeSiblingDir().begin(), exeSiblingDir().end()) + L"\\cache\\" +
+                                      std::wstring(h.begin(), h.end()) + L".bp.json";
+                std::ifstream db(dbPath, std::ios::binary);
+                if (db) { j = njson::parse(db); found = j.value("peHash", std::string{}) == h; }
+            }
+        }
+    } catch (const std::exception& e) { pushLog(std::string("Cache de breakpoints ignorada: ") + e.what()); found = false; }
+
+    int nsw = 0, nhw = 0, nexc = 0;
+    if (found && j.value("schemaVersion", 0) == 1) {
+        // Base: si ya conocemos la base runtime (attach en curso) usamos esa; si no, la preferida
+        // del PE y el motor relocaliza al recibir CREATE_PROCESS (ASLR).
+        const uint64_t base = debugger_.imageBase() ? debugger_.imageBase() : pe_.imageBase();
+        auto restoreAddress = [&](const njson& item) -> uint64_t {
+            return item.contains("rva") ? base + item.value("rva", uint64_t{0}) : item.value("address", uint64_t{0});
+        };
+        debugger_.setEventBreakMask(j.value("eventBreakMask", uint32_t{0}));
+        for (const auto& item : j.value("breakpoints", njson::array())) {
+            const uint64_t address = restoreAddress(item);
+            if (!address) continue;
+            if (!debugger_.addBreakpoint(address, item.value("label", "cache"))) continue;
+            debugger_.toggleBreakpoint(address, item.value("enabled", true));
+            debugger_.setBreakpointHitTarget(address, item.value("breakOnHit", uint64_t{0}));
+            debugger_.setBreakpointCondition(address, item.value("condition", ""));
+            debugger_.setBreakpointLogOnly(address, item.value("logOnly", false));
+            std::string act = item.value("action", "");
+            if (!act.empty()) bpActions_[address] = act;
+            ++nsw;
+        }
+        for (const auto& item : j.value("hardwareBreakpoints", njson::array())) {
+            const uint64_t address = restoreAddress(item);
+            if (address && debugger_.addHwBreakpoint(address, item.value("type", 0), item.value("len", 1), item.value("label", "cache"))) ++nhw;
+        }
+        for (const auto& item : j.value("exceptionBreakpoints", njson::array())) {
+            const uint32_t id = debugger_.addExceptionBreak(item.value("code", uint32_t{0}), restoreAddress(item), item.value("label", "cache"));
+            debugger_.toggleExceptionBreak(id, item.value("enabled", true));
+            ++nexc;
+        }
+        if (nsw || nhw || nexc)
+            pushLog("Breakpoints del binario restaurados y activos: " + std::to_string(nsw) + " software, " +
+                    std::to_string(nhw) + " hardware, " + std::to_string(nexc) + " de excepcion.");
+    }
+    bpCacheLoaded_ = true;
+    bpCacheSig_ = breakpointCacheSignature();
+    bpCacheFrame_ = 0;
+}
+
+void App::tickBreakpointCache() {
+    if (!fileLoaded_ || !bpCacheLoaded_) return;
+    if (++bpCacheFrame_ < 30) return;      // ~2 veces por segundo
+    bpCacheFrame_ = 0;
+    std::string sig = breakpointCacheSignature();
+    if (sig != bpCacheSig_) saveBreakpointCache();
 }
 
 void App::finishStopReload() {
@@ -2256,21 +2424,22 @@ void App::drawCpuContent() {
                         if (ImGui::MenuItem("Analyze this", "Ctrl+A")) analyzeCodeAt(in.address);
                         ImGui::EndMenu();
                     }
-                    const bool bookmarked = bookmarks_.find(in.address) != bookmarks_.end();
+                    const uint64_t annVA = canonVA(in.address);   // anotaciones se guardan en VA preferida
+                    const bool bookmarked = bookmarks_.find(annVA) != bookmarks_.end();
                     if (ImGui::MenuItem(bookmarked ? "Quitar bookmark" : "Agregar bookmark")) {
-                        if (bookmarked) bookmarks_.erase(in.address);
-                        else bookmarks_[in.address] = labels_.count(in.address) ? labels_[in.address] : "CPU";
+                        if (bookmarked) bookmarks_.erase(annVA);
+                        else bookmarks_[annVA] = labels_.count(annVA) ? labels_[annVA] : "CPU";
                         saveAnnotations();
                     }
-                    if (ImGui::MenuItem("Comentario...")) {
-                        annotAddr_ = in.address; annotIsLabel_ = false;
-                        auto it = comments_.find(in.address);
+                    if (ImGui::MenuItem("Comentario...", ";")) {
+                        annotAddr_ = annVA; annotIsLabel_ = false;
+                        auto it = comments_.find(annVA);
                         std::snprintf(annotBuf_, sizeof(annotBuf_), "%s", it==comments_.end()?"":it->second.c_str());
                         openAnnot_ = true;
                     }
-                    if (ImGui::MenuItem("Etiqueta...")) {
-                        annotAddr_ = in.address; annotIsLabel_ = true;
-                        auto it = labels_.find(in.address);
+                    if (ImGui::MenuItem("Etiqueta...", ":")) {
+                        annotAddr_ = annVA; annotIsLabel_ = true;
+                        auto it = labels_.find(annVA);
                         std::snprintf(annotBuf_, sizeof(annotBuf_), "%s", it==labels_.end()?"":it->second.c_str());
                         openAnnot_ = true;
                     }
@@ -2349,7 +2518,7 @@ void App::drawCpuContent() {
                 ImGui::TableSetColumnIndex(3);
                 ImGui::TextDisabled("%s", in.bytes.c_str());
                 ImGui::TableSetColumnIndex(4);
-                auto lbit = labels_.find(in.address);
+                auto lbit = labels_.find(canonVA(in.address));
                 if (lbit != labels_.end()) {
                     ImGui::TextColored(ImVec4(0.5f,1,0.8f,1), "%s:", lbit->second.c_str());
                     ImGui::SameLine();
@@ -2361,7 +2530,7 @@ void App::drawCpuContent() {
                 ImGui::TextColored(col, "%s", in.text.c_str());
                 if (in.hasBranchTarget && ImGui::IsItemHovered())
                     ImGui::SetTooltip("-> 0x%s", hex64(in.branchTarget).c_str());
-                auto cmit = comments_.find(in.address);
+                auto cmit = comments_.find(canonVA(in.address));
                 if (cmit != comments_.end()) {
                     ImGui::SameLine();
                     ImGui::TextColored(ImVec4(0.5f,0.75f,0.5f,1), "; %s", cmit->second.c_str());
@@ -2401,6 +2570,15 @@ void App::drawCpuContent() {
                 if (!has) allHave = false;
             }
             setBreakpointsOnAddresses(addrs, !allHave, "cpu");
+        }
+        // ';' = comentario en la linea seleccionada, ':' (Shift+;) = etiqueta (como OllyDbg).
+        if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::IsKeyPressed(ImGuiKey_Semicolon) && !ImGui::GetIO().WantTextInput) {
+            annotAddr_ = canonVA(insns_[selectedInsn_].address);
+            annotIsLabel_ = ImGui::GetIO().KeyShift;
+            auto& map = annotIsLabel_ ? labels_ : comments_;
+            auto it = map.find(annotAddr_);
+            std::snprintf(annotBuf_, sizeof(annotBuf_), "%s", it == map.end() ? "" : it->second.c_str());
+            openAnnot_ = true;
         }
     }
     if (selectedInsn_ >= 0 && selectedInsn_ < (int)insns_.size() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A))
