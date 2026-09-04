@@ -939,7 +939,16 @@ void App::render() {
             regs_ = live;
             currentIp_ = regs_.ip();
             curModule_ = moduleNameAt(currentIp_);
-            refreshLiveDisassembly(currentIp_);
+            // Estilo OllyDbg: si el RIP ya esta en el listado actual, NO recargamos ni
+            // recentramos; solo movemos la seleccion al RIP y dejamos que el codigo se
+            // quede quieto (el grid solo hara scroll cuando el RIP salga del area visible,
+            // ver cpuEnsureRipVisible_). Solo si el RIP no esta (salto/ret lejano) se
+            // recarga el desensamblado centrado en el.
+            int ripIdx = -1;
+            if (liveView_ && !insns_.empty())
+                for (int k = 0; k < (int)insns_.size(); ++k) if (insns_[k].address == currentIp_) { ripIdx = k; break; }
+            if (ripIdx < 0) refreshLiveDisassembly(currentIp_);   // fija selectedInsn_ + pendingScroll_ (centra)
+            else { selectedInsn_ = ripIdx; selAnchor_ = ripIdx; cpuEnsureRipVisible_ = true; }
             if (dumpFollowRip_) followInDump(currentIp_);   // el volcado sigue lo que trazas (estilo Olly)
             if (stateChanged) memMap_ = debugger_.memoryMap();
             if (debugger_.foundOEP()) pluginOEP_ = debugger_.foundOEP();
@@ -2387,6 +2396,7 @@ void App::drawCpuContent() {
             flowGuides.push_back({i, target->second, lane});
         }
 
+        const float cpuViewH = ImGui::GetContentRegionAvail().y;   // alto scrollable (tras el encabezado)
         ImGuiListClipper clipper;
         clipper.Begin((int)insns_.size());
         if (pendingScroll_ >= 0 && pendingScroll_ < (int)insns_.size())
@@ -2650,6 +2660,16 @@ void App::drawCpuContent() {
                     }
                 }
             }
+        }
+        // Scroll SOLO cuando el RIP sale del area visible (estilo OllyDbg): al trazar,
+        // el RIP baja una fila y el codigo se queda quieto hasta tocar el borde.
+        if (cpuEnsureRipVisible_ && selectedInsn_ >= 0 && clipper.ItemsHeight > 0.0f) {
+            const float rowH = clipper.ItemsHeight;
+            const float top = selectedInsn_ * rowH, bot = top + rowH;
+            const float sy = ImGui::GetScrollY();
+            if (top < sy) ImGui::SetScrollY(top);
+            else if (bot > sy + cpuViewH) ImGui::SetScrollY(bot - cpuViewH);
+            cpuEnsureRipVisible_ = false;
         }
         ImGui::EndTable();
     }

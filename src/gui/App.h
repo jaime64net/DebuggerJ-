@@ -337,6 +337,7 @@ private:
     void          analyzeSelectionAsCpp();   // manda las lineas seleccionadas a la ventana Code (IA)
     uint64_t      disBase_ = 0;      // VA base del listado actual
     bool          liveView_ = false; // true = desensamblando memoria viva
+    bool          cpuEnsureRipVisible_ = false; // al trazar: scroll solo si el RIP salio del area visible
 
     // --- Excepciones (add manual) ---
     char          excCodeBuf_[24] = "C0000005";
